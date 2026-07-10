@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.env
+output/
+# Invoice PDFs may contain confidential business data - never commit them.
+# (Test fixtures are generated on the fly by the test suite.)
+samples/*.pdf
+.claude/
