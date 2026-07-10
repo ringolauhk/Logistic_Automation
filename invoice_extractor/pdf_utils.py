@@ -1,42 +1,111 @@
-"""PDF text extraction, text/image classification, and page rendering."""
+"""Page-level PDF analysis: per-page classification and selective rendering.
+
+Every page is classified independently:
+
+  text  - alphanumeric chars on the page exceed the quality threshold;
+          its extracted text goes down the text route.
+  image - below the threshold but the page carries images or vector drawings
+          (typical scan), or has a little text not worth trusting; the page
+          is rendered and goes down the vision route.
+  blank - no alphanumeric text, no images, no drawings (includes
+          punctuation-only pages). Skipped but recorded.
+
+A mixed PDF therefore uses text extraction for some pages and vision for
+others; the whole file is never forced down one route.
+"""
+
+from dataclasses import dataclass
 
 import fitz  # PyMuPDF
 
-METHOD_TEXT = "text"
-METHOD_IMAGE = "image"
+PAGE_TEXT = "text"
+PAGE_IMAGE = "image"
+PAGE_BLANK = "blank"
+
+DOC_TEXT_NATIVE = "text-native"
+DOC_IMAGE_ONLY = "image-only"
+DOC_MIXED = "mixed"
+DOC_ERROR = "error"
 
 
-def extract_pages_text(path: str) -> list[str]:
-    """Return the extracted text of every page (empty string if none)."""
-    with fitz.open(path) as doc:
-        return [page.get_text("text") or "" for page in doc]
+@dataclass(frozen=True)
+class PageInfo:
+    number: int  # 1-based
+    kind: str  # PAGE_TEXT | PAGE_IMAGE | PAGE_BLANK
+    alnum_chars: int
+    text: str
 
 
 def alnum_count(text: str) -> int:
     return sum(1 for ch in text if ch.isalnum())
 
 
-def avg_alnum_per_page(pages_text: list[str]) -> float:
-    if not pages_text:
-        return 0.0
-    return sum(alnum_count(t) for t in pages_text) / len(pages_text)
+def _classify_page(page: fitz.Page, text: str, threshold: int) -> str:
+    chars = alnum_count(text)
+    if chars > threshold:
+        return PAGE_TEXT
+    # Below threshold: a scanned page carries an embedded image (or vector
+    # drawings); a page with neither and no alnum text is blank.
+    if page.get_images(full=True) or page.get_drawings():
+        return PAGE_IMAGE
+    if chars > 0:
+        return PAGE_IMAGE  # a little text, not enough to trust: render it
+    return PAGE_BLANK
 
 
-def classify_pages(pages_text: list[str], threshold: int) -> str:
-    """'text' when the average alphanumeric chars per page exceeds threshold,
-    else 'image' (scanned / no usable text layer)."""
-    return METHOD_TEXT if avg_alnum_per_page(pages_text) > threshold else METHOD_IMAGE
+def analyze_pages(path: str, threshold: int) -> list[PageInfo]:
+    """Classify every page. Raises on unreadable/corrupt PDFs."""
+    pages: list[PageInfo] = []
+    with fitz.open(path) as doc:
+        for i, page in enumerate(doc, start=1):
+            text = page.get_text("text") or ""
+            kind = _classify_page(page, text, threshold)
+            pages.append(
+                PageInfo(number=i, kind=kind, alnum_chars=alnum_count(text), text=text)
+            )
+    return pages
 
 
-def render_pages_png(path: str, dpi: int = 200, max_pages: int | None = None) -> list[bytes]:
-    """Render each page to PNG bytes at the given DPI."""
+def classify_document(pages: list[PageInfo]) -> str:
+    kinds = {p.kind for p in pages if p.kind != PAGE_BLANK}
+    if not kinds:
+        return DOC_ERROR  # nothing meaningful (all pages blank, or zero pages)
+    if kinds == {PAGE_TEXT}:
+        return DOC_TEXT_NATIVE
+    if kinds == {PAGE_IMAGE}:
+        return DOC_IMAGE_ONLY
+    return DOC_MIXED
+
+
+def format_page_ranges(numbers: list[int]) -> str:
+    """Stable human-readable page list: [1,2,5,6,7] -> '1-2,5-7'.
+
+    This is the documented representation used in Excel provenance columns,
+    review reasons, and logs (never Python list syntax).
+    """
+    if not numbers:
+        return ""
+    nums = sorted(set(numbers))
+    parts: list[str] = []
+    start = prev = nums[0]
+    for n in nums[1:]:
+        if n == prev + 1:
+            prev = n
+            continue
+        parts.append(f"{start}-{prev}" if prev > start else str(start))
+        start = prev = n
+    parts.append(f"{start}-{prev}" if prev > start else str(start))
+    return ",".join(parts)
+
+
+def render_pages_png(path: str, page_numbers: list[int], dpi: int = 200) -> list[bytes]:
+    """Render the given 1-based pages to PNG bytes, in the order given."""
     zoom = dpi / 72.0
     matrix = fitz.Matrix(zoom, zoom)
-    images: list[bytes] = []
+    wanted = set(page_numbers)
+    rendered: dict[int, bytes] = {}
     with fitz.open(path) as doc:
-        for i, page in enumerate(doc):
-            if max_pages is not None and i >= max_pages:
-                break
-            pix = page.get_pixmap(matrix=matrix)
-            images.append(pix.tobytes("png"))
-    return images
+        for i, page in enumerate(doc, start=1):
+            if i in wanted:
+                rendered[i] = page.get_pixmap(matrix=matrix).tobytes("png")
+    return [rendered[n] for n in page_numbers if n in rendered]

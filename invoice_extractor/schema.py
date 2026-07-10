@@ -1,6 +1,16 @@
-"""Unified invoice schema: normalization, coercion, and validation."""
+"""Unified invoice schema: strict Pydantic models, Decimal coercion, validation.
+
+Raw LLM JSON is first *filtered* to known schema keys (LLMs occasionally emit
+commentary keys; hard-failing on those would waste a paid call - this is the
+documented reason the raw payload itself is not validated with extra="forbid").
+The filtered dict is then validated by Pydantic models that DO forbid extras,
+so any programming error upstream fails loudly.
+"""
 
 import re
+from decimal import Decimal, InvalidOperation
+
+from pydantic import BaseModel, ConfigDict
 
 HEADER_FIELDS = [
     "invoice_number",
@@ -34,127 +44,244 @@ REQUIRED_FIELDS = [
 class ExtractionError(Exception):
     """LLM output was unusable (bad JSON, missing required fields, etc.).
 
-    Not retried against the same provider; triggers the fallback provider.
+    `message` must never contain raw response/invoice content (it is logged);
+    `detail` may carry the raw payload for debug artifacts only.
     """
 
+    def __init__(self, message: str, detail: str | None = None):
+        super().__init__(message)
+        self.detail = detail
 
-def empty_invoice() -> dict:
-    inv: dict = {field: None for field in HEADER_FIELDS}
-    inv["line_items"] = []
-    return inv
+
+class LineItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    description: str | None = None
+    quantity: Decimal | None = None
+    unit_price: Decimal | None = None
+    amount: Decimal | None = None
+
+
+class Invoice(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    invoice_number: str | None = None
+    invoice_date: str | None = None
+    currency: str | None = None
+    seller_name: str | None = None
+    seller_address: str | None = None
+    buyer_name: str | None = None
+    buyer_address: str | None = None
+    subtotal: Decimal | None = None
+    tax_amount: Decimal | None = None
+    total_amount: Decimal | None = None
+    payment_terms: str | None = None
+    line_items: list[LineItem] = []
+
+
+def empty_invoice() -> Invoice:
+    return Invoice()
 
 
 _NUMBER_CLEAN_RE = re.compile(r"[^\d.,\-]")
 
 
-def coerce_number(value) -> float | None:
-    """Coerce LLM output ('1,234.50', '$99', 42) to float, or None."""
+def coerce_decimal(value) -> Decimal | None:
+    """Coerce LLM output ('1,234.56', '(99.00)', '€1.234,56', 0) to Decimal.
+
+    Zero is preserved as Decimal('0') - never converted to None. Unparseable
+    values return None (the original value is kept for diagnostics upstream).
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, (int, float)):
+        return Decimal(str(value))
+    if not isinstance(value, str):
+        return None
+
+    s = value.strip()
+    if not s:
+        return None
+    # Accounting-style negatives: (1,234.56)
+    negative = s.startswith("(") and s.endswith(")")
+    if negative:
+        s = s[1:-1]
+    s = _NUMBER_CLEAN_RE.sub("", s).strip()
+    if not s or s == "-":
+        return None
+    # European style "1.234,56" -> "1234.56"
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        parts = s.split(",")
+        if len(parts) == 2 and len(parts[1]) in (1, 2):
+            s = s.replace(",", ".")  # decimal comma: "123,45"
+        else:
+            s = s.replace(",", "")  # thousands: "12,345"
+    try:
+        result = Decimal(s)
+    except InvalidOperation:
+        return None
+    return -result if negative and result > 0 else result
+
+
+_CURRENCY_SYMBOLS = {"€": "EUR", "£": "GBP"}  # only unambiguous symbols
+
+
+def normalize_currency(value) -> str | None:
+    """Normalize to an uppercase ISO-4217-shaped code without inventing one.
+
+    Unambiguous symbols are mapped; anything unrecognized is kept as-is so
+    the reviewer can see what the model actually returned.
+    """
     if value is None:
         return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        cleaned = _NUMBER_CLEAN_RE.sub("", value).strip()
-        if not cleaned:
-            return None
-        # European style "1.234,56" -> "1234.56"
-        if "," in cleaned and "." in cleaned:
-            if cleaned.rfind(",") > cleaned.rfind("."):
-                cleaned = cleaned.replace(".", "").replace(",", ".")
-            else:
-                cleaned = cleaned.replace(",", "")
-        elif "," in cleaned:
-            # Lone comma is a decimal separator if it looks like one ("123,45")
-            parts = cleaned.split(",")
-            if len(parts) == 2 and len(parts[1]) in (1, 2):
-                cleaned = cleaned.replace(",", ".")
-            else:
-                cleaned = cleaned.replace(",", "")
-        try:
-            return float(cleaned)
-        except ValueError:
-            return None
-    return None
+    s = str(value).strip()
+    if not s:
+        return None
+    if s in _CURRENCY_SYMBOLS:
+        return _CURRENCY_SYMBOLS[s]
+    if len(s) == 3 and s.isalpha():
+        return s.upper()
+    return s
 
 
 def _coerce_str(value) -> str | None:
+    """Coerce to a stripped string; empty strings normalize to None."""
     if value is None:
         return None
     text = str(value).strip()
     return text or None
 
 
-def normalize_invoice(raw) -> dict:
-    """Map raw LLM JSON onto the unified schema, coercing types.
+def normalize_invoice(raw) -> Invoice:
+    """Map raw (filtered) LLM JSON onto the strict schema, coercing types.
 
-    Unknown keys are dropped; missing keys become None.
+    Unknown keys are dropped (see module docstring); missing keys become None;
+    empty strings become None; zero survives as Decimal('0').
     """
     if not isinstance(raw, dict):
-        raise ExtractionError(f"expected a JSON object, got {type(raw).__name__}")
+        raise ExtractionError(
+            f"expected a JSON object, got {type(raw).__name__}"
+        )
 
-    inv = empty_invoice()
+    data: dict = {}
     for field in HEADER_FIELDS:
         value = raw.get(field)
         if field in NUMERIC_HEADER_FIELDS:
-            inv[field] = coerce_number(value)
+            data[field] = coerce_decimal(value)
+        elif field == "currency":
+            data[field] = normalize_currency(value)
         else:
-            inv[field] = _coerce_str(value)
+            data[field] = _coerce_str(value)
 
-    items = raw.get("line_items")
-    if isinstance(items, list):
-        for item in items:
+    items: list[LineItem] = []
+    raw_items = raw.get("line_items")
+    if isinstance(raw_items, list):
+        for item in raw_items:
             if not isinstance(item, dict):
                 continue
-            normalized = {}
+            fields = {}
             for field in LINE_ITEM_FIELDS:
                 value = item.get(field)
                 if field in NUMERIC_LINE_ITEM_FIELDS:
-                    normalized[field] = coerce_number(value)
+                    fields[field] = coerce_decimal(value)
                 else:
-                    normalized[field] = _coerce_str(value)
-            if any(v is not None for v in normalized.values()):
-                inv["line_items"].append(normalized)
-    return inv
+                    fields[field] = _coerce_str(value)
+            if any(v is not None for v in fields.values()):
+                items.append(LineItem(**fields))
+    data["line_items"] = items
+    return Invoice(**data)
 
 
-def missing_required_fields(inv: dict) -> list[str]:
-    return [f for f in REQUIRED_FIELDS if inv.get(f) is None]
+def unknown_keys(raw: dict) -> list[str]:
+    """Top-level keys the LLM emitted that are not part of the schema."""
+    known = set(HEADER_FIELDS) | {"line_items"}
+    return sorted(k for k in raw.keys() if k not in known)
 
 
-def check_required(inv: dict) -> None:
+def missing_required_fields(inv: Invoice) -> list[str]:
+    return [f for f in REQUIRED_FIELDS if getattr(inv, f) is None]
+
+
+def check_required(inv: Invoice) -> None:
     """Raise ExtractionError when required fields are missing.
 
-    Used on provider output to decide whether to try the fallback provider.
+    Called on each provider's output: a failure here is what triggers the
+    fallback provider.
     """
     missing = missing_required_fields(inv)
     if missing:
         raise ExtractionError(f"missing required fields: {', '.join(missing)}")
 
 
-def validate_invoice(inv: dict) -> str | None:
-    """Return a review reason if the invoice fails validation, else None."""
+def validate_invoice(
+    inv: Invoice,
+    abs_tolerance: Decimal = Decimal("0.02"),
+    rel_tolerance: Decimal = Decimal("0.005"),
+) -> str | None:
+    """Return a review reason if the invoice fails validation, else None.
+
+    Totals reconciliation (documented rules, in order - passing any check
+    means the arithmetic is consistent):
+
+      1. sum(line_items.amount) + tax_amount ~= total_amount   (exclusive tax)
+      2. sum(line_items.amount) ~= total_amount                (inclusive/zero tax)
+      3. subtotal + tax_amount ~= total_amount AND
+         sum(line_items.amount) ~= subtotal                    (subtotal chain)
+
+    tolerance = max(TOTAL_ABS_TOLERANCE, TOTAL_REL_TOLERANCE * |total|).
+
+    When no check passes, the arithmetic is flagged as INCONCLUSIVE rather
+    than wrong: the schema has no fields for discount / shipping / duties /
+    rounding, so an unexplained difference may be a legitimate charge the
+    schema cannot represent. Missing amounts are never invented (a None tax
+    is only treated as absent, not as zero, except via check 2).
+    """
     reasons = []
 
     missing = missing_required_fields(inv)
     if missing:
         reasons.append(f"missing required fields: {', '.join(missing)}")
 
-    items = inv.get("line_items") or []
+    items = inv.line_items
     if not items:
         reasons.append("no line items extracted")
     else:
-        amounts = [it["amount"] for it in items if it.get("amount") is not None]
-        total = inv.get("total_amount")
-        if amounts and total is not None:
-            line_sum = sum(amounts)
-            tax = inv.get("tax_amount") or 0.0
-            tolerance = max(0.02, abs(total) * 0.01)
-            if abs(line_sum + tax - total) > tolerance:
-                reasons.append(
-                    f"totals mismatch: sum(line_items)={line_sum:.2f} "
-                    f"+ tax={tax:.2f} != total={total:.2f}"
-                )
-        elif not amounts:
+        amounts = [it.amount for it in items if it.amount is not None]
+        total = inv.total_amount
+        if not amounts:
             reasons.append("line items have no amounts")
+        elif total is not None:
+            line_sum = sum(amounts, Decimal("0"))
+            tax = inv.tax_amount
+            subtotal = inv.subtotal
+            tolerance = max(abs_tolerance, rel_tolerance * abs(total))
+
+            def close(a: Decimal, b: Decimal) -> bool:
+                return abs(a - b) <= tolerance
+
+            ok = (
+                (tax is not None and close(line_sum + tax, total))
+                or close(line_sum, total)
+                or (
+                    subtotal is not None
+                    and close(subtotal + (tax or Decimal("0")), total)
+                    and close(line_sum, subtotal)
+                )
+            )
+            if not ok:
+                diff = line_sum + (tax or Decimal("0")) - total
+                reasons.append(
+                    "totals inconclusive: "
+                    f"sum(line_items)={line_sum} tax={tax if tax is not None else 'n/a'} "
+                    f"total={total} unexplained difference={diff:+} "
+                    "(may be discount/shipping/duties/rounding not captured by schema)"
+                )
 
     return "; ".join(reasons) if reasons else None

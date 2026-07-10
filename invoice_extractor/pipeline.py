@@ -1,4 +1,15 @@
-"""Per-file orchestration: classify -> extract -> validate."""
+"""Per-file orchestration: page-level classify -> per-route extract -> merge -> validate.
+
+Vision pages are processed in ordered chunks of MAX_VISION_PAGES pages per
+request - every meaningful page is processed, none are silently dropped.
+Each chunk gets the full Gemini-first / Claude-fallback treatment; a chunk
+failing both providers is recorded (failed_pages + review reason with the
+page range) while later chunks still run.
+
+Assumes one invoice per PDF (documented PoC limitation). Likely multi-invoice
+PDFs are detected via conflicting invoice numbers and flagged for review
+rather than merged silently.
+"""
 
 import logging
 import time
@@ -6,108 +17,231 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from invoice_extractor import claude_client, gemini_client, pdf_utils
-from invoice_extractor.config import Config
-from invoice_extractor.schema import empty_invoice, validate_invoice
+from invoice_extractor.aggregation import RouteResult, aggregate
+from invoice_extractor.config import Config, describe_models
+from invoice_extractor.logging_setup import exc_summary
+from invoice_extractor.pdf_utils import (
+    DOC_ERROR,
+    PAGE_BLANK,
+    PAGE_IMAGE,
+    PAGE_TEXT,
+    PageInfo,
+    format_page_ranges,
+)
+from invoice_extractor.schema import Invoice, empty_invoice, validate_invoice
 
 
 @dataclass
 class InvoiceResult:
     source_file: str
-    data: dict = field(default_factory=empty_invoice)
+    invoice: Invoice = field(default_factory=empty_invoice)
     page_count: int = 0
-    # "text" | "gemini_vision" | "claude_vision" | None (total failure)
-    extraction_method: str | None = None
-    # Provider that actually produced the result, for the log/summary.
-    provider: str | None = None
+    document_classification: str = DOC_ERROR  # text-native | image-only | mixed | error
+    extraction_method: str = "failed"  # text | vision | mixed | failed
+    provider: str = "none"  # gemini | claude | mixed | none
+    model: str | None = None  # actual model id(s) that produced the result
+    text_pages: list[int] = field(default_factory=list)
+    image_pages: list[int] = field(default_factory=list)
+    blank_pages: list[int] = field(default_factory=list)
+    failed_pages: list[int] = field(default_factory=list)  # pages whose route/chunk failed
+    vision_chunk_count: int = 0  # vision requests attempted (successful + failed)
     needs_review: bool = False
     review_reason: str | None = None
-    error: bool = False
+    error: bool = False  # hard failure: no structured result at all
     elapsed_seconds: float = 0.0
 
 
-def _extract_text_path(cfg: Config, logger: logging.Logger, name: str, full_text: str) -> tuple[dict, str]:
-    """Gemini text normalization, with Claude text (never vision) as fallback."""
-    try:
-        inv = gemini_client.extract_from_text(cfg, full_text)
-        return inv, "gemini_text"
-    except Exception as exc:
-        logger.warning("%s: Gemini text normalization failed (%s: %s); trying Claude text fallback",
-                       name, type(exc).__name__, exc)
-        inv = claude_client.extract_from_text(cfg, full_text)
-        return inv, "claude_text"
+def _chunked(items: list, size: int) -> list[list]:
+    return [items[i : i + size] for i in range(0, len(items), size)]
 
 
-def _extract_vision_path(cfg: Config, logger: logging.Logger, name: str, images: list[bytes]) -> tuple[dict, str, str]:
-    """Gemini vision first; on error/invalid output, retry the same images on Claude."""
+def _run_text_route(cfg: Config, logger: logging.Logger, name: str,
+                    text_pages: list[PageInfo]) -> RouteResult:
+    """Gemini text normalization; Claude TEXT fallback only when enabled.
+
+    With ENABLE_CLAUDE_TEXT_FALLBACK=false (the default, matching the original
+    cost/routing design) a Gemini failure propagates - Claude is never called.
+    """
+    pages = [p.number for p in text_pages]
+    combined = "\n\n".join(f"--- PAGE {p.number} ---\n{p.text}" for p in text_pages)
+    started = time.perf_counter()
     try:
-        inv = gemini_client.extract_from_images(cfg, images)
-        return inv, "gemini_vision", "gemini_vision"
+        inv = gemini_client.extract_from_text(cfg, combined, label=f"{name}_gemini_text")
+        provider, model = "gemini", cfg.gemini_text_model
     except Exception as exc:
-        logger.warning("%s: Gemini vision failed (%s: %s); falling back to Claude vision",
-                       name, type(exc).__name__, exc)
-        inv = claude_client.extract_from_images(cfg, images)
-        return inv, "claude_vision", "claude_vision"
+        if not cfg.enable_claude_text_fallback:
+            logger.warning("%s: Gemini text failed (%s); Claude text fallback is disabled",
+                           name, exc_summary(exc))
+            raise
+        logger.warning("%s: Gemini text failed (%s); trying Claude text fallback",
+                       name, exc_summary(exc))
+        inv = claude_client.extract_from_text(cfg, combined, label=f"{name}_claude_text")
+        provider, model = "claude", cfg.claude_text_model
+    logger.info("%s: text route (pages %s) ok provider=%s model=%s %.1fs",
+                name, format_page_ranges(pages), provider, model,
+                time.perf_counter() - started)
+    return RouteResult("text", pages, inv, provider, model)
+
+
+def _run_vision_chunk(cfg: Config, logger: logging.Logger, name: str, path: Path,
+                      chunk: list[PageInfo], index: int, total: int) -> RouteResult:
+    """One vision request for one chunk: Gemini first, Claude on any failure.
+
+    Per-chunk attempt counts are logged by the clients (same label prefix);
+    normal logs never carry invoice text or response bodies.
+    """
+    pages = [p.number for p in chunk]
+    page_range = format_page_ranges(pages)
+    started = time.perf_counter()
+    images = pdf_utils.render_pages_png(str(path), pages, dpi=cfg.render_dpi)
+    try:
+        inv = gemini_client.extract_from_images(
+            cfg, images, label=f"{name}_gemini_vision_c{index}")
+        provider, model = "gemini", cfg.gemini_vision_model
+    except Exception as exc:
+        logger.warning("%s: vision chunk %d/%d (pages %s): Gemini failed (%s); "
+                       "falling back to Claude vision",
+                       name, index, total, page_range, exc_summary(exc))
+        inv = claude_client.extract_from_images(
+            cfg, images, label=f"{name}_claude_vision_c{index}")
+        provider, model = "claude", cfg.claude_vision_model
+    logger.info("%s: vision chunk %d/%d (pages %s) ok provider=%s model=%s %.1fs",
+                name, index, total, page_range, provider, model,
+                time.perf_counter() - started)
+    return RouteResult("vision", pages, inv, provider, model)
+
+
+def _reason_categories(result: InvoiceResult) -> str:
+    """Loggable summary of review reasons WITHOUT invoice values."""
+    if not result.review_reason:
+        return "none"
+    categories = []
+    for part in result.review_reason.split("; "):
+        categories.append(part.split(":", 1)[0].strip())
+    return ", ".join(dict.fromkeys(categories))
 
 
 def process_file(path: Path, cfg: Config, logger: logging.Logger) -> InvoiceResult:
     started = time.perf_counter()
     result = InvoiceResult(source_file=path.name)
 
-    # Stage 1-2: direct text extraction + classification
+    # Stage 1-2: per-page text extraction + classification
     try:
-        pages_text = pdf_utils.extract_pages_text(str(path))
+        pages = pdf_utils.analyze_pages(str(path), cfg.text_quality_threshold)
     except Exception as exc:
-        logger.error("%s: failed to open/parse PDF: %s", path.name, exc)
+        logger.error("%s: unreadable PDF (%s)", path.name, exc_summary(exc))
         result.needs_review = True
         result.error = True
-        result.review_reason = f"unreadable PDF: {exc}"
+        result.review_reason = f"unreadable PDF: {exc_summary(exc)}"
         result.elapsed_seconds = time.perf_counter() - started
         return result
 
-    result.page_count = len(pages_text)
-    avg_chars = pdf_utils.avg_alnum_per_page(pages_text)
-    classification = pdf_utils.classify_pages(pages_text, cfg.text_quality_threshold)
-    logger.info("%s: %d page(s), avg %.0f alphanumeric chars/page -> %s",
-                path.name, result.page_count, avg_chars,
-                "text-native" if classification == pdf_utils.METHOD_TEXT else "image-only")
+    result.page_count = len(pages)
+    text_pages = [p for p in pages if p.kind == PAGE_TEXT]
+    image_pages = [p for p in pages if p.kind == PAGE_IMAGE]
+    blank_pages = [p for p in pages if p.kind == PAGE_BLANK]
+    result.text_pages = [p.number for p in text_pages]
+    result.image_pages = [p.number for p in image_pages]
+    result.blank_pages = [p.number for p in blank_pages]
+    result.document_classification = pdf_utils.classify_document(pages)
 
-    # Stage 3/4: LLM extraction with provider fallback
-    try:
-        if classification == pdf_utils.METHOD_TEXT:
-            full_text = "\n\n--- PAGE BREAK ---\n\n".join(pages_text)
-            inv, provider = _extract_text_path(cfg, logger, path.name, full_text)
-            method = "text"
+    for p in pages:
+        logger.debug("%s: page %d -> %s (%d alnum chars)",
+                     path.name, p.number, p.kind, p.alnum_chars)
+    logger.info("%s: %d page(s) -> %s (text=%s image=%s blank=%s)",
+                path.name, result.page_count, result.document_classification,
+                format_page_ranges(result.text_pages) or "-",
+                format_page_ranges(result.image_pages) or "-",
+                format_page_ranges(result.blank_pages) or "-")
+
+    # Stage 3-4: per-route extraction with provider fallback
+    routes: list[RouteResult] = []
+    route_failures: list[tuple[str, Exception]] = []
+
+    if text_pages:
+        try:
+            routes.append(_run_text_route(cfg, logger, path.name, text_pages))
+        except Exception as exc:
+            label = f"text route (pages {format_page_ranges(result.text_pages)})"
+            route_failures.append((label, exc))
+            result.failed_pages.extend(result.text_pages)
+
+    if image_pages:
+        chunks = _chunked(image_pages, cfg.max_vision_pages)
+        result.vision_chunk_count = len(chunks)
+        if len(chunks) > 1:
+            logger.info("%s: %d image page(s) split into %d vision chunk(s) of <= %d",
+                        path.name, len(image_pages), len(chunks), cfg.max_vision_pages)
+        for index, chunk in enumerate(chunks, start=1):
+            try:
+                routes.append(_run_vision_chunk(cfg, logger, path.name, path,
+                                                chunk, index, len(chunks)))
+            except Exception as exc:
+                nums = [p.number for p in chunk]
+                page_range = format_page_ranges(nums)
+                label = f"vision route chunk {index}/{len(chunks)} (pages {page_range})"
+                route_failures.append((label, exc))
+                result.failed_pages.extend(nums)
+                logger.warning("%s: vision chunk %d/%d (pages %s) FAILED on all "
+                               "providers (%s); continuing with remaining chunks",
+                               path.name, index, len(chunks), page_range,
+                               exc_summary(exc))
+
+    if not routes:
+        # No structured result at all: emit a reviewable null row, never crash.
+        result.needs_review = True
+        result.error = True
+        if result.document_classification == DOC_ERROR:
+            result.review_reason = "no meaningful pages (document is blank)"
         else:
-            images = pdf_utils.render_pages_png(str(path), dpi=cfg.render_dpi,
-                                                max_pages=cfg.max_vision_pages)
-            if result.page_count > cfg.max_vision_pages:
-                logger.warning("%s: %d pages, only first %d sent to vision API",
-                               path.name, result.page_count, cfg.max_vision_pages)
-            inv, method, provider = _extract_vision_path(cfg, logger, path.name, images)
-        result.data = inv
-        result.extraction_method = method
-        result.provider = provider
-    except Exception as exc:
-        # Both providers failed: emit a null row instead of crashing the batch.
-        logger.error("%s: all providers failed (%s: %s); emitting null row for review",
-                     path.name, type(exc).__name__, exc)
-        result.needs_review = True
-        result.error = True
-        result.review_reason = f"extraction failed on all providers: {exc}"
+            result.review_reason = "; ".join(
+                f"{label} failed on all providers: {exc_summary(exc)}"
+                for label, exc in route_failures
+            )
         result.elapsed_seconds = time.perf_counter() - started
+        logger.error("%s: extraction failed (%s); emitting null row for review",
+                     path.name, _reason_categories(result))
         return result
 
-    # Stage 6: validation
-    reason = validate_invoice(result.data)
-    if reason:
+    # Stage 5: deterministic aggregation (chunks merge like any other routes)
+    outcome = aggregate(routes)
+    result.invoice = outcome.invoice
+
+    routes_used = {r.route for r in routes}
+    result.extraction_method = "mixed" if len(routes_used) > 1 else routes[0].route
+    ordered_routes = sorted(routes, key=lambda r: min(r.pages))
+    providers = list(dict.fromkeys(r.provider for r in ordered_routes))
+    result.provider = providers[0] if len(providers) == 1 else "mixed"
+    result.model = "+".join(dict.fromkeys(r.model for r in ordered_routes))
+
+    # Stage 6: review flags - partial route/chunk failure, conflicts, validation
+    reasons: list[str] = []
+    covered = format_page_ranges(sorted(n for r in routes for n in r.pages))
+    for label, exc in route_failures:
+        reasons.append(
+            f"partial extraction: {label} failed ({exc_summary(exc)}); "
+            f"result covers pages {covered} only"
+        )
+    for fld, detail in outcome.conflicts:
+        reasons.append(f"conflict in {fld}: {detail}")
+    reasons.extend(outcome.notes)
+    validation_reason = validate_invoice(
+        result.invoice, cfg.total_abs_tolerance, cfg.total_rel_tolerance
+    )
+    if validation_reason:
+        reasons.append(validation_reason)
+    if reasons:
         result.needs_review = True
-        result.review_reason = reason
+        result.review_reason = "; ".join(reasons)
 
     result.elapsed_seconds = time.perf_counter() - started
-    logger.info("%s: done in %.1fs (method=%s, provider=%s, needs_review=%s%s)",
-                path.name, result.elapsed_seconds, result.extraction_method,
-                result.provider, result.needs_review,
-                f", reason={result.review_reason}" if result.review_reason else "")
+    logger.info(
+        "%s: done in %.1fs class=%s method=%s provider=%s model=%s chunks=%d "
+        "needs_review=%s (%s)",
+        path.name, result.elapsed_seconds, result.document_classification,
+        result.extraction_method, result.provider, result.model,
+        result.vision_chunk_count, result.needs_review, _reason_categories(result),
+    )
     return result
 
 
@@ -122,4 +256,14 @@ def process_directory(input_dir: Path, cfg: Config, logger: logging.Logger) -> l
         logger.warning("No PDF files found in %s", input_dir)
         return []
     logger.info("Processing %d PDF(s) from %s", len(pdfs), input_dir)
-    return [process_file(path, cfg, logger) for path in pdfs]
+    logger.info(describe_models(cfg))
+    results = []
+    for path in pdfs:
+        try:
+            results.append(process_file(path, cfg, logger))
+        except Exception as exc:  # belt and braces: one file must never stop the batch
+            logger.error("%s: unexpected pipeline error (%s)", path.name, exc_summary(exc))
+            failed = InvoiceResult(source_file=path.name, needs_review=True, error=True,
+                                   review_reason=f"unexpected pipeline error: {exc_summary(exc)}")
+            results.append(failed)
+    return results
