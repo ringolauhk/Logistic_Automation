@@ -11,7 +11,7 @@ import pandas as pd
 
 from invoice_extractor.pdf_utils import format_page_ranges
 from invoice_extractor.pipeline import InvoiceResult
-from invoice_extractor.schema import HEADER_FIELDS, LINE_ITEM_FIELDS
+from invoice_extractor.schema import HEADER_FIELDS, LINE_ITEM_FIELDS, suspicious_line_item_rows
 
 # Page columns use the documented human-readable range format ("1-2,5-7"),
 # never Python list syntax.
@@ -35,6 +35,16 @@ INVOICE_COLUMNS = (
 
 LINE_ITEM_COLUMNS = ["invoice_id", "line_number", "source_file"] + LINE_ITEM_FIELDS
 
+# A focused, reviewer-facing sheet - deliberately NOT a slice of INVOICE_COLUMNS.
+# line_numbers/line_descriptions are None unless suspicious_line_item_rows()
+# found specific rows to point at (e.g. the hallucinated-header-row guardrail);
+# other review reasons (missing fields, totals inconclusive, ...) are invoice-
+# level and leave those two columns blank.
+NEEDS_REVIEW_COLUMNS = [
+    "invoice_id", "source_file", "invoice_number", "needs_review",
+    "review_reason", "line_numbers", "line_descriptions",
+]
+
 
 def _cell(value):
     if isinstance(value, Decimal):
@@ -50,6 +60,7 @@ def export_workbook(results: list[InvoiceResult], output_path: str | Path) -> Pa
 
     invoice_rows = []
     line_item_rows = []
+    needs_review_rows = []
     for i, res in enumerate(results, start=1):
         invoice_id = f"INV-{i:04d}"
         row = {"invoice_id": invoice_id}
@@ -76,9 +87,24 @@ def export_workbook(results: list[InvoiceResult], output_path: str | Path) -> Pa
             li.update({f: _cell(getattr(item, f)) for f in LINE_ITEM_FIELDS})
             line_item_rows.append(li)
 
+        if res.needs_review:
+            suspicious = suspicious_line_item_rows(res.invoice.line_items)
+            needs_review_rows.append({
+                "invoice_id": invoice_id,
+                "source_file": res.source_file,
+                "invoice_number": row["invoice_number"],
+                "needs_review": res.needs_review,
+                "review_reason": res.review_reason,
+                "line_numbers": ", ".join(str(n) for n in suspicious) or None,
+                "line_descriptions": "; ".join(
+                    res.invoice.line_items[n - 1].description or "(no description)"
+                    for n in suspicious
+                ) or None,
+            })
+
     invoices_df = pd.DataFrame(invoice_rows, columns=INVOICE_COLUMNS)
     line_items_df = pd.DataFrame(line_item_rows, columns=LINE_ITEM_COLUMNS)
-    needs_review_df = invoices_df[invoices_df["needs_review"] == True]  # noqa: E712
+    needs_review_df = pd.DataFrame(needs_review_rows, columns=NEEDS_REVIEW_COLUMNS)
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         invoices_df.to_excel(writer, sheet_name="Invoices", index=False)

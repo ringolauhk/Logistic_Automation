@@ -1,3 +1,4 @@
+import json
 from decimal import Decimal
 
 import openpyxl
@@ -5,9 +6,10 @@ import pandas as pd
 
 from invoice_extractor.excel_export import export_workbook
 from invoice_extractor.pipeline import InvoiceResult
-from invoice_extractor.schema import empty_invoice, normalize_invoice
+from invoice_extractor.schema import empty_invoice, normalize_invoice, validate_invoice
 
 from .conftest import invoice_dict
+from .synthetic_fixtures import provider_responses as pr
 
 
 def sample_results():
@@ -128,3 +130,102 @@ class TestEdgeCases:
         assert isinstance(cell.value, (int, float))
         assert not isinstance(cell.value, str)
         assert abs(cell.value - float(Decimal("119.0"))) < 1e-9
+
+
+def _fixture_08_hallucination_result() -> InvoiceResult:
+    """Real fixture-8 hallucination data run through normalize_invoice/
+    validate_invoice (schema-level, no PDF/provider mocking needed - the full
+    pipeline path for this exact scenario is already covered by
+    test_synthetic_pipeline.py::TestFixture08HappyPath)."""
+    raw = json.loads(pr.fixture_08_hallucination_response_json())
+    inv = normalize_invoice(raw)
+    reason = validate_invoice(inv)
+    return InvoiceResult(
+        source_file="repeated_table_headers.pdf",
+        invoice=inv,
+        document_classification="text-native",
+        extraction_method="text",
+        provider="gemini",
+        model="gemini-test-text",
+        needs_review=reason is not None,
+        review_reason=reason,
+    )
+
+
+class TestNeedsReviewSheetContent:
+    def test_hallucination_case_flagged_with_line_detail(self, tmp_path):
+        result = _fixture_08_hallucination_result()
+        assert result.needs_review is True  # sanity: guardrail from the prior milestone fired
+
+        path = export_workbook([result], tmp_path / "out.xlsx")
+        review = pd.read_excel(path, sheet_name="NeedsReview")
+
+        assert len(review) == 1
+        row = review.iloc[0]
+        assert row["source_file"] == "repeated_table_headers.pdf"
+        assert row["invoice_number"] == "REP-4400"
+        assert "missing an amount" in row["review_reason"]
+        assert "possible hallucinated header/label row" in row["review_reason"]
+        assert row["line_numbers"] == "2, 5, 8"
+        assert row["line_descriptions"] == "Description; Description; Description"
+
+    def test_happy_path_invoice_produces_no_review_row(self, tmp_path):
+        ok = InvoiceResult(
+            source_file="good.pdf",
+            invoice=normalize_invoice(invoice_dict()),
+            document_classification="text-native",
+            extraction_method="text",
+            provider="gemini",
+            model="gemini-test-text",
+            needs_review=False,
+        )
+        path = export_workbook([ok], tmp_path / "out.xlsx")
+        review = pd.read_excel(path, sheet_name="NeedsReview")
+        assert review.empty
+
+    def test_failed_invoice_appears_in_needs_review_without_line_detail(self, tmp_path):
+        failed = InvoiceResult(
+            source_file="failed.pdf",
+            invoice=empty_invoice(),
+            document_classification="image-only",
+            extraction_method="failed",
+            provider="none",
+            model=None,
+            needs_review=True,
+            error=True,
+            review_reason="vision route failed on all providers: synthetic",
+        )
+        path = export_workbook([failed], tmp_path / "out.xlsx")
+
+        wb = openpyxl.load_workbook(path)
+        assert wb.sheetnames == ["Invoices", "LineItems", "NeedsReview"]  # unbroken by a failure
+
+        review = pd.read_excel(path, sheet_name="NeedsReview")
+        assert len(review) == 1
+        row = review.iloc[0]
+        assert row["source_file"] == "failed.pdf"
+        assert "failed on all providers" in row["review_reason"]
+        assert pd.isna(row["line_numbers"])  # invoice-level reason, no specific rows
+        assert pd.isna(row["line_descriptions"])
+
+    def test_multi_file_export_keeps_rows_associated_with_source_file(self, tmp_path):
+        clean = _fixture_08_hallucination_result()
+        clean.source_file = "second_hallucination.pdf"  # a second, distinct file
+        results = [_fixture_08_hallucination_result(), clean, sample_results()[0]]  # ok invoice too
+
+        path = export_workbook(results, tmp_path / "out.xlsx")
+        invoices = pd.read_excel(path, sheet_name="Invoices")
+        items = pd.read_excel(path, sheet_name="LineItems")
+        review = pd.read_excel(path, sheet_name="NeedsReview")
+
+        # every line item and every review row traces back to the correct source_file
+        by_id = dict(zip(invoices["invoice_id"], invoices["source_file"]))
+        for _, li in items.iterrows():
+            assert li["source_file"] == by_id[li["invoice_id"]]
+        for _, r in review.iterrows():
+            assert r["source_file"] == by_id[r["invoice_id"]]
+
+        assert set(review["source_file"]) == {
+            "repeated_table_headers.pdf", "second_hallucination.pdf",
+        }
+        assert "good.pdf" not in set(review["source_file"])
