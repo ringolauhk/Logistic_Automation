@@ -52,6 +52,16 @@ class InvoiceResult:
 
 
 def _chunked(items: list, size: int) -> list[list]:
+    # Defense in depth: Config.__post_init__ already rejects a non-positive
+    # max_vision_pages before any PDF/provider work starts, but this function
+    # is small and directly callable/importable on its own, so it must not
+    # silently misbehave if ever invoked with a bad size some other way.
+    # size=0 previously raised a confusing bare `ValueError: range() arg 3
+    # must not be zero`; size<0 previously returned [] silently (range with
+    # a negative step is empty when items is non-empty) - both now raise the
+    # same clear, explicit error. Positive-size behavior is unchanged.
+    if size <= 0:
+        raise ValueError(f"chunk size must be a positive integer, got {size!r}")
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 

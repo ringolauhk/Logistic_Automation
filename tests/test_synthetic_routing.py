@@ -331,17 +331,14 @@ class TestChunkPlans:
         with pytest.raises(ValueError):
             _chunked([1, 2, 3], 0)
 
-    def test_negative_limit_does_not_raise_and_silently_drops_all_pages(self):
-        # SURPRISING BEHAVIOR, DOCUMENTED NOT FIXED (see milestone report):
-        # a negative max_vision_pages does NOT raise and does NOT chunk -
-        # range(0, len(items), -1) is empty when items is non-empty, so
-        # _chunked silently returns [] (zero chunks), which would cause
-        # pipeline.process_file to attempt ZERO vision requests for a
-        # document that has image pages, with no error surfaced at the
-        # chunking layer at all. This is locked down here as CURRENT
-        # behavior, not endorsed as correct - see the milestone report's
-        # proposed fix (validate max_vision_pages >= 1 at config load time).
-        assert _chunked([1, 2, 3], -1) == []
+    def test_negative_limit_raises_clearly(self):
+        # FIXED in milestone 4 (was previously a silent [] with no error -
+        # see tests/test_config.py for the corresponding Config-level fix).
+        # _chunked itself now also rejects size<=0 directly, as defense in
+        # depth for any caller that invokes it without going through
+        # Config's validation.
+        with pytest.raises(ValueError):
+            _chunked([1, 2, 3], -1)
 
 
 # ---------------------------------------------------------------------------

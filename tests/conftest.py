@@ -143,3 +143,19 @@ def pdf_factory(tmp_path):
         return build_pdf(tmp_path / (name or f"fixture_{counter['n']}.pdf"), page_specs)
 
     return factory
+
+
+@pytest.fixture(scope="session")
+def synthetic_fixture_paths(tmp_path_factory):
+    """All ten synthetic-pack PDFs (tests/synthetic_fixtures/), built ONCE
+    for the whole test session and shared read-only across every test that
+    needs one - the image-heavy fixtures (2, 3, 9) are expensive enough that
+    rebuilding them per test or per module would blow the pipeline-test
+    performance budget for no benefit, since these files are never mutated
+    by the tests that consume them."""
+    from .synthetic_fixtures import ground_truth as gt
+    from .synthetic_fixtures import scenarios as sc
+
+    output_dir = tmp_path_factory.mktemp("synthetic_pipeline_fixtures")
+    return {core.fixture_id: sc.build_scenario(core.fixture_id, output_dir / core.filename)
+            for core in gt.ALL_CORES}

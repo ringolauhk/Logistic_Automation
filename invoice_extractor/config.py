@@ -52,6 +52,21 @@ class Config:
     save_debug_artifacts: bool
     debug_artifact_dir: str
 
+    def __post_init__(self) -> None:
+        # Runs on EVERY construction path - load_config() and direct
+        # `Config(...)` calls alike (frozen dataclasses still run
+        # __post_init__; it just can't assign attributes, which we don't
+        # need to here). This is the fix for the confirmed bug where a
+        # negative MAX_VISION_PAGES let pipeline._chunked silently return no
+        # chunks at all (range(0, n, -1) is empty), causing an image-only
+        # PDF to be misreported as having no meaningful pages instead of
+        # failing loudly at startup.
+        if self.max_vision_pages < 1:
+            raise ValueError(
+                f"MAX_VISION_PAGES must be at least 1 (got {self.max_vision_pages}); "
+                "check your .env or environment configuration."
+            )
+
 
 def load_config() -> Config:
     # Legacy single-model vars are honored as defaults for the per-route vars.
