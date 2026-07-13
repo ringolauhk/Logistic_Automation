@@ -118,8 +118,8 @@ Uses the current **`google-genai`** SDK (migrated from the deprecated
 | Variable | Default | Purpose |
 |---|---|---|
 | `GEMINI_API_KEY` / `ANTHROPIC_API_KEY` | — | provider keys (never logged) |
-| `GEMINI_TEXT_MODEL` | `gemini-2.5-flash` | text-route primary model |
-| `GEMINI_VISION_MODEL` | `gemini-2.5-flash` | vision-route primary model |
+| `GEMINI_TEXT_MODEL` | `gemini-flash-latest` | text-route primary model |
+| `GEMINI_VISION_MODEL` | `gemini-flash-latest` | vision-route primary model |
 | `CLAUDE_TEXT_MODEL` | `claude-sonnet-5` | text-route fallback model |
 | `CLAUDE_VISION_MODEL` | `claude-sonnet-5` | vision-route fallback model |
 | `ENABLE_CLAUDE_TEXT_FALLBACK` | `false` | text path stays Gemini-only by default (original cost design); vision fallback is always on |

@@ -23,14 +23,25 @@ class TestDefaults:
     def test_default_models_and_flags(self, monkeypatch):
         clean_env(monkeypatch)
         cfg = load_config()
-        assert cfg.gemini_text_model == "gemini-2.5-flash"
-        assert cfg.gemini_vision_model == "gemini-2.5-flash"
+        assert cfg.gemini_text_model == "gemini-flash-latest"
+        assert cfg.gemini_vision_model == "gemini-flash-latest"
         assert cfg.claude_text_model == "claude-sonnet-5"
         assert cfg.claude_vision_model == "claude-sonnet-5"
         assert cfg.enable_claude_text_fallback is False  # original routing design
         assert cfg.save_debug_artifacts is False  # privacy default
         assert cfg.total_abs_tolerance == Decimal("0.02")
         assert cfg.total_rel_tolerance == Decimal("0.005")
+
+    def test_default_gemini_model_is_not_a_known_retired_alias(self, monkeypatch):
+        # Regression test for the 2026-07-13 live-doctor finding: "gemini-2.5-flash"
+        # returns 404 "no longer available to new users" despite still being
+        # enumerated by models.list(). Guards against reverting to it or another
+        # known-retired alias without re-running `doctor --live` first.
+        clean_env(monkeypatch)
+        cfg = load_config()
+        retired_aliases = {"gemini-2.5-flash", "gemini-pro-vision", "gemini-1.0-pro"}
+        assert cfg.gemini_text_model not in retired_aliases
+        assert cfg.gemini_vision_model not in retired_aliases
 
 
 class TestOverrides:

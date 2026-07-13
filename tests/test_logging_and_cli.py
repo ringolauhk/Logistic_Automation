@@ -2,6 +2,7 @@ import logging
 
 from click.testing import CliRunner
 
+from invoice_extractor import claude_client, gemini_client
 from invoice_extractor.cli import cli
 from invoice_extractor.logging_setup import exc_summary, new_run_id, setup_logging
 
@@ -90,6 +91,73 @@ class TestProbeErrorClassification:
         ]
         for exc, expected in cases:
             assert classify_probe_error(exc) == expected, (type(exc).__name__, expected)
+
+
+class TestDoctorLiveFiltering:
+    """--provider/--route restrict which of the 4 probes run.
+
+    All provider calls are mocked - these tests make no network calls and
+    only need fake key env vars to get past the `gem`/`claude` presence gate.
+    """
+
+    def _invoke(self, tmp_path, monkeypatch, extra_args, gen_ret="OK", req_ret="OK"):
+        monkeypatch.setenv("GEMINI_API_KEY", "fake-gemini-key")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-anthropic-key")
+        monkeypatch.setattr(gemini_client, "_generate", lambda cfg, model, contents: gen_ret)
+        monkeypatch.setattr(claude_client, "_request", lambda cfg, model, content: req_ret)
+        samples = tmp_path / "samples"
+        samples.mkdir()
+        return CliRunner().invoke(
+            cli, ["doctor", "--input", str(samples), "--output", str(tmp_path / "out"),
+                  "--live", *extra_args],
+        )
+
+    def test_default_runs_all_four_probes(self, tmp_path, monkeypatch):
+        result = self._invoke(tmp_path, monkeypatch, [])
+        assert result.exit_code == 0, result.output
+        for label in ("gemini text", "gemini vision", "claude text", "claude vision"):
+            assert label in result.output
+
+    def test_provider_gemini_only(self, tmp_path, monkeypatch):
+        result = self._invoke(tmp_path, monkeypatch, ["--provider", "gemini"])
+        assert result.exit_code == 0, result.output
+        assert "gemini text" in result.output and "gemini vision" in result.output
+        assert "claude text" not in result.output and "claude vision" not in result.output
+
+    def test_provider_claude_only(self, tmp_path, monkeypatch):
+        result = self._invoke(tmp_path, monkeypatch, ["--provider", "claude"])
+        assert result.exit_code == 0, result.output
+        assert "claude text" in result.output and "claude vision" in result.output
+        assert "gemini text" not in result.output and "gemini vision" not in result.output
+
+    def test_route_text_only(self, tmp_path, monkeypatch):
+        result = self._invoke(tmp_path, monkeypatch, ["--route", "text"])
+        assert result.exit_code == 0, result.output
+        assert "gemini text" in result.output and "claude text" in result.output
+        assert "gemini vision" not in result.output and "claude vision" not in result.output
+
+    def test_route_vision_only(self, tmp_path, monkeypatch):
+        result = self._invoke(tmp_path, monkeypatch, ["--route", "vision"])
+        assert result.exit_code == 0, result.output
+        assert "gemini vision" in result.output and "claude vision" in result.output
+        assert "gemini text" not in result.output and "claude text" not in result.output
+
+    def test_single_provider_and_route_combination(self, tmp_path, monkeypatch):
+        result = self._invoke(
+            tmp_path, monkeypatch, ["--provider", "gemini", "--route", "vision"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "gemini vision" in result.output
+        for label in ("gemini text", "claude text", "claude vision"):
+            assert label not in result.output
+
+    def test_invalid_provider_rejected(self, tmp_path, monkeypatch):
+        result = self._invoke(tmp_path, monkeypatch, ["--provider", "bogus"])
+        assert result.exit_code != 0
+
+    def test_invalid_route_rejected(self, tmp_path, monkeypatch):
+        result = self._invoke(tmp_path, monkeypatch, ["--route", "bogus"])
+        assert result.exit_code != 0
 
 
 class TestClassifyCommand:

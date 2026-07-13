@@ -6,7 +6,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+# "gemini-2.5-flash" was confirmed via `doctor --live` (2026-07-13) to return
+# a 404 "no longer available to new users" for current API keys, despite
+# still being enumerated by models.list(). "gemini-flash-latest" is Google's
+# alias for the current recommended flash model and was confirmed working
+# for both text and vision via `doctor --live`.
+DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-5"
 
 

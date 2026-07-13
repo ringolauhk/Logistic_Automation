@@ -206,14 +206,21 @@ def _tiny_png() -> bytes:
 @click.option("--output", "output_dir", default="./output", show_default=True,
               type=click.Path(path_type=Path))
 @click.option("--live", is_flag=True,
-              help="Make one minimal request per provider/route to confirm the "
-                   "configured models are accepted. Sends a tiny generated probe, "
+              help="Make one minimal request per selected provider/route to confirm "
+                   "the configured models are accepted. Sends a tiny generated probe, "
                    "NEVER an invoice. Costs a few tokens.")
-def doctor(input_dir: Path, output_dir: Path, live: bool):
+@click.option("--provider", type=click.Choice(["gemini", "claude", "all"]),
+              default="all", show_default=True,
+              help="Restrict --live probes to one provider.")
+@click.option("--route", type=click.Choice(["text", "vision", "all"]),
+              default="all", show_default=True,
+              help="Restrict --live probes to one route.")
+def doctor(input_dir: Path, output_dir: Path, live: bool, provider: str, route: str):
     """Health check: environment, dependencies, paths, keys, models.
 
     Offline by default. With --live, makes the smallest practical provider
-    request per configured model to confirm acceptance.
+    request per configured model to confirm acceptance. --provider/--route
+    narrow which of the four probes run (default: all four).
     """
     cfg = load_config()
     ok = True
@@ -269,14 +276,21 @@ def doctor(input_dir: Path, output_dir: Path, live: bool):
            if (gem or claude) else "blocked: no keys")
 
     if live:
-        click.echo("Live probes (tiny generated content, never an invoice):")
+        run_gemini = provider in ("gemini", "all")
+        run_claude = provider in ("claude", "all")
+        run_text = route in ("text", "all")
+        run_vision = route in ("vision", "all")
+        click.echo(f"Live probes (tiny generated content, never an invoice; "
+                   f"provider={provider} route={route}):")
         probe_prompt = "Reply with exactly: OK"
-        if gem:
+        if run_gemini and gem:
             from invoice_extractor import gemini_client
-            for label, model, contents in (
-                ("gemini text", cfg.gemini_text_model, [probe_prompt]),
-                ("gemini vision", cfg.gemini_vision_model, None),
-            ):
+            candidates = []
+            if run_text:
+                candidates.append(("gemini text", cfg.gemini_text_model, [probe_prompt]))
+            if run_vision:
+                candidates.append(("gemini vision", cfg.gemini_vision_model, None))
+            for label, model, contents in candidates:
                 try:
                     if contents is None:
                         from google.genai import types as genai_types
@@ -287,9 +301,9 @@ def doctor(input_dir: Path, output_dir: Path, live: bool):
                     ok &= _check(True, f"{label} ({model})", "model accepted")
                 except Exception as exc:
                     ok &= _check(False, f"{label} ({model})", classify_probe_error(exc))
-        else:
+        elif run_gemini:
             click.echo("  [skip] gemini probes - no key")
-        if claude:
+        if run_claude and claude:
             import base64
             from invoice_extractor import claude_client
             vision_content = [
@@ -298,16 +312,18 @@ def doctor(input_dir: Path, output_dir: Path, live: bool):
                             "data": base64.standard_b64encode(_tiny_png()).decode()}},
                 {"type": "text", "text": probe_prompt},
             ]
-            for label, model, content in (
-                ("claude text", cfg.claude_text_model, probe_prompt),
-                ("claude vision", cfg.claude_vision_model, vision_content),
-            ):
+            candidates = []
+            if run_text:
+                candidates.append(("claude text", cfg.claude_text_model, probe_prompt))
+            if run_vision:
+                candidates.append(("claude vision", cfg.claude_vision_model, vision_content))
+            for label, model, content in candidates:
                 try:
                     claude_client._request(cfg, model, content)
                     ok &= _check(True, f"{label} ({model})", "model accepted")
                 except Exception as exc:
                     ok &= _check(False, f"{label} ({model})", classify_probe_error(exc))
-        else:
+        elif run_claude:
             click.echo("  [skip] claude probes - no key")
     else:
         click.echo("(offline mode - pass --live for minimal provider probes)")
