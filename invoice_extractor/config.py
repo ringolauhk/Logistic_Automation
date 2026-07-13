@@ -101,3 +101,19 @@ def describe_models(cfg: Config) -> str:
         f"claude_vision={cfg.claude_vision_model} "
         f"claude_text_fallback={'on' if cfg.enable_claude_text_fallback else 'off'}"
     )
+
+
+def provider_key_status(cfg: Config) -> dict[str, bool]:
+    """Single source of truth for "is this provider's key configured" -
+    booleans only, never the key values themselves. `doctor` and `run` both
+    report this same status (for different purposes: an upfront console
+    warning vs. a health-check display) and previously each recomputed
+    `bool(cfg.x_api_key)` separately; this is the one place that fact is
+    derived. Actual enforcement (raising when a call is attempted without a
+    key) still lives where it belongs - in each provider client's own
+    _get_client() - this function never raises, only reports.
+    """
+    return {
+        "gemini": bool(cfg.gemini_api_key),
+        "anthropic": bool(cfg.anthropic_api_key),
+    }

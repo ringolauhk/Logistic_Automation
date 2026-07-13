@@ -2,7 +2,7 @@ from decimal import Decimal
 
 import pytest
 
-from invoice_extractor.config import describe_models, load_config
+from invoice_extractor.config import describe_models, load_config, provider_key_status
 from invoice_extractor.pipeline import _chunked
 
 from .conftest import make_config
@@ -169,3 +169,31 @@ class TestSecretsNeverInModelLog:
         assert "SECRET-GEM" not in line
         assert "SECRET-CLAUDE" not in line
         assert "gemini-test-text" in line
+
+
+class TestProviderKeyStatus:
+    """The single place `doctor` and `run` both read "is this key
+    configured" from - see config.py's provider_key_status docstring for why
+    this replaced two separate bool(cfg.x_api_key) call sites."""
+
+    def test_both_keys_set(self):
+        cfg = make_config(gemini_api_key="x", anthropic_api_key="y")
+        assert provider_key_status(cfg) == {"gemini": True, "anthropic": True}
+
+    def test_both_keys_missing(self):
+        cfg = make_config(gemini_api_key=None, anthropic_api_key=None)
+        assert provider_key_status(cfg) == {"gemini": False, "anthropic": False}
+
+    def test_only_gemini_set(self):
+        cfg = make_config(gemini_api_key="x", anthropic_api_key=None)
+        assert provider_key_status(cfg) == {"gemini": True, "anthropic": False}
+
+    def test_empty_string_counts_as_missing(self):
+        cfg = make_config(gemini_api_key="", anthropic_api_key=None)
+        assert provider_key_status(cfg) == {"gemini": False, "anthropic": False}
+
+    def test_never_leaks_key_values(self):
+        cfg = make_config(gemini_api_key="SECRET-GEM", anthropic_api_key="SECRET-CLAUDE")
+        status = provider_key_status(cfg)
+        assert "SECRET-GEM" not in str(status)
+        assert "SECRET-CLAUDE" not in str(status)

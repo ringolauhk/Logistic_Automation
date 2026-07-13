@@ -38,6 +38,13 @@ class TestEnvExample:
         gitignore_lines = (REPO_ROOT / ".gitignore").read_text().splitlines()
         assert ".env" in gitignore_lines
 
+    def test_documents_provider_key_roles(self):
+        content = ENV_EXAMPLE.read_text()
+        assert "GEMINI_API_KEY" in content and "ANTHROPIC_API_KEY" in content
+        assert "fallback" in content.lower()
+        assert "required" in content.lower()
+        assert "optional" in content.lower()
+
 
 class TestReadmeUsageDocs:
     def test_mentions_real_cli_run_command(self):
@@ -58,6 +65,13 @@ class TestReadmeUsageDocs:
         content = README.read_text()
         for shape in ("sk-ant-", "sk-proj-", "AIza"):
             assert shape not in content
+
+    def test_documents_gemini_and_claude_provider_roles(self):
+        content = README.read_text()
+        assert "GEMINI_API_KEY" in content and "ANTHROPIC_API_KEY" in content
+        assert "Gemini" in content and "Claude" in content
+        assert "fallback" in content.lower()
+        assert "doctor" in content.lower()  # points operators at the status command
 
 
 class TestPackageImportWithoutKeys:

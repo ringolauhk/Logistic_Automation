@@ -13,7 +13,7 @@ from pathlib import Path
 import click
 
 from invoice_extractor import pdf_utils
-from invoice_extractor.config import describe_models, load_config
+from invoice_extractor.config import describe_models, load_config, provider_key_status
 from invoice_extractor.excel_export import export_workbook
 from invoice_extractor.logging_setup import exc_summary, new_run_id, setup_logging
 from invoice_extractor.pipeline import InvoiceResult, find_pdfs, process_directory
@@ -91,9 +91,10 @@ def run(input_dir: Path, output_path: Path, log_file: Path | None):
 
     logger.info("run %s starting; %s", run_id, describe_models(cfg))
 
-    if not cfg.gemini_api_key:
+    key_status = provider_key_status(cfg)
+    if not key_status["gemini"]:
         logger.warning("GEMINI_API_KEY not set - Gemini calls will fail")
-    if not cfg.anthropic_api_key:
+    if not key_status["anthropic"]:
         logger.warning("ANTHROPIC_API_KEY not set - Claude fallback is unavailable")
 
     if not find_pdfs(input_dir):
@@ -298,10 +299,16 @@ def doctor(input_dir: Path, output_dir: Path, live: bool, provider: str, route: 
         ok &= _check(False, f"output dir {output_dir}", f"not writable: {type(exc).__name__}")
 
     click.echo("API keys (values never printed):")
-    gem = bool(cfg.gemini_api_key)
-    claude = bool(cfg.anthropic_api_key)
+    key_status = provider_key_status(cfg)
+    gem = key_status["gemini"]
+    claude = key_status["anthropic"]
     _check(gem, "GEMINI_API_KEY", "set" if gem else "NOT SET")
     _check(claude, "ANTHROPIC_API_KEY", "set" if claude else "NOT SET")
+
+    click.echo("Provider roles (fixed by design - not a user-selectable choice):")
+    click.echo("  text route:   Gemini only, unless ENABLE_CLAUDE_TEXT_FALLBACK=true "
+               "(then Claude is the fallback)")
+    click.echo("  vision route: Gemini primary, Claude fallback (always on if its key is set)")
 
     click.echo("Models (configured names; only --live confirms acceptance):")
     click.echo(f"  gemini_text   = {cfg.gemini_text_model}")

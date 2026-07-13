@@ -117,6 +117,26 @@ Uses the current **`google-genai`** SDK (migrated from the deprecated
 contains real keys. `.env` itself is git-ignored: **never commit your real
 provider keys.**
 
+### Providers: Gemini and Claude
+
+Provider roles are **fixed by design** — this is not a "pick Claude or
+Gemini" setting:
+
+| | Required? | Role |
+|---|---|---|
+| **Gemini** (`GEMINI_API_KEY`) | **Required** for any real extraction | Primary provider for both the text route and the vision route |
+| **Claude** (`ANTHROPIC_API_KEY`) | Optional | Vision-route fallback (used automatically if Gemini vision fails); text-route fallback too, but only if `ENABLE_CLAUDE_TEXT_FALLBACK=true` |
+
+Leave `ANTHROPIC_API_KEY` blank to run Gemini-only — vision extraction still
+works, it just has no fallback if Gemini vision fails on a given file (that
+file is flagged `needs_review`, the batch still completes).
+
+**Neither key is required** to import the package, run `--help`, run
+`classify`/`render` (offline stage tests), or run `doctor` in its default
+(non-`--live`) mode — those never call a provider. Run
+`python -m invoice_extractor doctor` any time to see exactly which keys are
+configured (values are never printed) and what that enables.
+
 ### Configuration (environment variables)
 
 | Variable | Default | Purpose |

@@ -63,6 +63,27 @@ class TestDoctorOffline:
         )
         assert "sk-gem-VALUE-SHOULD-NOT-PRINT" not in result.output
 
+    def test_doctor_shows_provider_roles_and_key_status_no_secrets(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("GEMINI_API_KEY", "sk-gem-SHOULD-NOT-PRINT")
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        samples = tmp_path / "samples"
+        samples.mkdir()
+
+        result = CliRunner().invoke(
+            cli, ["doctor", "--input", str(samples), "--output", str(tmp_path / "out")]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "GEMINI_API_KEY" in result.output and "set" in result.output
+        assert "ANTHROPIC_API_KEY" in result.output and "NOT SET" in result.output
+        assert "sk-gem-SHOULD-NOT-PRINT" not in result.output
+        # fixed provider roles are stated explicitly, not left implicit
+        assert "Provider roles" in result.output
+        assert "fallback" in result.output.lower()
+        assert "text route" in result.output and "vision route" in result.output
+
 
 class TestProbeErrorClassification:
     def test_categories(self):
@@ -247,6 +268,30 @@ class TestRunCommand:
         assert output.exists()
         assert "Files processed:      2" in result.output
         assert "Failed/problem:       1" in result.output
+
+    def test_missing_gemini_key_is_clean_review_not_crash(self, tmp_path, monkeypatch):
+        # No key configured at all, and gemini_client._generate is NOT
+        # mocked - this exercises the real _get_client() RuntimeError guard
+        # end to end. Missing a provider key is a review outcome, not a CLI
+        # failure (see README "Review outcomes vs program failure").
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        samples = tmp_path / "samples"
+        samples.mkdir()
+        build_pdf(samples / "inv.pdf", [("text", TEXT_BODY)])
+        output = tmp_path / "out" / "results.xlsx"
+
+        result = CliRunner().invoke(
+            cli, ["run", "--input", str(samples), "--output", str(output)]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Traceback" not in result.output
+        assert output.exists()
+        assert "Needs review:         1" in result.output
+        assert "Failed/problem:       1" in result.output
+        review = pd.read_excel(output, sheet_name="NeedsReview")
+        assert "GEMINI_API_KEY" in review.iloc[0]["review_reason"]
 
     def test_missing_input_folder_exits_nonzero(self, tmp_path):
         result = CliRunner().invoke(
