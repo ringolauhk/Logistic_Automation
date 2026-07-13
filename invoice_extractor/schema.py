@@ -220,6 +220,21 @@ def check_required(inv: Invoice) -> None:
         raise ExtractionError(f"missing required fields: {', '.join(missing)}")
 
 
+def suspicious_line_item_rows(items: list[LineItem]) -> list[int]:
+    """1-based indices of line items with no amount at all.
+
+    A genuine line item always contributes a monetary amount to the
+    invoice. A row with no amount is already invisible to totals
+    reconciliation (see validate_invoice's `amounts` filter below) and is
+    far more likely to be a hallucinated table header/label row than a real
+    charge - e.g. a repeated column header ("Description", "Qty", ...)
+    the model mistook for an item on a continuation page. Rows are never
+    dropped for this (normalize_invoice's filter is unchanged); this only
+    flags them for human review.
+    """
+    return [i for i, it in enumerate(items, start=1) if it.amount is None]
+
+
 def validate_invoice(
     inv: Invoice,
     abs_tolerance: Decimal = Decimal("0.02"),
@@ -242,6 +257,12 @@ def validate_invoice(
     rounding, so an unexplained difference may be a legitimate charge the
     schema cannot represent. Missing amounts are never invented (a None tax
     is only treated as absent, not as zero, except via check 2).
+
+    Independently of the arithmetic checks, any line item missing an amount
+    is flagged via suspicious_line_item_rows() - see its docstring. This
+    fires even when the arithmetic itself reconciles (a hallucinated
+    amount-less row doesn't change the sum), which is exactly the case it
+    is designed to catch.
     """
     reasons = []
 
@@ -253,6 +274,14 @@ def validate_invoice(
     if not items:
         reasons.append("no line items extracted")
     else:
+        suspicious = suspicious_line_item_rows(items)
+        if suspicious:
+            rows = ", ".join(str(i) for i in suspicious)
+            reasons.append(
+                f"{len(suspicious)} line item(s) missing an amount (row(s) {rows}); "
+                "possible hallucinated header/label row - review line items before use"
+            )
+
         amounts = [it.amount for it in items if it.amount is not None]
         total = inv.total_amount
         if not amounts:

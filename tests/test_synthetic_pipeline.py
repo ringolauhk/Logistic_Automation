@@ -291,17 +291,18 @@ class TestFixture08HappyPath:
         assert result.needs_review is False
         assert recorder.gemini_text_count == 1
 
-    def test_variant_b_header_hallucination_known_gap_not_endorsed(
+    def test_variant_b_header_hallucination_now_flagged_for_review(
         self, synthetic_fixture_paths, cfg, logger, monkeypatch
     ):
-        # DOCUMENTS A KNOWN APPLICATION GAP - does not endorse it as correct.
         # See ground_truth.py's FIXTURE_08.corrupted.known_gap: a header-
         # shaped row with only `description` set survives
-        # normalize_invoice's any()-based filter. Because its amount is
-        # null, it's excluded from validate_invoice's sum, so there is no
-        # arithmetic impact and no review trigger - 3 spurious rows pass
-        # through completely undetected. This test locks down that CURRENT
-        # behavior; it is not a statement that the behavior is desirable.
+        # normalize_invoice's any()-based filter (rows are never dropped, by
+        # design). Previously this passed through completely undetected -
+        # amount is null, so it's excluded from validate_invoice's sum, and
+        # there was no other review trigger. schema.py's
+        # suspicious_line_item_rows() now independently flags any line item
+        # with no amount, so this scenario sets needs_review=True even
+        # though the arithmetic reconciles.
         path = synthetic_fixture_paths["fixture_08_repeated_table_headers"]
         recorder = pr.install_provider_seams(
             monkeypatch, cfg, gemini_text=[pr.fixture_08_hallucination_response_json()],
@@ -309,12 +310,46 @@ class TestFixture08HappyPath:
 
         result = process_file(path, cfg, logger)
 
-        assert len(result.invoice.line_items) == 9  # 6 real + 3 spurious header rows
+        assert len(result.invoice.line_items) == 9  # 6 real + 3 spurious header rows, not dropped
         spurious = [li for li in result.invoice.line_items if li.description == "Description"]
         assert len(spurious) == 3
         assert all(li.amount is None for li in spurious)
-        assert result.needs_review is False  # <- the gap, locked down not fixed
+        assert result.needs_review is True
+        for substring in gt.FIXTURE_08.corrupted.expected_review_reason_contains:
+            assert substring in result.review_reason
         assert recorder.gemini_text_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Guardrail on the vision/OCR path (fixture 8 above only exercises text)
+# ---------------------------------------------------------------------------
+
+class TestVisionPathHallucinationGuardrail:
+    def test_spurious_row_in_vision_response_flagged_for_review(
+        self, synthetic_fixture_paths, logger, monkeypatch
+    ):
+        # Same guardrail as fixture 8's text-path test, exercised through a
+        # real vision call instead, to confirm suspicious_line_item_rows()
+        # is reached identically regardless of extraction_method - it lives
+        # in validate_invoice, downstream of both routes.
+        cfg = make_config(max_vision_pages=7)  # all 7 pages in a single chunk
+        path = synthetic_fixture_paths["fixture_02_multipage_scanned_exceeds_limit"]
+        recorder = pr.install_provider_seams(
+            monkeypatch, cfg,
+            gemini_vision=[pr.fixture_02_vision_hallucination_response_json()],
+        )
+
+        result = process_file(path, cfg, logger)
+
+        assert result.extraction_method == "vision"
+        assert len(result.invoice.line_items) == 8  # 7 real + 1 spurious header row
+        spurious = [li for li in result.invoice.line_items if li.description == "Description"]
+        assert len(spurious) == 1
+        assert spurious[0].amount is None
+        assert result.needs_review is True
+        assert "1 line item(s) missing an amount" in result.review_reason
+        assert "possible hallucinated header/label row" in result.review_reason
+        assert recorder.gemini_vision_count == 1
 
 
 # ---------------------------------------------------------------------------

@@ -131,6 +131,23 @@ def fixture_05_response_json() -> str:
 
 
 # =============================================================================
+# Fixture 2 - vision-path counterpart of the header-hallucination guardrail
+# =============================================================================
+
+def fixture_02_vision_hallucination_response_json() -> str:
+    """Same guardrail scenario as fixture 8, but via a single vision call
+    (all 7 pages in one chunk) instead of the text route: 7 genuine rows
+    plus 1 header-shaped row (only `description` set, all numeric fields
+    null), to prove suspicious_line_item_rows() is not text-route-specific
+    - validate_invoice runs identically regardless of extraction_method."""
+    scenario = gt.FIXTURE_02
+    items = [_line_item_dict(li) for li in scenario.expected_line_items] + [
+        {"description": "Description", "quantity": None, "unit_price": None, "amount": None},
+    ]
+    return invoice_response_json(scenario, line_items=items)
+
+
+# =============================================================================
 # Fixture 8 - clean vs header-hallucination model output
 # =============================================================================
 

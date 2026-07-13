@@ -190,6 +190,7 @@ class ExpectedHeaderHallucinationVariant:
     resulting_line_item_count: int
     expected_arithmetic_status_benchmark_label: ArithmeticBenchmarkLabel
     expected_needs_review: bool
+    expected_review_reason_contains: tuple[str, ...]  # substrings that must ALL appear
     known_gap: str  # non-empty only when this variant exposes an application gap
 
 
@@ -788,15 +789,25 @@ _FIXTURE_08_CLEAN = ExpectedInvoiceScenario(
 #         items.append(LineItem(**fields))
 # A row with description="Description" and quantity/unit_price/amount all
 # None has `any(...)` = True (description alone is non-null), so THIS ROW
-# SURVIVES the filter. It is not dropped.
+# SURVIVES the filter. It is not dropped, by design - the guardrail below
+# flags suspicious rows for human review rather than silently discarding
+# them (a dropped row could just as easily have been a real, badly-OCR'd
+# charge).
 #
 # Consequence: normalize_invoice returns 9 line items (6 real + 3 spurious),
 # not 6. Because each spurious row's amount is None, it is excluded from
 # validate_invoice's `amounts = [it.amount for it in items if it.amount is
 # not None]` list, so sum(line_items.amount) is still exactly 600.00 (only
 # the 6 real amounts contribute) and rule 2 (sum ~= total, zero tax) still
-# passes. No arithmetic reason is triggered, and validate_invoice has no
-# separate "line-item count" sanity check - so needs_review stays False.
+# passes - the arithmetic reconciles regardless.
+#
+# GUARDRAIL (added 2026-07-13, schema.py:suspicious_line_item_rows): any
+# line item with amount=None is now independently flagged - a genuine line
+# item always contributes a monetary amount, so an amount-less row is
+# treated as a likely hallucinated header/label row. This fires even though
+# arithmetic reconciles, which is exactly the case it exists to catch.
+# validate_invoice appends a reason naming the affected 1-based row indices
+# (2, 5, 8 for this fixture) and needs_review becomes True.
 #
 # This is also true for aggregation: fixture 8 is a SINGLE text route (all 3
 # pages concatenated into one Gemini call), so aggregate() takes the
@@ -805,11 +816,11 @@ _FIXTURE_08_CLEAN = ExpectedInvoiceScenario(
 # (which requires all four fields non-null to even consider two items
 # "the same") never gets a chance to remove these spurious rows either,
 # since it only compares items ACROSS separate RouteResults, not within one.
+# The guardrail above does not depend on aggregation, so this is unaffected.
 #
-# NET RESULT: a corrupted extraction with 3 hallucinated header rows is
-# currently indistinguishable, by any existing review trigger, from a clean
-# one. This is a genuine, currently-unaddressed application gap. It is
-# documented here, NOT fixed in this milestone.
+# NET RESULT: a corrupted extraction with 3 hallucinated header rows is now
+# flagged for review via review_reason, while the rows themselves are still
+# preserved (not dropped) so a human reviewer can inspect them directly.
 _FIXTURE_08_CORRUPTED = ExpectedHeaderHallucinationVariant(
     variant_name="header_hallucination_output",
     raw_model_line_items=(
@@ -826,16 +837,22 @@ _FIXTURE_08_CORRUPTED = ExpectedHeaderHallucinationVariant(
     survives_normalization=True,
     resulting_line_item_count=9,
     expected_arithmetic_status_benchmark_label="reconciled",  # sum of non-null amounts is unaffected
-    expected_needs_review=False,  # <- the gap: no review trigger despite 3 spurious rows
+    expected_needs_review=True,  # guardrail: 3 rows have no amount at all
+    expected_review_reason_contains=(
+        "missing an amount",
+        "row(s) 2, 5, 8",
+        "possible hallucinated header/label row",
+    ),
     known_gap=(
         "normalize_invoice() keeps any row where at least one field is "
         "non-null. A header-shaped row with only `description` set survives "
         "and inflates line_item_count from 6 to 9 with zero effect on "
         "validate_invoice's arithmetic (its amount is null, so it is "
-        "excluded from the sum) and zero effect on needs_review (there is "
-        "no line-item-count sanity check). A corrupted extraction can "
-        "therefore pass through completely undetected by every current "
-        "review trigger."
+        "excluded from the sum). FIXED: validate_invoice now separately "
+        "flags any line item with no amount via suspicious_line_item_rows(), "
+        "so this scenario now sets needs_review=True even though the "
+        "arithmetic reconciles. The rows still survive normalization (not "
+        "dropped) - only flagged for human review."
     ),
 )
 

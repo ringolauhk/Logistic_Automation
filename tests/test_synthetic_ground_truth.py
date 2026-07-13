@@ -327,6 +327,18 @@ class TestFixture08Corrections:
     def test_clean_variant_has_exactly_six_items(self):
         assert len(gt.FIXTURE_08.clean.expected_line_items) == 6
 
+    def test_corrupted_variant_now_flagged_for_review(self):
+        # The guardrail fix: amount-less rows are flagged even though the
+        # arithmetic still reconciles (their absence doesn't move the sum).
+        corrupted = gt.FIXTURE_08.corrupted
+        assert corrupted.expected_arithmetic_status_benchmark_label == "reconciled"
+        assert corrupted.expected_needs_review is True
+        assert corrupted.expected_review_reason_contains == (
+            "missing an amount",
+            "row(s) 2, 5, 8",
+            "possible hallucinated header/label row",
+        )
+
 
 class TestFixture09Corrections:
     def test_two_chunk_settings_defined(self):
