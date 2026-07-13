@@ -12,3 +12,6 @@ samples/*.pdf
 # never commit real invoice PDFs or their outputs/manifests.
 real_invoice_test/
 real_invoice_test_*/
+
+# macOS Finder metadata
+.DS_Store
