@@ -113,6 +113,10 @@ Uses the current **`google-genai`** SDK (migrated from the deprecated
 `google-generativeai` package, which Google has end-of-lifed) and the
 `anthropic` SDK. Keys come from `.env` / environment only.
 
+`.env.example` is a committed template with placeholder values — it never
+contains real keys. `.env` itself is git-ignored: **never commit your real
+provider keys.**
+
 ### Configuration (environment variables)
 
 | Variable | Default | Purpose |
@@ -150,6 +154,33 @@ python -m invoice_extractor run --input ./samples --output ./output/results.xlsx
 # Smoke script (same pipeline + printed summary)
 python test_pipeline.py
 ```
+
+### First successful run
+
+1. Drop a few invoice PDFs into `samples/` (two generated fixtures — one
+   text-native, one scanned-image — are already there so you can try this
+   immediately; delete them once you have real samples. See
+   [samples/README.md](samples/README.md)).
+2. Preview routing at no cost: `python -m invoice_extractor classify --input ./samples`
+   shows which pages will go to the text route vs the vision route, before
+   any tokens are spent.
+3. Run the full pipeline:
+   ```bash
+   python -m invoice_extractor run --input ./samples --output ./output/results.xlsx
+   ```
+4. Open `output/results.xlsx` and check all three sheets:
+   - **Invoices** — one row per file: header fields plus extraction
+     provenance (`document_classification`, `extraction_method`, `provider`,
+     `model`, page ranges, `needs_review`, `review_reason`).
+   - **LineItems** — every extracted line item, tied back to its invoice via
+     `invoice_id`.
+   - **NeedsReview** — only the rows worth a human look: file name, invoice
+     number, a human-readable `review_reason`, and — when the flag traces to
+     specific line rows (e.g. a suspicious hallucinated row) —
+     `line_numbers`/`line_descriptions` pointing at exactly which lines to
+     check.
+5. Exit code `0` means the batch *completed*, not that every invoice is
+   clean — always check `NeedsReview` after a run.
 
 ### Review outcomes vs program failure (exit codes)
 
