@@ -7,3 +7,8 @@ output/
 # (Test fixtures are generated on the fly by the test suite.)
 samples/*.pdf
 .claude/
+
+# Dedicated directories for controlled real-invoice validation milestones -
+# never commit real invoice PDFs or their outputs/manifests.
+real_invoice_test/
+real_invoice_test_*/
