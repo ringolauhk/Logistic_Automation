@@ -63,15 +63,25 @@ def _request(cfg: Config, model: str, content) -> str:
     return "".join(block.text for block in resp.content if block.type == "text")
 
 
-def _finalize(cfg: Config, raw_text: str, label: str) -> Invoice:
-    save_debug_artifact(cfg, label, raw_text)
-    data = parse_json_response(raw_text)
+def _finalize(cfg: Config, raw_text: str, label: str, model: str) -> Invoice:
+    """No repair retry here (unlike gemini_client) - Claude is already the
+    final safety net; a still-unusable Claude response is meant to surface
+    as the ordinary needs_review/failure outcome, not be retried further."""
+    try:
+        data = parse_json_response(raw_text)
+    except ExtractionError as exc:
+        save_debug_artifact(cfg, label, model=model, reason=str(exc), raw_text=raw_text)
+        raise
     extras = unknown_keys(data)
     if extras:
         logger.debug("%s: dropped %d unexpected key(s): %s",
                      label, len(extras), ", ".join(extras[:8]))
     inv = normalize_invoice(data)
-    check_required(inv)
+    try:
+        check_required(inv)
+    except ExtractionError as exc:
+        save_debug_artifact(cfg, label, model=model, reason=str(exc), raw_text=raw_text)
+        raise
     return inv
 
 
@@ -82,7 +92,7 @@ def extract_from_text(cfg: Config, invoice_text: str, label: str = "claude_text"
         is_transient, cfg.max_retries, label,
     )
     logger.debug("%s: model=%s attempts=%d", label, cfg.claude_text_model, attempts)
-    return _finalize(cfg, raw, label)
+    return _finalize(cfg, raw, label, cfg.claude_text_model)
 
 
 def extract_from_images(cfg: Config, images: list[bytes], label: str = "claude_vision") -> Invoice:
@@ -104,4 +114,4 @@ def extract_from_images(cfg: Config, images: list[bytes], label: str = "claude_v
         is_transient, cfg.max_retries, label,
     )
     logger.debug("%s: model=%s attempts=%d", label, cfg.claude_vision_model, attempts)
-    return _finalize(cfg, raw, label)
+    return _finalize(cfg, raw, label, cfg.claude_vision_model)

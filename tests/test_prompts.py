@@ -33,3 +33,13 @@ class TestParseJsonResponse:
     def test_non_object_json_raises(self):
         with pytest.raises(ExtractionError):
             parse_json_response('["a", "list"]')
+
+    def test_truncated_json_raises(self):
+        # Cut off mid-array, as a response might be if generation stopped early.
+        truncated = '{"invoice_number": "INV-1", "line_items": [{"description": "x"'
+        with pytest.raises(ExtractionError):
+            parse_json_response(truncated)
+
+    def test_prose_with_no_json_at_all_raises(self):
+        with pytest.raises(ExtractionError):
+            parse_json_response("I'm sorry, I cannot process this document.")

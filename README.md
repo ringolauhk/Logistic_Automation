@@ -33,6 +33,26 @@ flowchart TD
 If **all** routes fail for a file, a null row is still emitted with
 `needs_review=true` — one bad file never stops the batch.
 
+### Gemini JSON-repair retry
+
+Before "bad JSON" ever counts as a Gemini failure (and triggers the Claude
+fallback above), two things happen first:
+
+1. **Local cleanup** (always, free, no extra call): strips markdown code
+   fences and extracts the outermost `{...}` object from surrounding prose.
+   Handles the common "here's your JSON: ```json ... ```" case with zero
+   extra latency or cost.
+2. **One repair retry** (only if local cleanup still can't produce valid
+   JSON): a single follow-up request to the *same* Gemini model, echoing
+   back its own invalid response (and, on the vision route, the same
+   image(s) again) with an explicit instruction to return strict JSON only.
+   Exactly one attempt — never a retry loop.
+
+Only if both of those fail does it count as a Gemini failure for fallback
+purposes. This is why enabling `ENABLE_CLAUDE_TEXT_FALLBACK` should now be
+needed less often in practice than before - most malformed-JSON cases
+self-heal before Claude is ever involved.
+
 ### Vision page chunking
 
 `MAX_VISION_PAGES` (default 5) is the maximum pages **per vision request**,
@@ -309,9 +329,14 @@ or `.env` — `samples_real/`, `output/`, and `.env` are all git-ignored.
   classifications, provider/model names, attempt counts, durations, and
   sanitized (truncated, key-redacted) error summaries — **never** API keys,
   raw provider responses, extracted invoice text, or image data.
-- `SAVE_DEBUG_ARTIFACTS=true` persists raw provider responses (i.e. full
-  invoice contents) to `DEBUG_ARTIFACT_DIR`. Disabled by default; enable only
-  while actively debugging and treat the directory as confidential.
+- `SAVE_DEBUG_ARTIFACTS=true` persists the raw provider response for a
+  **failed** extraction only (malformed JSON even after one repair retry, or
+  missing required fields) to `DEBUG_ARTIFACT_DIR` — never for a successful
+  one. These files MAY CONTAIN FULL INVOICE CONTENTS (i.e. confidential
+  business data). Disabled by default; enable only while actively debugging,
+  and **never commit `DEBUG_ARTIFACT_DIR`** — the default `./output/debug` is
+  already covered by `output/` in `.gitignore`; git-ignore a custom path too
+  if you point it elsewhere.
 - Invoice contents ARE sent to Google and Anthropic APIs when you run the
   pipeline — that is the product working as designed. Review both providers'
   data-handling terms before processing real invoices.
@@ -324,7 +349,7 @@ or `.env` — `samples_real/`, `output/`, and `.env` are all git-ignored.
 | `doctor --live` fails with `NotFoundError` / 404 | Model id not accepted by the provider. Set `*_MODEL` vars to a current id; check provider docs. |
 | Frequent `transient RateLimitError, retrying` in log | Provider rate limits. Lower batch size, raise `MAX_RETRIES`, or wait. Backoff is automatic (1→2→4s… capped 30s). |
 | `APITimeoutError` / `ReadTimeout` | Slow provider or large scans. Raise `REQUEST_TIMEOUT_SECONDS`; lower `RENDER_DPI` or `MAX_VISION_PAGES`. |
-| `malformed JSON in response` then Claude fallback | Normal self-healing on the vision route. If the text route hits it with fallback disabled, the row is flagged for review — consider `ENABLE_CLAUDE_TEXT_FALLBACK=true`. |
+| `malformed JSON in response`, then `attempting one repair retry` | Gemini returned unusable JSON. It gets one repair retry (same model, asked to reformat) before anything else happens — most cases self-heal right here. If repair also fails: normal self-healing via Claude on the vision route (always on); on the text route with fallback disabled, the row is flagged for review — consider `ENABLE_CLAUDE_TEXT_FALLBACK=true`. |
 | `unreadable PDF` | Corrupt/encrypted file. The row is flagged; the batch continues. Re-export the PDF. |
 | Row with `totals inconclusive` | Arithmetic doesn't reconcile — often discount/shipping/duties the schema doesn't model. Review manually; tune `TOTAL_*_TOLERANCE` for rounding-heavy vendors. |
 | `conflict in <field>` / `possible multiple invoices` | Pages disagree. Verify the PDF holds a single invoice; split multi-invoice files. |

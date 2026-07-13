@@ -151,6 +151,7 @@ class TestChunkFailures:
         gem, gem_calls = make_gemini_seam(cfg, vision_responses=[
             chunk_payload(1),
             "totally { broken json",  # chunk 2: Gemini unusable
+            "still broken after repair retry",  # chunk 2: one repair attempt, also unusable
             chunk_payload(3),
         ])
         claude, claude_calls = make_claude_seam(cfg, vision_responses=[
@@ -160,7 +161,9 @@ class TestChunkFailures:
         monkeypatch.setattr(claude_client, "_request", claude)
 
         result = process_file(pdf, cfg, logger)
-        assert gem_calls["vision"] == [2, 2, 1]  # all three chunks attempted
+        # chunk 1 ok (2 imgs), chunk 2 fails + 1 repair retry (2 imgs each,
+        # same images resent), chunk 3 ok (1 img) - all chunks still attempted
+        assert gem_calls["vision"] == [2, 2, 2, 1]
         assert claude_calls["vision"] == 1  # fallback tried for the failed chunk only
         assert result.vision_chunk_count == 3
         assert result.failed_pages == [3, 4]

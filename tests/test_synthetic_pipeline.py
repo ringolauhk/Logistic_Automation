@@ -479,12 +479,15 @@ class TestFixture10RealisticPipeline:
         self, synthetic_fixture_paths, cfg, logger, monkeypatch
     ):
         path = synthetic_fixture_paths["fixture_10_two_invoice_numbers"]
+        # Second entry is the one JSON-repair retry gemini_client now attempts
+        # before giving up - also malformed, so the outcome is unchanged.
         recorder = pr.install_provider_seams(
-            monkeypatch, cfg, gemini_text=[pr.malformed_json_text()],
+            monkeypatch, cfg,
+            gemini_text=[pr.malformed_json_text(), pr.malformed_json_text()],
         )
 
         result = process_file(path, cfg, logger)
 
-        assert recorder.gemini_text_count == 1
+        assert recorder.gemini_text_count == 2
         assert result.needs_review is True
         assert result.error is True  # hard failure: no structured result at all

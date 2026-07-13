@@ -114,11 +114,15 @@ class TestVisionRoute:
     def test_gemini_malformed_json_falls_back_to_claude(
         self, cfg, logger, scan_pdf, monkeypatch
     ):
-        monkeypatch.setattr(gemini_client, "_generate",
-                            Recorder(['{"invoice_number": broken json']))
+        # Second queued response is the one JSON-repair retry gemini_client
+        # now attempts before giving up - also malformed, so Claude still
+        # ends up as the fallback exactly as before this milestone.
+        gem = Recorder(['{"invoice_number": broken json', 'still not json {'])
+        monkeypatch.setattr(gemini_client, "_generate", gem)
         claude = Recorder([invoice_json()])
         monkeypatch.setattr(claude_client, "_request", claude)
         result = process_file(scan_pdf, cfg, logger)
+        assert gem.calls == [cfg.gemini_vision_model, cfg.gemini_vision_model]
         assert claude.calls == [cfg.claude_vision_model]
         assert result.provider == "claude"
         assert result.extraction_method == "vision"
@@ -153,6 +157,127 @@ class TestVisionRoute:
         assert "failed on all providers" in result.review_reason
         assert result.failed_pages == [1]
         assert result.vision_chunk_count == 1
+
+
+class TestGeminiJsonRepair:
+    """gemini_client's one-shot JSON-repair retry, sitting between local
+    cleanup (parse_json_response's own fence-stripping/outer-brace
+    extraction - already covered elsewhere) and the existing Claude-fallback
+    /needs_review behavior, which this must never change the OUTCOME of."""
+
+    def test_fenced_response_recovered_locally_no_repair_call_needed(
+        self, cfg, logger, text_pdf, monkeypatch
+    ):
+        # Local cleanup (not the new repair retry) handles this - exactly
+        # one Gemini call, no fallback.
+        gem = Recorder([f"```json\n{invoice_json()}\n```"])
+        monkeypatch.setattr(gemini_client, "_generate", gem)
+        claude_calls = []
+        monkeypatch.setattr(claude_client, "_request",
+                            lambda *a, **k: claude_calls.append(1))
+        result = process_file(text_pdf, cfg, logger)
+        assert gem.calls == [cfg.gemini_text_model]  # exactly one call
+        assert claude_calls == []
+        assert result.provider == "gemini"
+        assert result.needs_review is False
+
+    def test_malformed_response_repaired_via_retry_succeeds_without_claude(
+        self, cfg, logger, text_pdf, monkeypatch
+    ):
+        gem = Recorder(["not valid json at all", invoice_json()])
+        monkeypatch.setattr(gemini_client, "_generate", gem)
+        claude_calls = []
+        monkeypatch.setattr(claude_client, "_request",
+                            lambda *a, **k: claude_calls.append(1))
+        result = process_file(text_pdf, cfg, logger)
+        assert gem.calls == [cfg.gemini_text_model, cfg.gemini_text_model]
+        assert claude_calls == []  # repair succeeded - Claude never needed
+        assert result.provider == "gemini"
+        assert result.needs_review is False
+        assert result.invoice.invoice_number == "INV-1001"
+
+    def test_repair_fails_then_falls_back_to_claude_text(
+        self, logger, text_pdf, monkeypatch
+    ):
+        cfg = make_config(enable_claude_text_fallback=True)
+        gem = Recorder(["not valid json at all", "still not valid json"])
+        monkeypatch.setattr(gemini_client, "_generate", gem)
+        claude = Recorder([invoice_json()])
+        monkeypatch.setattr(claude_client, "_request", claude)
+        result = process_file(text_pdf, cfg, logger)
+        assert gem.calls == [cfg.gemini_text_model, cfg.gemini_text_model]
+        assert claude.calls == [cfg.claude_text_model]
+        assert result.provider == "claude"
+        assert result.needs_review is False
+
+    def test_repair_fails_without_fallback_produces_clean_failure(
+        self, logger, text_pdf, monkeypatch
+    ):
+        cfg = make_config(enable_claude_text_fallback=False)
+        gem = Recorder(["not valid json at all", "still not valid json"])
+        monkeypatch.setattr(gemini_client, "_generate", gem)
+        claude_calls = []
+        monkeypatch.setattr(claude_client, "_request",
+                            lambda *a, **k: claude_calls.append(1))
+        result = process_file(text_pdf, cfg, logger)
+        assert gem.calls == [cfg.gemini_text_model, cfg.gemini_text_model]
+        assert claude_calls == []  # fallback disabled - never called
+        assert result.extraction_method == "failed"
+        assert result.needs_review is True and result.error is True
+        assert "text route" in result.review_reason
+        assert "failed on all providers" in result.review_reason
+
+    def test_vision_repair_resends_the_same_images(
+        self, cfg, logger, scan_pdf, monkeypatch
+    ):
+        # The repair call must re-include the original image(s), not just
+        # text, both for repair quality and so it's still classified as a
+        # vision call by any contents-length-based test seam.
+        contents_lengths = []
+
+        def fake(cfg_, model, contents):
+            contents_lengths.append(len(contents))
+            if len(contents_lengths) == 1:
+                return "not valid json at all"
+            return invoice_json()
+
+        monkeypatch.setattr(gemini_client, "_generate", fake)
+        claude_calls = []
+        monkeypatch.setattr(claude_client, "_request",
+                            lambda *a, **k: claude_calls.append(1))
+        result = process_file(scan_pdf, cfg, logger)
+        assert len(contents_lengths) == 2
+        assert contents_lengths[0] == contents_lengths[1]  # same image count both times
+        assert contents_lengths[0] > 1  # prompt/repair text + at least one image
+        assert claude_calls == []
+        assert result.provider == "gemini"
+        assert result.needs_review is False
+
+    def test_repair_steps_are_logged(self, cfg, logger, text_pdf, monkeypatch, caplog):
+        # gemini_client logs to its own module logger ("invoice_extractor"),
+        # independent of the "logger" fixture passed into process_file.
+        gem = Recorder(["not valid json at all", invoice_json()])
+        monkeypatch.setattr(gemini_client, "_generate", gem)
+        with caplog.at_level("DEBUG", logger="invoice_extractor"):
+            process_file(text_pdf, cfg, logger)
+        messages = " ".join(r.message for r in caplog.records)
+        assert "not valid JSON" in messages
+        assert "repair" in messages.lower()
+        assert "recovered valid JSON" in messages
+
+    def test_raw_response_and_secrets_never_appear_in_logs(
+        self, logger, text_pdf, monkeypatch, caplog
+    ):
+        cfg = make_config(gemini_api_key="SECRET-GEM-KEY-SHOULD-NOT-LOG")
+        secret_marker = "UNIQUE-RAW-RESPONSE-MARKER-XYZ"
+        gem = Recorder([f"not valid json {secret_marker}", "still not valid json either"])
+        monkeypatch.setattr(gemini_client, "_generate", gem)
+        with caplog.at_level("DEBUG", logger="invoice_extractor"):
+            process_file(text_pdf, cfg, logger)
+        messages = " ".join(r.message for r in caplog.records)
+        assert secret_marker not in messages  # raw response text never logged
+        assert "SECRET-GEM-KEY-SHOULD-NOT-LOG" not in messages
+        assert "not valid json" not in messages  # the literal response body itself
 
 
 class TestMixedPdf:

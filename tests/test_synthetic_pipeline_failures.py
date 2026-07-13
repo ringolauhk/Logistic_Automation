@@ -94,12 +94,12 @@ class TestVisionFallbackCauses:
     both image pages arrive in a single chunk/call, keeping each test to
     exactly one Gemini vision attempt and one Claude vision attempt."""
 
-    def _run(self, synthetic_fixture_paths, logger, monkeypatch, gemini_response):
+    def _run(self, synthetic_fixture_paths, logger, monkeypatch, *gemini_responses):
         cfg = make_config(max_retries=1, max_vision_pages=5)
         path = synthetic_fixture_paths["fixture_09_conflicting_totals"]
         recorder = pr.install_provider_seams(
             monkeypatch, cfg,
-            gemini_vision=[gemini_response],
+            gemini_vision=list(gemini_responses),
             claude_vision=[pr.fixture_09_chunk_response_json([0, 1, 2], "650.00")],
         )
         return process_file(path, cfg, logger), recorder
@@ -107,10 +107,14 @@ class TestVisionFallbackCauses:
     def test_malformed_json_falls_back_to_claude_vision(
         self, synthetic_fixture_paths, logger, monkeypatch
     ):
+        # Second entry is the one JSON-repair retry gemini_client now
+        # attempts before giving up - also malformed, so Claude still ends
+        # up as the fallback exactly as before.
         result, recorder = self._run(
-            synthetic_fixture_paths, logger, monkeypatch, pr.malformed_json_text(),
+            synthetic_fixture_paths, logger, monkeypatch,
+            pr.malformed_json_text(), pr.malformed_json_text(),
         )
-        assert recorder.gemini_vision_count == 1
+        assert recorder.gemini_vision_count == 2
         assert recorder.claude_vision_count == 1
         assert result.provider == "claude"
         assert result.needs_review is False
@@ -118,6 +122,8 @@ class TestVisionFallbackCauses:
     def test_schema_invalid_falls_back_to_claude_vision(
         self, synthetic_fixture_paths, logger, monkeypatch
     ):
+        # Valid JSON, just missing required fields - no JSON-repair retry is
+        # attempted at all (repair only fires on a parse failure).
         result, recorder = self._run(
             synthetic_fixture_paths, logger, monkeypatch, pr.missing_required_fields_json(),
         )
@@ -129,6 +135,7 @@ class TestVisionFallbackCauses:
     def test_timeout_falls_back_to_claude_vision(
         self, synthetic_fixture_paths, logger, monkeypatch
     ):
+        # _generate itself raises - never reaches JSON parsing/repair at all.
         result, recorder = self._run(
             synthetic_fixture_paths, logger, monkeypatch, TimeoutError("synthetic timeout"),
         )

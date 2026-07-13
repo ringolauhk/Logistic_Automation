@@ -276,6 +276,10 @@ class TestRunCommand:
         # failure (see README "Review outcomes vs program failure").
         monkeypatch.delenv("GEMINI_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        # Must not depend on the developer's local .env - explicitly pin
+        # this rather than relying on the documented default, so the test
+        # stays deterministic regardless of what's in a real .env on disk.
+        monkeypatch.setenv("ENABLE_CLAUDE_TEXT_FALLBACK", "false")
         samples = tmp_path / "samples"
         samples.mkdir()
         build_pdf(samples / "inv.pdf", [("text", TEXT_BODY)])

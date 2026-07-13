@@ -14,6 +14,7 @@ from google.genai import types as genai_types
 from invoice_extractor.artifacts import save_debug_artifact
 from invoice_extractor.config import Config
 from invoice_extractor.prompts import (
+    JSON_SCHEMA_BLOCK,
     parse_json_response,
     text_extraction_prompt,
     vision_extraction_prompt,
@@ -74,15 +75,68 @@ def _generate(cfg: Config, model: str, contents: list) -> str:
     return resp.text
 
 
-def _finalize(cfg: Config, raw_text: str, label: str) -> Invoice:
-    save_debug_artifact(cfg, label, raw_text)
-    data = parse_json_response(raw_text)
+_REPAIR_INSTRUCTION = (
+    "Your previous response was not valid JSON. Return the same extraction "
+    "as strict JSON only, matching this exact schema. Do not include "
+    "markdown fences, comments, or explanation.\n\n" + JSON_SCHEMA_BLOCK
+)
+
+
+def _ensure_parsed_json(
+    cfg: Config, model: str, raw_text: str, label: str,
+    image_parts: list | None = None,
+) -> tuple[dict, str]:
+    """Parse a Gemini response, tolerating markdown fences / surrounding
+    prose via parse_json_response's own local cleanup. If that still fails,
+    try exactly ONE repair retry against the same model before giving up:
+    the repair prompt echoes the model's own (invalid) response - and, for
+    the vision route, the same images again - so it has full context to
+    correct itself, not just a bare instruction.
+
+    Returns (parsed_dict, raw_text_that_produced_it) - the latter is needed
+    by _finalize so a later check_required failure saves the text that
+    actually parsed (original or repaired), not a mismatched one.
+
+    Raises the ORIGINAL ExtractionError (not a repair-specific one) if the
+    repair attempt doesn't produce valid JSON either, so callers' existing
+    failure/fallback handling is unaffected by this step's mere presence -
+    it can only turn a would-be failure into a success, never change what a
+    still-uncovered failure looks like upstream.
+    """
+    try:
+        return parse_json_response(raw_text), raw_text
+    except ExtractionError as exc:
+        logger.warning("%s: response from %s was not valid JSON (%s); "
+                       "attempting one repair retry", label, model, exc)
+        repair_text = f"Your previous response was:\n\n{raw_text}\n\n{_REPAIR_INSTRUCTION}"
+        repair_contents: list = [repair_text, *(image_parts or [])]
+        try:
+            repaired, attempts = call_with_retry(
+                lambda: _generate(cfg, model, repair_contents),
+                is_transient, cfg.max_retries, f"{label}_repair",
+            )
+            logger.debug("%s_repair: model=%s attempts=%d", label, model, attempts)
+            data = parse_json_response(repaired)
+        except Exception as repair_exc:
+            logger.warning("%s: JSON repair retry did not produce valid JSON; "
+                           "continuing with existing failure/fallback behavior", label)
+            save_debug_artifact(cfg, label, model=model, reason=str(exc), raw_text=raw_text)
+            raise exc from repair_exc
+        logger.info("%s: JSON repair retry recovered valid JSON", label)
+        return data, repaired
+
+
+def _finalize(cfg: Config, data: dict, raw_text: str, label: str, model: str) -> Invoice:
     extras = unknown_keys(data)
     if extras:
         logger.debug("%s: dropped %d unexpected key(s): %s",
                      label, len(extras), ", ".join(extras[:8]))
     inv = normalize_invoice(data)
-    check_required(inv)
+    try:
+        check_required(inv)
+    except ExtractionError as exc:
+        save_debug_artifact(cfg, label, model=model, reason=str(exc), raw_text=raw_text)
+        raise
     return inv
 
 
@@ -93,18 +147,22 @@ def extract_from_text(cfg: Config, invoice_text: str, label: str = "gemini_text"
         is_transient, cfg.max_retries, label,
     )
     logger.debug("%s: model=%s attempts=%d", label, cfg.gemini_text_model, attempts)
-    return _finalize(cfg, raw, label)
+    data, raw_used = _ensure_parsed_json(cfg, cfg.gemini_text_model, raw, label)
+    return _finalize(cfg, data, raw_used, label, cfg.gemini_text_model)
 
 
 def extract_from_images(cfg: Config, images: list[bytes], label: str = "gemini_vision") -> Invoice:
     """Extract from rendered page PNGs via Gemini vision."""
-    contents: list = [vision_extraction_prompt(len(images))]
-    contents.extend(
+    image_parts = [
         genai_types.Part.from_bytes(data=png, mime_type="image/png") for png in images
-    )
+    ]
+    contents: list = [vision_extraction_prompt(len(images)), *image_parts]
     raw, attempts = call_with_retry(
         lambda: _generate(cfg, cfg.gemini_vision_model, contents),
         is_transient, cfg.max_retries, label,
     )
     logger.debug("%s: model=%s attempts=%d", label, cfg.gemini_vision_model, attempts)
-    return _finalize(cfg, raw, label)
+    data, raw_used = _ensure_parsed_json(
+        cfg, cfg.gemini_vision_model, raw, label, image_parts=image_parts,
+    )
+    return _finalize(cfg, data, raw_used, label, cfg.gemini_vision_model)
