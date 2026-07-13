@@ -156,18 +156,30 @@ python test_pipeline.py
 **Invoice-level review is not a CLI failure.** An invoice flagged
 `needs_review=true` — including every invoice failing because API keys are
 missing — is an *expected, reviewable data outcome*: the batch still
-completes, the workbook and log are still written, and `test_pipeline.py`
-exits **0**. Its summary reports six separate counts: PDFs discovered, PDFs
-processed, successful structured extractions, needs-review invoices,
-provider/config failures, and unexpected fatal errors.
+completes and the workbook and log are still written. Both `run` (the real
+CLI entrypoint) and the parallel root-level smoke script (`test_pipeline.py`)
+share this policy and exit **0** in that case.
 
-`test_pipeline.py` exits nonzero only for **fatal tool-level failures**:
+`run` prints a summary after every completed batch: files processed,
+invoices extracted (successful structured extractions), line items
+extracted, needs-review count, failed/problem count, a breakdown by
+extraction method, and the workbook output path. `test_pipeline.py`'s
+summary is the same idea with two additional counts (PDFs discovered vs
+processed, kept separate for the smoke-script's own diagnostics).
+
+Both exit nonzero only for **fatal tool-level failures** — a bad extraction
+on one invoice never counts as one of these, it only ever raises the
+needs-review/failed counts in the summary above:
 
 | Exit | Condition |
 |---|---|
-| `0` | batch completed and outputs written (even if all rows need review); or no PDFs found |
+| `0` | batch completed and outputs written (even if every row needs review); or no PDFs found |
 | `2` | input path cannot be accessed |
-| `1` | workbook cannot be written, output/log location cannot be created, or an uncaught orchestration failure prevents batch completion |
+| `1` | config could not be loaded, the log/output location could not be created, the workbook could not be written, or an uncaught orchestration failure prevented batch completion |
+
+Neither command ever prints API keys, provider config, or raw LLM
+prompts/responses in its summary — only counts, filenames, and the output
+path (see [Privacy and data protection](#privacy-and-data-protection)).
 
 ## Testing
 

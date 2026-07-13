@@ -1,10 +1,15 @@
 import logging
 
+import openpyxl
+import pandas as pd
 from click.testing import CliRunner
 
 from invoice_extractor import claude_client, gemini_client
+from invoice_extractor import cli as cli_module
 from invoice_extractor.cli import cli
 from invoice_extractor.logging_setup import exc_summary, new_run_id, setup_logging
+
+from .conftest import TEXT_BODY, build_pdf, invoice_json
 
 
 class TestLogging:
@@ -171,3 +176,132 @@ class TestClassifyCommand:
         assert "page 1: text" in result.output
         assert "page 2: image" in result.output
         assert "page 3: blank" in result.output
+
+
+class TestRunCommand:
+    """The real operator entrypoint (`python -m invoice_extractor run`), as
+    opposed to the parallel root-level smoke script exercised by
+    test_smoke_script.py - same exit-code policy, but this is what ships."""
+
+    def _samples_with_one_pdf(self, tmp_path, monkeypatch, name="inv.pdf"):
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        samples = tmp_path / "samples"
+        samples.mkdir()
+        build_pdf(samples / name, [("text", TEXT_BODY)])
+        return samples
+
+    def test_writes_workbook_and_prints_summary_counts(self, tmp_path, monkeypatch):
+        samples = self._samples_with_one_pdf(tmp_path, monkeypatch)
+        monkeypatch.setattr(gemini_client, "_generate",
+                            lambda cfg, model, contents: invoice_json())
+        output = tmp_path / "out" / "results.xlsx"
+
+        result = CliRunner().invoke(
+            cli, ["run", "--input", str(samples), "--output", str(output)]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert output.exists()
+        wb = openpyxl.load_workbook(output)
+        assert wb.sheetnames == ["Invoices", "LineItems", "NeedsReview"]  # unchanged contract
+        assert "Files processed:      1" in result.output
+        assert "Invoices extracted:   1" in result.output
+        assert "Line items extracted: 1" in result.output
+        assert "Needs review:         0" in result.output
+        assert "Failed/problem:       0" in result.output
+
+    def test_exit_zero_when_invoice_needs_review(self, tmp_path, monkeypatch):
+        samples = self._samples_with_one_pdf(tmp_path, monkeypatch)
+        # total_amount doesn't reconcile with the line items -> flagged, not fatal
+        monkeypatch.setattr(gemini_client, "_generate",
+                            lambda cfg, model, contents: invoice_json(total_amount=999.0))
+        output = tmp_path / "out" / "results.xlsx"
+
+        result = CliRunner().invoke(
+            cli, ["run", "--input", str(samples), "--output", str(output)]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Needs review:         1" in result.output
+        review = pd.read_excel(output, sheet_name="NeedsReview")
+        assert len(review) == 1
+
+    def test_exit_zero_when_one_file_fails_batch_continues(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        samples = tmp_path / "samples"
+        samples.mkdir()
+        build_pdf(samples / "a_bad.pdf", [("text", TEXT_BODY)])
+        build_pdf(samples / "b_good.pdf", [("text", TEXT_BODY)])
+        responses = ["not { json at all", invoice_json()]  # a_bad fails, b_good succeeds
+        monkeypatch.setattr(gemini_client, "_generate",
+                            lambda cfg, model, contents: responses.pop(0))
+        output = tmp_path / "out" / "results.xlsx"
+
+        result = CliRunner().invoke(
+            cli, ["run", "--input", str(samples), "--output", str(output)]
+        )
+
+        assert result.exit_code == 0, result.output  # one bad file never stops the batch
+        assert output.exists()
+        assert "Files processed:      2" in result.output
+        assert "Failed/problem:       1" in result.output
+
+    def test_missing_input_folder_exits_nonzero(self, tmp_path):
+        result = CliRunner().invoke(
+            cli, ["run", "--input", str(tmp_path / "does-not-exist")]
+        )
+        assert result.exit_code != 0
+
+    def test_no_pdfs_found_exits_zero(self, tmp_path):
+        samples = tmp_path / "samples"
+        samples.mkdir()
+        result = CliRunner().invoke(cli, ["run", "--input", str(samples)])
+        assert result.exit_code == 0, result.output
+        assert "No PDFs found" in result.output
+
+    def test_summary_includes_output_path(self, tmp_path, monkeypatch):
+        samples = self._samples_with_one_pdf(tmp_path, monkeypatch)
+        monkeypatch.setattr(gemini_client, "_generate",
+                            lambda cfg, model, contents: invoice_json())
+        output = tmp_path / "out" / "results.xlsx"
+
+        result = CliRunner().invoke(
+            cli, ["run", "--input", str(samples), "--output", str(output)]
+        )
+
+        assert str(output) in result.output
+
+    def test_no_secrets_printed_in_normal_output(self, tmp_path, monkeypatch):
+        samples = self._samples_with_one_pdf(tmp_path, monkeypatch)
+        monkeypatch.setenv("GEMINI_API_KEY", "sk-gem-SHOULD-NOT-PRINT")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-SHOULD-NOT-PRINT")
+        monkeypatch.setattr(gemini_client, "_generate",
+                            lambda cfg, model, contents: invoice_json())
+        output = tmp_path / "out" / "results.xlsx"
+
+        result = CliRunner().invoke(
+            cli, ["run", "--input", str(samples), "--output", str(output)]
+        )
+
+        assert "sk-gem-SHOULD-NOT-PRINT" not in result.output
+        assert "sk-ant-SHOULD-NOT-PRINT" not in result.output
+
+    def test_workbook_write_failure_exits_nonzero(self, tmp_path, monkeypatch):
+        samples = self._samples_with_one_pdf(tmp_path, monkeypatch)
+        monkeypatch.setattr(gemini_client, "_generate",
+                            lambda cfg, model, contents: invoice_json())
+
+        def broken_export(results, output_path):
+            raise OSError("disk full (synthetic)")
+
+        monkeypatch.setattr(cli_module, "export_workbook", broken_export)
+        output = tmp_path / "out" / "results.xlsx"
+
+        result = CliRunner().invoke(
+            cli, ["run", "--input", str(samples), "--output", str(output)]
+        )
+
+        assert result.exit_code != 0
+        assert "workbook could not be written" in result.output

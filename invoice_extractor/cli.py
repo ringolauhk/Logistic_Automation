@@ -15,7 +15,7 @@ import click
 from invoice_extractor import pdf_utils
 from invoice_extractor.config import describe_models, load_config
 from invoice_extractor.excel_export import export_workbook
-from invoice_extractor.logging_setup import new_run_id, setup_logging
+from invoice_extractor.logging_setup import exc_summary, new_run_id, setup_logging
 from invoice_extractor.pipeline import InvoiceResult, find_pdfs, process_directory
 
 
@@ -24,8 +24,13 @@ def cli():
     """Batch invoice PDF extraction to Excel."""
 
 
-def print_summary(results: list[InvoiceResult]) -> None:
+def print_summary(results: list[InvoiceResult], output_path: Path) -> None:
+    """Operator-facing summary. Counts and a file path only - never secrets,
+    provider config, or raw LLM prompts/responses."""
     processed = len(results)
+    successful = sum(1 for r in results
+                     if r.extraction_method in ("text", "vision", "mixed"))
+    line_items = sum(len(r.invoice.line_items) for r in results)
     needs_review = sum(1 for r in results if r.needs_review)
     errors = sum(1 for r in results if r.error)
     by_method: dict[str, int] = {}
@@ -34,11 +39,14 @@ def print_summary(results: list[InvoiceResult]) -> None:
 
     click.echo("")
     click.echo("=" * 52)
-    click.echo(f"  Processed:     {processed}")
-    click.echo(f"  Needs review:  {needs_review}")
-    click.echo(f"  Errors:        {errors}")
+    click.echo(f"  Files processed:      {processed}")
+    click.echo(f"  Invoices extracted:   {successful}")
+    click.echo(f"  Line items extracted: {line_items}")
+    click.echo(f"  Needs review:         {needs_review}")
+    click.echo(f"  Failed/problem:       {errors}")
     for method, count in sorted(by_method.items()):
         click.echo(f"    - {method}: {count}")
+    click.echo(f"  Output written:       {output_path}")
     click.echo("=" * 52)
 
 
@@ -52,14 +60,35 @@ def print_summary(results: list[InvoiceResult]) -> None:
 @click.option("--log-file", default=None, type=click.Path(dir_okay=False, path_type=Path),
               help="Log file path (default: <output dir>/run.log).")
 def run(input_dir: Path, output_path: Path, log_file: Path | None):
-    """Run the full extraction pipeline over a folder of PDFs."""
-    cfg = load_config()
+    """Run the full extraction pipeline over a folder of PDFs.
+
+    Exit-code policy (invoice-level review is NOT a program failure - see
+    README "Review outcomes vs program failure"):
+
+      0  batch completed and the workbook was written - even if some or
+         every invoice is needs_review (e.g. missing API keys, provider
+         failures); also 0 when no PDFs are found (nothing to do)
+      2  --input does not exist (enforced by click.Path(exists=True) before
+         this function ever runs)
+      1  config could not be loaded, the log/output location could not be
+         created, the batch could not complete, or the workbook could not
+         be written (fatal tool-level failures)
+    """
+    try:
+        cfg = load_config()
+    except Exception as exc:
+        raise SystemExit(f"FATAL: configuration error: {exc_summary(exc)}")
+
     run_id = new_run_id()
     log_path = log_file or output_path.parent / "run.log"
-    logger = setup_logging(
-        log_path, run_id=run_id,
-        secrets=(cfg.gemini_api_key or "", cfg.anthropic_api_key or ""),
-    )
+    try:
+        logger = setup_logging(
+            log_path, run_id=run_id,
+            secrets=(cfg.gemini_api_key or "", cfg.anthropic_api_key or ""),
+        )
+    except Exception as exc:
+        raise SystemExit(f"FATAL: cannot create log/output location: {exc_summary(exc)}")
+
     logger.info("run %s starting; %s", run_id, describe_models(cfg))
 
     if not cfg.gemini_api_key:
@@ -67,13 +96,26 @@ def run(input_dir: Path, output_path: Path, log_file: Path | None):
     if not cfg.anthropic_api_key:
         logger.warning("ANTHROPIC_API_KEY not set - Claude fallback is unavailable")
 
-    results = process_directory(input_dir, cfg, logger)
-    if not results:
-        raise SystemExit(f"No PDFs found in {input_dir}")
+    if not find_pdfs(input_dir):
+        click.echo(f"No PDFs found in {input_dir} - nothing to do.")
+        return
 
-    export_workbook(results, output_path)
+    try:
+        results = process_directory(input_dir, cfg, logger)
+    except Exception as exc:
+        logger.error("batch did not complete: %s", exc_summary(exc))
+        raise SystemExit(f"FATAL: batch did not complete: {exc_summary(exc)}")
+
+    try:
+        export_workbook(results, output_path)
+    except Exception as exc:
+        logger.error("workbook could not be written: %s", exc_summary(exc))
+        raise SystemExit(
+            f"FATAL: workbook could not be written to {output_path}: {exc_summary(exc)}"
+        )
+
     logger.info("Wrote %s (log: %s)", output_path, log_path)
-    print_summary(results)
+    print_summary(results, output_path)
 
 
 @cli.command()
