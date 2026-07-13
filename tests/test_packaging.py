@@ -74,6 +74,55 @@ class TestReadmeUsageDocs:
         assert "doctor" in content.lower()  # points operators at the status command
 
 
+class TestRealSamplePilotDocs:
+    """The workflow for a user's first trial run against REAL invoice PDFs -
+    distinct from the synthetic-fixture 'First successful run' flow, which
+    never touches confidential data."""
+
+    def test_documents_pilot_folder_and_run_command(self):
+        content = README.read_text()
+        assert "samples_real" in content
+        assert "python -m invoice_extractor run --input ./samples_real" in content
+
+    def test_recommends_starting_small(self):
+        content = README.read_text()
+        assert "1–5" in content or "1-5" in content
+        assert "not a whole" in content.lower() or "whole production folder" in content.lower()
+
+    def test_warns_against_committing_real_invoices(self):
+        content = README.read_text()
+        assert "never commit real invoice" in content.lower()
+
+    def test_documents_evaluation_checklist_against_source_pdf(self):
+        content = README.read_text()
+        for field in ("invoice_number", "invoice_date", "seller_name",
+                      "buyer_name", "total_amount"):
+            assert field in content
+        assert "NeedsReview" in content
+        assert "line_numbers" in content and "line_descriptions" in content
+        assert "scanned" in content.lower() or "OCR" in content
+
+    def test_mentions_confirming_keys_via_doctor_before_spending_tokens(self):
+        content = README.read_text()
+        assert "doctor" in content.lower()
+        assert "before spending" in content.lower() or "before any tokens" in content.lower()
+
+
+class TestGitignoreCoversRealSampleFolders:
+    def test_samples_real_is_gitignored(self):
+        lines = (REPO_ROOT / ".gitignore").read_text().splitlines()
+        assert "samples_real/" in lines
+
+    def test_output_folder_is_gitignored(self):
+        lines = (REPO_ROOT / ".gitignore").read_text().splitlines()
+        assert "output/" in lines
+
+    def test_no_duplicate_entries(self):
+        lines = [ln.strip() for ln in (REPO_ROOT / ".gitignore").read_text().splitlines()
+                 if ln.strip() and not ln.strip().startswith("#")]
+        assert len(lines) == len(set(lines))
+
+
 class TestPackageImportWithoutKeys:
     """A fresh interpreter, run from the repo root with provider keys
     stripped from the environment, to prove import-time code never requires

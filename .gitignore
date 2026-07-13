@@ -13,5 +13,10 @@ samples/*.pdf
 real_invoice_test/
 real_invoice_test_*/
 
+# Real-sample pilot workflow (README "Real sample pilot") and scratch output -
+# same reasoning: never commit real invoice PDFs.
+samples_real/
+tmp/
+
 # macOS Finder metadata
 .DS_Store

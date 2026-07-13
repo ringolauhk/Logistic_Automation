@@ -259,14 +259,52 @@ Gemini vision, Claude text, Claude vision — a "reply OK" prompt and a tiny
 generated blank PNG, **never an invoice**) to confirm the provider accepts
 each model id. Probe failures are classified (missing key / authentication
 failure / model not found / rate limited / timeout / network failure) and
-are never retried. Run this before the first real batch. Only after
-`doctor --live` passes, drop **non-confidential sample** invoices into
-`samples/` and run the pipeline.
+are never retried. Run this before the first real batch.
+
+### Real sample pilot (first real PDFs)
+
+Once `doctor --live` passes, pilot the pipeline on a **small, controlled**
+batch before pointing it at a full production folder:
+
+1. Create a new folder — e.g. `samples_real/` — and copy **only 1–5** real
+   invoice PDFs into it, not a whole archive. `samples_real/` and `output/`
+   are already git-ignored (see `.gitignore`) — nothing here gets committed.
+2. Confirm provider setup once more: `python -m invoice_extractor doctor`
+   (add `--live` if you haven't already this session).
+3. Optional: preview routing at no cost —
+   `python -m invoice_extractor classify --input ./samples_real`.
+4. Run the pilot to its own output file, kept separate from any prior run:
+   ```bash
+   python -m invoice_extractor run --input ./samples_real --output ./output/real_test_results.xlsx
+   ```
+5. Read the printed summary first (files processed, invoices extracted,
+   line items extracted, needs-review count, failed/problem count, output
+   path — see "Review outcomes vs program failure" above for what the exit
+   code does and doesn't tell you).
+6. Open `output/real_test_results.xlsx` and evaluate it **against the
+   original PDFs**, kept open side by side:
+   - **Invoices** — compare `invoice_number`, `invoice_date`, `seller_name`,
+     `buyer_name`, and `total_amount` against each source PDF.
+   - **LineItems** — spot-check a sample of rows per invoice (not just the
+     first one); check quantities and unit prices, not only the amount.
+   - **NeedsReview** — read every `review_reason`; where
+     `line_numbers`/`line_descriptions` are populated, go straight to those
+     specific rows in the source PDF.
+   - Give scanned/OCR PDFs (`document_classification=image-only`) extra
+     scrutiny — they went through the vision route with no underlying text
+     layer to fall back on.
+7. Only scale up once a small pilot's results hold up under this manual
+   review. **Don't start real-PDF testing with an entire production folder.**
+
+**Cost and risk control:** start with 1–5 PDFs, not a whole folder; confirm
+`GEMINI_API_KEY` (and `ANTHROPIC_API_KEY` if you use the fallback) are
+correct via `doctor` before spending tokens; never commit real invoice PDFs
+or `.env` — `samples_real/`, `output/`, and `.env` are all git-ignored.
 
 ## Privacy and data protection
 
-- Invoice PDFs are confidential business data. `samples/*.pdf`, `output/`,
-  and `.env` are git-ignored — never commit them.
+- Invoice PDFs are confidential business data. `samples/*.pdf`,
+  `samples_real/`, `output/`, and `.env` are git-ignored — never commit them.
 - Normal logs (`output/run.log`) contain run id, filenames, page numbers,
   classifications, provider/model names, attempt counts, durations, and
   sanitized (truncated, key-redacted) error summaries — **never** API keys,
