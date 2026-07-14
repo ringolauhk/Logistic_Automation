@@ -6,6 +6,13 @@ Each chunk gets the full Gemini-first / Claude-fallback treatment; a chunk
 failing both providers is recorded (failed_pages + review reason with the
 page range) while later chunks still run.
 
+Text pages under LLM_GATEWAY=openrouter are chunked the same way, in ordered
+chunks of MAX_TEXT_PAGES pages per request (M3.1 - bounded chunking so a
+large text-native invoice's single JSON response doesn't hit the output-
+token cap and get rejected as truncated on every configured model). The
+direct Gemini/Claude text route is UNCHANGED - it still sends all text pages
+combined in one request; only the OpenRouter ladder chunks.
+
 Assumes one invoice per PDF (documented PoC limitation). Likely multi-invoice
 PDFs are detected via conflicting invoice numbers and flagged for review
 rather than merged silently.
@@ -34,7 +41,7 @@ from invoice_extractor.pdf_utils import (
     format_page_ranges,
 )
 from invoice_extractor.schema import ExtractionError, Invoice, empty_invoice, validate_invoice
-from invoice_extractor.usage import RunBudget, UsageRecord
+from invoice_extractor.usage import FileBudget, RunBudget, UsageRecord
 
 
 @dataclass
@@ -51,6 +58,7 @@ class InvoiceResult:
     blank_pages: list[int] = field(default_factory=list)
     failed_pages: list[int] = field(default_factory=list)  # pages whose route/chunk failed
     vision_chunk_count: int = 0  # vision requests attempted (successful + failed)
+    text_chunk_count: int = 0  # OpenRouter text chunks attempted (successful + failed); 0 for direct gateway
     needs_review: bool = False
     review_reason: str | None = None
     error: bool = False  # hard failure: no structured result at all
@@ -77,23 +85,20 @@ def _chunked(items: list, size: int) -> list[list]:
 
 
 def _run_text_route(cfg: Config, logger: logging.Logger, name: str,
-                    text_pages: list[PageInfo], run_id: str,
-                    run_budget: RunBudget | None = None) -> RouteResult:
+                    text_pages: list[PageInfo], run_id: str) -> RouteResult:
     """Gemini text normalization; Claude TEXT fallback only when enabled.
+
+    Direct gateway ONLY (LLM_GATEWAY=openrouter never reaches this function -
+    see process_file, which chunks and calls _run_openrouter_text_chunk
+    instead). All text pages are always combined into ONE request here,
+    unchanged since before M3.1.
 
     With ENABLE_CLAUDE_TEXT_FALLBACK=false (the default, matching the original
     cost/routing design) a Gemini failure propagates - Claude is never called.
-
-    run_budget is only meaningful for the OpenRouter branch below; the direct
-    gateway (Gemini/Claude) branch ignores it entirely (unchanged).
     """
     pages = [p.number for p in text_pages]
     combined = "\n\n".join(f"--- PAGE {p.number} ---\n{p.text}" for p in text_pages)
     started = time.perf_counter()
-    if cfg.llm_gateway == "openrouter":
-        return _run_openrouter_text_route(
-            cfg, logger, name, pages, combined, started, run_id, run_budget,
-        )
     try:
         inv = gemini_client.extract_from_text(cfg, combined, label=f"{name}_gemini_text")
         provider, model = "gemini", cfg.gemini_text_model
@@ -122,42 +127,50 @@ def _run_text_route(cfg: Config, logger: logging.Logger, name: str,
     return RouteResult("text", pages, inv, provider, model)
 
 
-def _run_openrouter_text_route(
+def _run_openrouter_text_chunk(
     cfg: Config, logger: logging.Logger, name: str,
-    pages: list[int], combined: str, started: float, run_id: str,
-    run_budget: RunBudget | None = None,
+    chunk: list[PageInfo], index: int, total: int, run_id: str,
+    run_budget: RunBudget | None, file_budget: FileBudget,
 ) -> RouteResult:
-    """Text extraction via the configured OpenRouter text model LADDER
-    (LLM_GATEWAY=openrouter, M3): each model is tried in order, escalating on
-    any unusable result, stopping at the first accepted extraction. Usage
-    records for every attempt (accepted and rejected) are carried on the
-    returned RouteResult even when the ultimately-accepted model isn't the
-    first one tried.
+    """One OpenRouter text chunk (LLM_GATEWAY=openrouter, M3.1): runs the
+    full model ladder independently for just this chunk's pages, escalating
+    on any unusable result and stopping at the first accepted extraction.
+    Usage records for every attempt (accepted and rejected) are carried on
+    the returned RouteResult.
+
+    Mirrors _run_vision_chunk's per-chunk shape deliberately: process_file
+    calls this once per chunk in a loop (see its text-handling branch), so
+    the SAME partial-failure handling (route_failures, failed_pages,
+    Stage-6 review reasons) and the SAME cross-chunk provenance/aggregation
+    (aggregate() over multiple RouteResults) that already work for vision
+    chunks apply to text chunks with no changes to either mechanism.
+
+    is_chunked=True is passed to the ladder whenever there is more than one
+    chunk for this file - see extract_from_text_ladder/_attempt_model for
+    what that relaxes (chunk-level hard-required validation) and what it
+    does not relax (the final aggregated invoice's hard-required check,
+    still enforced unchanged in process_file's Stage 6).
 
     validate_openrouter_config runs here (immediately before the live call),
     not at config-load time, so import/--help/classify/render/offline doctor
-    stay key-free even when LLM_GATEWAY=openrouter is configured. A missing
-    key, empty model list, or fully-exhausted ladder surfaces as the same
-    clean per-route failure/needs_review outcome as any other provider
-    failure - never a crash - and still carries whatever usage records were
-    collected before failing (see the LadderExhaustedError recovery in
-    process_file).
-
-    run_budget (the shared run-wide cost tracker) is passed straight through
-    to the ladder, which is the only place that consults or updates it.
+    stay key-free even when LLM_GATEWAY=openrouter is configured.
     """
     validate_openrouter_config(cfg, require_vision=False)
-    label = f"{name}_openrouter_text"
+    pages = [p.number for p in chunk]
+    combined = "\n\n".join(f"--- PAGE {p.number} ---\n{p.text}" for p in chunk)
     page_range = format_page_ranges(pages)
+    label = f"{name}_openrouter_text_c{index}"
+    started = time.perf_counter()
     inv, provider_result, usage_records = openrouter_client.extract_from_text_ladder(
         cfg, combined, run_id=run_id, source_file=name, page_range=page_range,
-        label=label, run_budget=run_budget,
+        label=label, run_budget=run_budget, file_budget=file_budget,
+        is_chunked=total > 1,
     )
     model = provider_result.actual_model or provider_result.requested_model
     logger.info(
-        "%s: text route (pages %s) ok provider=openrouter requested=%s actual=%s "
+        "%s: text chunk %d/%d (pages %s) ok provider=openrouter requested=%s actual=%s "
         "mode=%s finish=%s gen=%s %.1fs",
-        name, page_range, provider_result.requested_model, model,
+        name, index, total, page_range, provider_result.requested_model, model,
         provider_result.structured_mode, provider_result.finish_reason,
         provider_result.generation_id, time.perf_counter() - started,
     )
@@ -263,14 +276,64 @@ def process_file(
     route_failures: list[tuple[str, Exception]] = []
 
     if text_pages:
-        try:
-            routes.append(_run_text_route(
-                cfg, logger, path.name, text_pages, run_id, run_budget,
-            ))
-        except Exception as exc:
-            label = f"text route (pages {format_page_ranges(result.text_pages)})"
-            route_failures.append((label, exc))
-            result.failed_pages.extend(result.text_pages)
+        if cfg.llm_gateway == "openrouter":
+            chunks = _chunked(text_pages, cfg.max_text_pages)
+            result.text_chunk_count = len(chunks)
+            if len(chunks) > 1:
+                logger.info("%s: %d text page(s) split into %d chunk(s) of <= %d",
+                            path.name, len(text_pages), len(chunks), cfg.max_text_pages)
+            file_budget = FileBudget(
+                cfg.max_model_attempts_per_file, RunBudget(cfg.max_cost_usd_per_file)
+            )
+            for index, chunk in enumerate(chunks, start=1):
+                # Checked BEFORE attempting each chunk (not just relying on
+                # extract_from_text_ladder's own internal per-model check):
+                # once either budget is exhausted, every remaining chunk is
+                # skipped with ONE compact reason and zero further provider
+                # calls, instead of one repeated "skipped" failure per
+                # remaining chunk (each of which would otherwise still reach
+                # the ladder and immediately bounce with no calls made).
+                budget_reason = None
+                if run_budget is not None and run_budget.exceeded():
+                    budget_reason = f"run-wide OpenRouter cost budget (${run_budget.limit}) reached"
+                elif file_budget.exceeded():
+                    budget_reason = file_budget.reason()
+                if budget_reason is not None:
+                    remaining = [p.number for c in chunks[index - 1:] for p in c]
+                    page_range = format_page_ranges(remaining)
+                    label = f"text chunks pages {page_range}"
+                    route_failures.append((
+                        label,
+                        ExtractionError(f"{budget_reason} before these chunks could be attempted"),
+                    ))
+                    result.failed_pages.extend(remaining)
+                    logger.warning(
+                        "%s: %s; skipping remaining text chunk(s) pages %s with no "
+                        "further provider calls", path.name, budget_reason, page_range,
+                    )
+                    break
+                try:
+                    routes.append(_run_openrouter_text_chunk(
+                        cfg, logger, path.name, chunk, index, len(chunks), run_id,
+                        run_budget, file_budget,
+                    ))
+                except Exception as exc:
+                    nums = [p.number for p in chunk]
+                    page_range = format_page_ranges(nums)
+                    label = f"text chunk {index}/{len(chunks)} (pages {page_range})"
+                    route_failures.append((label, exc))
+                    result.failed_pages.extend(nums)
+                    logger.warning("%s: text chunk %d/%d (pages %s) FAILED on all "
+                                   "configured models (%s); continuing with remaining "
+                                   "chunks", path.name, index, len(chunks), page_range,
+                                   exc_summary(exc))
+        else:
+            try:
+                routes.append(_run_text_route(cfg, logger, path.name, text_pages, run_id))
+            except Exception as exc:
+                label = f"text route (pages {format_page_ranges(result.text_pages)})"
+                route_failures.append((label, exc))
+                result.failed_pages.extend(result.text_pages)
 
     if image_pages:
         chunks = _chunked(image_pages, cfg.max_vision_pages)
@@ -329,7 +392,23 @@ def process_file(
     ordered_routes = sorted(routes, key=lambda r: min(r.pages))
     providers = list(dict.fromkeys(r.provider for r in ordered_routes))
     result.provider = providers[0] if len(providers) == 1 else "mixed"
-    result.model = "+".join(dict.fromkeys(r.model for r in ordered_routes))
+    distinct_models = list(dict.fromkeys(r.model for r in ordered_routes))
+    if len(distinct_models) == 1:
+        result.model = distinct_models[0]
+    elif result.provider == "openrouter":
+        # Multiple OpenRouter text CHUNKS accepted by different actual models
+        # is normal (each chunk runs the ladder independently) - an unbounded
+        # "+"-joined value here would be misleading/unbounded for a many-
+        # chunk file; a compact marker is honest without implying one model
+        # produced the whole invoice. Full per-chunk requested/actual model
+        # detail is always in the usage CSV regardless.
+        result.model = "multiple"
+    else:
+        # Direct-gateway provider fallback (gemini -> claude) across
+        # vision/text routes: distinct providers already show as "mixed"
+        # above, and this list is always small/bounded (at most one model
+        # per configured provider role) - unchanged from before M3.1.
+        result.model = "+".join(distinct_models)
 
     # Stage 6: review flags - partial route/chunk failure, conflicts, validation
     reasons: list[str] = []
@@ -342,6 +421,16 @@ def process_file(
     for fld, detail in outcome.conflicts:
         reasons.append(f"conflict in {fld}: {detail}")
     reasons.extend(outcome.notes)
+    # This is the FINAL hard-required gate for invoice_date/currency/
+    # seller_name/total_amount (schema.REQUIRED_FIELDS), unchanged since
+    # before M3.1 and unconditional for every file regardless of route or
+    # gateway. It matters more now: OpenRouter text chunking (M3.1) relaxes
+    # this same check at the PER-CHUNK level (a line-item-only chunk
+    # legitimately lacks headers - see openrouter_client._finalize's
+    # require_hard_fields), so this is the one place the full requirement is
+    # still enforced on the aggregated invoice. Never discards invoice/
+    # line_items - only flags needs_review with a specific, safe reason
+    # naming the missing field(s) (existing contract, unchanged).
     validation_reason = validate_invoice(
         result.invoice, cfg.total_abs_tolerance, cfg.total_rel_tolerance
     )
@@ -353,11 +442,12 @@ def process_file(
 
     result.elapsed_seconds = time.perf_counter() - started
     logger.info(
-        "%s: done in %.1fs class=%s method=%s provider=%s model=%s chunks=%d "
-        "needs_review=%s (%s)",
+        "%s: done in %.1fs class=%s method=%s provider=%s model=%s "
+        "vision_chunks=%d text_chunks=%d needs_review=%s (%s)",
         path.name, result.elapsed_seconds, result.document_classification,
         result.extraction_method, result.provider, result.model,
-        result.vision_chunk_count, result.needs_review, _reason_categories(result),
+        result.vision_chunk_count, result.text_chunk_count,
+        result.needs_review, _reason_categories(result),
     )
     return result
 
@@ -379,16 +469,16 @@ def process_directory(
     run_id = run_id or new_run_id()
     results = []
     # Run-wide OpenRouter cost budget: ONE shared, mutable RunBudget is
-    # threaded by reference through every file's ladder (process_file ->
-    # _run_text_route -> _run_openrouter_text_route -> extract_from_text_ladder
-    # -> _attempt_model), which is the only place that ever mutates
-    # `.spent` - immediately after each usage record's cost becomes known, not
-    # in bulk after the file returns. That means the check here, before each
-    # new file, always sees the live total (never a stale per-file copy), and
-    # the SAME object already stopped this file's own ladder mid-flight (no
-    # repair/escalation calls past the crossing point) if it tripped during
-    # processing. Irrelevant (never exceeded, since nothing ever adds to it)
-    # for the direct gateway.
+    # threaded by reference through every file's chunk(s) and ladder
+    # (process_file -> the text-chunk loop -> _run_openrouter_text_chunk ->
+    # extract_from_text_ladder -> _attempt_model), which is the only place
+    # that ever mutates `.spent` - immediately after each usage record's cost
+    # becomes known, not in bulk after the file returns. That means the check
+    # here, before each new file, always sees the live total (never a stale
+    # per-file copy), and the SAME object already stopped this file's own
+    # chunk loop/ladder mid-flight (no repair/escalation/later-chunk calls
+    # past the crossing point) if it tripped during processing. Irrelevant
+    # (never exceeded, since nothing ever adds to it) for the direct gateway.
     run_budget = RunBudget(cfg.max_cost_usd_per_run)
     for path in pdfs:
         if cfg.llm_gateway == "openrouter" and run_budget.exceeded():

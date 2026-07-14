@@ -128,24 +128,25 @@ class LadderExhaustedError(ExtractionError):
 
 @dataclass
 class RunBudget:
-    """Shared, mutable run-wide OpenRouter cost tracker.
+    """Shared, mutable cost tracker - reused at two scopes (M3: run-wide;
+    M3.1: also file-wide via FileBudget below).
 
-    Exactly ONE instance is created per process_directory() call and threaded
-    by reference through process_file -> _run_text_route ->
-    _run_openrouter_text_route -> extract_from_text_ladder -> _attempt_model,
-    so every checkpoint (each primary attempt, each repair, each escalation,
-    each new file) consults the same live `spent` total - never a stale
+    Exactly ONE run-wide instance is created per process_directory() call and
+    threaded by reference through process_file -> the OpenRouter text-chunk
+    loop -> extract_from_text_ladder -> _attempt_model, so every checkpoint
+    (each primary attempt, each repair, each escalation, each new chunk, each
+    new file) consults the same live `spent` total - never a stale
     per-function copy. `spent` is mutated in exactly one place
     (_attempt_model, immediately after each usage record is built), so
-    process_directory must read it, never add to it, to avoid double
+    callers must read it, never add to it themselves, to avoid double
     counting.
 
-    limit=None means no run-wide budget is configured; exceeded() is then
-    always False. A cost_usd=None attempt (unknown cost) contributes
-    Decimal("0") here, the same non-blocking policy used everywhere else in
-    this module - budget enforcement is therefore incomplete whenever unknown
-    costs exist, which is why format_usage_summary separately surfaces an
-    unknown-cost count for the human reader.
+    limit=None means no budget is configured; exceeded() is then always
+    False. A cost_usd=None attempt (unknown cost) contributes Decimal("0")
+    here, the same non-blocking policy used everywhere else in this module -
+    budget enforcement is therefore incomplete whenever unknown costs exist,
+    which is why format_usage_summary separately surfaces an unknown-cost
+    count for the human reader.
     """
 
     limit: Decimal | None
@@ -156,6 +157,43 @@ class RunBudget:
 
     def add(self, cost: Decimal | None) -> None:
         self.spent += cost or Decimal("0")
+
+
+@dataclass
+class FileBudget:
+    """Shared, mutable PER-FILE ladder accounting spanning ALL of a file's
+    text chunks (M3.1).
+
+    Exactly ONE instance is created per process_file() call and threaded
+    through every chunk's extract_from_text_ladder call, so
+    MAX_MODEL_ATTEMPTS_PER_FILE and MAX_COST_USD_PER_FILE are enforced across
+    the WHOLE file (every chunk combined) rather than resetting at the start
+    of each chunk's own ladder - MAX_MODEL_ATTEMPTS_PER_FILE in particular has
+    no run-wide equivalent, so it is tracked here rather than folded into
+    RunBudget. For a single-chunk file (the common case - one page, or any
+    document within MAX_TEXT_PAGES) this behaves identically to the
+    pre-M3.1 per-call-local counters, since there is only ever one call.
+    """
+
+    max_attempts: int | None
+    cost: RunBudget
+    attempts_used: int = 0
+
+    def attempts_exceeded(self) -> bool:
+        return self.max_attempts is not None and self.attempts_used >= self.max_attempts
+
+    def exceeded(self) -> bool:
+        return self.attempts_exceeded() or self.cost.exceeded()
+
+    def record_attempt(self) -> None:
+        self.attempts_used += 1
+
+    def reason(self) -> str:
+        """Safe, human-readable description of WHICH cap tripped - used only
+        to build review reasons, never includes response/invoice content."""
+        if self.attempts_exceeded():
+            return f"model-attempt cap ({self.max_attempts}) reached"
+        return f"file cost budget (${self.cost.limit}) reached"
 
 
 def _cost_cell(cost: Decimal | None) -> str:

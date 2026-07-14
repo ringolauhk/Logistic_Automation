@@ -118,6 +118,14 @@ class Config:
     max_model_attempts_per_file: int | None = None
     max_cost_usd_per_file: Decimal | None = None
     max_cost_usd_per_run: Decimal | None = None
+    # Cap on text pages sent PER OpenRouter request (M3.1 bounded chunking) -
+    # only the OpenRouter text ladder chunks; the direct Gemini/Claude text
+    # route is unaffected (see pipeline.process_file). Default 2: the pilot's
+    # 6-page invoice truncated (finish_reason=length) on all 3 configured
+    # models at a whole-document single request; 2 pages keeps each request's
+    # JSON output comfortably under typical output-token caps while keeping
+    # the per-file request count (and therefore cost) low. Must be >= 1.
+    max_text_pages: int = 2
 
     def __post_init__(self) -> None:
         # Runs on EVERY construction path - load_config() and direct
@@ -131,6 +139,11 @@ class Config:
         if self.max_vision_pages < 1:
             raise ValueError(
                 f"MAX_VISION_PAGES must be at least 1 (got {self.max_vision_pages}); "
+                "check your .env or environment configuration."
+            )
+        if self.max_text_pages < 1:
+            raise ValueError(
+                f"MAX_TEXT_PAGES must be at least 1 (got {self.max_text_pages}); "
                 "check your .env or environment configuration."
             )
         # Gateway VALUE is validated here (a bare typo, key-independent, worth
@@ -200,6 +213,7 @@ def load_config() -> Config:
         max_model_attempts_per_file=_optional_int(os.getenv("MAX_MODEL_ATTEMPTS_PER_FILE")),
         max_cost_usd_per_file=_optional_decimal(os.getenv("MAX_COST_USD_PER_FILE")),
         max_cost_usd_per_run=_optional_decimal(os.getenv("MAX_COST_USD_PER_RUN")),
+        max_text_pages=int(os.getenv("MAX_TEXT_PAGES", "2")),
     )
 
 

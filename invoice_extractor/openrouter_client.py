@@ -17,7 +17,6 @@ import base64
 import logging
 import time
 from dataclasses import dataclass
-from decimal import Decimal
 
 import httpx
 
@@ -26,6 +25,7 @@ from invoice_extractor.config import Config
 from invoice_extractor.prompts import (
     JSON_SCHEMA_BLOCK,
     parse_json_response,
+    text_chunk_context,
     text_extraction_prompt,
 )
 from invoice_extractor.provider import (
@@ -51,6 +51,7 @@ from invoice_extractor.schema import (
 )
 from invoice_extractor.logging_setup import exc_summary
 from invoice_extractor.usage import (
+    FileBudget,
     LadderExhaustedError,
     RunBudget,
     usage_record_for_failed_attempt,
@@ -319,7 +320,13 @@ def _run_attempt(
 
     Truncation (finish_reason=length) and empty content raise a clear,
     sanitized ExtractionError - neither is retried and neither triggers the
-    JSON-repair path (repair is only for malformed-but-complete JSON).
+    JSON-repair path (repair is only for malformed-but-complete JSON). The
+    already-normalized ProviderResult (actual_model, tokens, cost,
+    generation_id, finish_reason - all safe metadata) is attached to the
+    raised exception as `.provider_result` so a caller that wants full usage
+    accounting for a rejected-but-parseable response can recover it (see
+    _attempt_model) without changing this function's raise/message contract -
+    extract_from_text (M2) does not read the attribute, so it is unaffected.
     """
     started = time.perf_counter()
     raw, _attempts = call_with_retry(
@@ -336,26 +343,44 @@ def _run_attempt(
         structured_mode=structured_mode, latency_ms=latency_ms,
     )
     if is_truncated(result):
-        raise ExtractionError(
+        exc = ExtractionError(
             "OpenRouter response truncated before valid JSON completed "
             "(finish_reason=length)"
         )
+        exc.provider_result = result
+        raise exc
     if not result.text.strip():
-        raise ExtractionError("empty response from model")
+        exc = ExtractionError("empty response from model")
+        exc.provider_result = result
+        raise exc
     return result
 
 
-def _finalize(cfg: Config, data: dict, raw_text: str, label: str, model: str) -> Invoice:
+def _finalize(
+    cfg: Config, data: dict, raw_text: str, label: str, model: str,
+    *, require_hard_fields: bool = True,
+) -> Invoice:
+    """require_hard_fields=False (M3.1) is used ONLY when this call is one
+    chunk of a multi-chunk text-native document: a chunk covering only
+    line-item pages will legitimately lack invoice_date/currency/seller_name/
+    total_amount, and rejecting it here would discard perfectly good line
+    items for no reason. The full hard-required contract is NOT weakened -
+    it is enforced exactly once, on the AGGREGATED invoice, in
+    pipeline.process_file's Stage 6 (validate_invoice, unchanged). For every
+    other caller (single-chunk ladder call, and extract_from_text's M2 path)
+    this defaults to True, identical to pre-M3.1 behavior.
+    """
     extras = unknown_keys(data)
     if extras:
         logger.debug("%s: dropped %d unexpected key(s): %s",
                      label, len(extras), ", ".join(extras[:8]))
     inv = normalize_invoice(data)
-    try:
-        check_required(inv)
-    except ExtractionError as exc:
-        save_debug_artifact(cfg, label, model=model, reason=str(exc), raw_text=raw_text)
-        raise
+    if require_hard_fields:
+        try:
+            check_required(inv)
+        except ExtractionError as exc:
+            save_debug_artifact(cfg, label, model=model, reason=str(exc), raw_text=raw_text)
+            raise
     return inv
 
 
@@ -430,23 +455,35 @@ class _AttemptOutcome:
 def _attempt_model(
     cfg: Config, invoice_text: str, model: str, *, ladder_index: int,
     run_id: str, source_file: str, page_range: str, label: str,
-    run_budget: RunBudget | None = None,
+    run_budget: RunBudget | None = None, file_budget: FileBudget | None = None,
+    is_chunked: bool = False,
 ) -> _AttemptOutcome:
     """Try exactly one model: primary request, local cleanup, at most one
-    repair, then schema + hard-required validation. Never raises - failures
-    are reported via the returned _AttemptOutcome so the ladder can escalate.
+    repair, then schema + (usually) hard-required validation. Never raises -
+    failures are reported via the returned _AttemptOutcome so the ladder can
+    escalate.
 
-    run_budget, when given, is the shared run-wide cost tracker: its live
-    `spent` total is updated immediately after every usage record is built
-    (never batched), and is checked immediately before the primary call and
-    again before the repair call - the two HTTP call sites inside this
-    function - so a run-wide crossing stops further calls at the earliest
-    possible point, even mid-file.
+    run_budget/file_budget, when given, are the shared run-wide/file-wide
+    cost trackers: their live totals are updated immediately after every
+    usage record is built (never batched), and checked immediately before
+    the primary call and again before the repair call - the two HTTP call
+    sites inside this function - so a crossing stops further calls at the
+    earliest possible point, even mid-file/mid-chunk.
+
+    is_chunked=True (M3.1) means this call is ONE chunk of a multi-chunk
+    text-native document: the prompt gets an extra "partial document"
+    paragraph (see prompts.text_chunk_context), and _finalize's hard-required
+    check is skipped for THIS chunk (a line-item-only chunk legitimately
+    lacks headers) - the full hard-required contract is still enforced once,
+    on the aggregated invoice, by pipeline.process_file's Stage 6. Defaults
+    to False (today's exact single-chunk behavior) everywhere except the new
+    multi-chunk orchestration in pipeline.py.
     """
     usage_records = []
     mode = cfg.openrouter_structured_output
     response_format = build_response_format(mode)
-    prompt = text_extraction_prompt(invoice_text)
+    chunk_context = text_chunk_context(page_range) if is_chunked else None
+    prompt = text_extraction_prompt(invoice_text, chunk_context=chunk_context)
     messages = build_text_messages(prompt)
     attempt_type = ATTEMPT_PRIMARY if ladder_index == 0 else ATTEMPT_ESCALATION
 
@@ -459,6 +496,8 @@ def _attempt_model(
         ))
         if run_budget is not None:
             run_budget.add(None)  # failed attempts never carry a cost
+        if file_budget is not None:
+            file_budget.cost.add(None)
 
     def outcome_record(result, *, accepted, category=None):
         usage_records.append(usage_record_from_result(
@@ -467,14 +506,26 @@ def _attempt_model(
         ))
         if run_budget is not None:
             run_budget.add(result.cost_usd)
+        if file_budget is not None:
+            file_budget.cost.add(result.cost_usd)
 
-    if run_budget is not None and run_budget.exceeded():
-        return _AttemptOutcome(
-            None, None, usage_records,
-            f"{model}: run-wide OpenRouter cost budget (${run_budget.limit}) "
-            "reached before this model could be attempted",
-            budget_exhausted=True,
-        )
+    def budget_exhausted_reason(context: str) -> str | None:
+        # Note: both branches already end in "reached" - context must NOT
+        # repeat it (e.g. "before the repair retry could be issued", never
+        # "reached before...").
+        if run_budget is not None and run_budget.exceeded():
+            return f"run-wide OpenRouter cost budget (${run_budget.limit}) reached {context}"
+        if file_budget is not None and file_budget.exceeded():
+            return f"{file_budget.reason()} {context}"
+        return None
+
+    # No pre-check for the PRIMARY call here: the ladder loop (which drives
+    # both the first/"primary" model and later "escalation" models) already
+    # gates every model attempt on both budgets BEFORE calling this function
+    # and BEFORE incrementing file_budget's attempt counter - re-checking
+    # here would see the post-increment state and wrongly block the very
+    # attempt the loop just approved. The repair call below has no such
+    # outer gate, so it checks explicitly.
 
     # --- primary request ---
     try:
@@ -485,9 +536,15 @@ def _attempt_model(
         return _AttemptOutcome(None, None, usage_records, f"{model}: {exc_summary(exc)}")
     except ExtractionError as exc:
         # Raised by _run_attempt itself for truncation or empty content -
-        # before any JSON parsing, so there is nothing to repair.
+        # before any JSON parsing, so there is nothing to repair. The
+        # ProviderResult (if the response was a parseable envelope) rides on
+        # the exception so full usage metadata is still preserved here.
         category = "truncated" if is_truncated_message(exc) else "empty"
-        failed_record(attempt_type, category)
+        pr = getattr(exc, "provider_result", None)
+        if pr is not None:
+            outcome_record(pr, accepted=False, category=category)
+        else:
+            failed_record(attempt_type, category)
         return _AttemptOutcome(None, None, usage_records, f"{model}: {exc_summary(exc)}")
 
     # --- local cleanup, then at most one repair ---
@@ -495,16 +552,14 @@ def _attempt_model(
         data = parse_json_response(result.text)
     except ExtractionError as parse_exc:
         outcome_record(result, accepted=False, category="malformed_json")
-        if run_budget is not None and run_budget.exceeded():
+        repair_reason = budget_exhausted_reason("before the repair retry could be issued")
+        if repair_reason is not None:
             # The primary call's own cost (just recorded above) may have
-            # crossed the run-wide budget - that overshoot is unavoidable
-            # since cost is only known after the response, but no further
-            # OpenRouter call (the repair retry) may now be issued.
+            # crossed the budget - that overshoot is unavoidable since cost
+            # is only known after the response, but no further OpenRouter
+            # call (the repair retry) may now be issued.
             return _AttemptOutcome(
-                None, None, usage_records,
-                f"{model}: run-wide OpenRouter cost budget (${run_budget.limit}) "
-                "reached; repair retry skipped",
-                budget_exhausted=True,
+                None, None, usage_records, f"{model}: {repair_reason}", budget_exhausted=True,
             )
         logger.warning("%s: OpenRouter response from %s was not valid JSON (%s); "
                        "attempting one repair retry", label, model, parse_exc)
@@ -520,7 +575,11 @@ def _attempt_model(
             )
         except ExtractionError as exc:
             category = "truncated" if is_truncated_message(exc) else "empty"
-            failed_record(ATTEMPT_REPAIR, category)
+            pr = getattr(exc, "provider_result", None)
+            if pr is not None:
+                outcome_record(pr, accepted=False, category=category)
+            else:
+                failed_record(ATTEMPT_REPAIR, category)
             return _AttemptOutcome(
                 None, None, usage_records, f"{model}: repair {exc_summary(exc)}"
             )
@@ -536,9 +595,10 @@ def _attempt_model(
         logger.info("%s: JSON repair retry recovered valid JSON", label)
         result = repair  # provenance reflects the successful (repair) attempt
 
-    # --- schema + hard-required validation ---
+    # --- schema + (usually) hard-required validation ---
     try:
-        inv = _finalize(cfg, data, result.text, label, model)
+        inv = _finalize(cfg, data, result.text, label, model,
+                        require_hard_fields=not is_chunked)
     except ExtractionError as exc:
         outcome_record(result, accepted=False, category="missing_required_fields")
         return _AttemptOutcome(None, None, usage_records, f"{model}: {exc_summary(exc)}")
@@ -556,22 +616,29 @@ def is_truncated_message(exc: ExtractionError) -> bool:
 def extract_from_text_ladder(
     cfg: Config, invoice_text: str, *, run_id: str, source_file: str,
     page_range: str, label: str = "openrouter_text",
-    run_budget: RunBudget | None = None,
+    run_budget: RunBudget | None = None, file_budget: FileBudget | None = None,
+    is_chunked: bool = False,
 ) -> tuple[Invoice, ProviderResult, list]:
     """Try each configured OPENROUTER_TEXT_MODELS entry in order (1-4 models);
     the first accepted extraction stops the ladder. Escalates on any unusable
     result (transport/HTTP failure, embedded error envelope, empty content,
     truncation, malformed JSON after one repair, or missing hard-required
-    fields) - never on soft validation outcomes, since validate_invoice() is
-    only called later in pipeline.py, after a model has already been accepted.
+    fields, unless is_chunked - see _attempt_model) - never on soft validation
+    outcomes, since validate_invoice() is only called later in pipeline.py,
+    after a model has already been accepted.
 
     run_budget, when given, is the shared run-wide cost tracker (see
-    usage.RunBudget) - checked here before every model attempt (covering both
-    the first/"primary" model and later "escalation" models uniformly, since
-    this loop drives both) and, one level deeper, inside _attempt_model before
-    its repair call. Either checkpoint tripping stops this ladder immediately
+    usage.RunBudget). file_budget, when given, is the shared per-file cost/
+    attempt tracker (see usage.FileBudget) spanning every chunk of the SAME
+    file - when omitted, a fresh one is created here scoped to just this one
+    call, so a caller that doesn't chunk (or calls this directly) gets
+    identical behavior to before M3.1: one call == one file == one budget.
+    Both are checked before every model attempt (covering both the first/
+    "primary" model and later "escalation" models uniformly, since this loop
+    drives both) and, one level deeper, inside _attempt_model before its
+    repair call. Any checkpoint tripping stops this ladder immediately
     (budget_exhausted=True) rather than trying the next model, since a
-    run-wide crossing blocks every model equally.
+    crossing blocks every model equally.
 
     Returns (Invoice, accepted ProviderResult, usage_records for every
     attempt across the whole ladder). Raises LadderExhaustedError (carrying
@@ -581,40 +648,31 @@ def extract_from_text_ladder(
     models = cfg.openrouter_text_models
     usage_records: list = []
     failures: list[str] = []
-    spent = Decimal("0")
-    attempts_used = 0
+    file_budget = file_budget or FileBudget(
+        cfg.max_model_attempts_per_file, RunBudget(cfg.max_cost_usd_per_file)
+    )
 
     for ladder_index, model in enumerate(models):
-        if (
-            cfg.max_model_attempts_per_file is not None
-            and attempts_used >= cfg.max_model_attempts_per_file
-        ):
-            failures.append(
-                f"model-attempt cap ({cfg.max_model_attempts_per_file}) reached"
-            )
+        if file_budget.attempts_exceeded():
+            failures.append(f"model-attempt cap ({file_budget.max_attempts}) reached")
             break
-        if (
-            cfg.max_cost_usd_per_file is not None
-            and spent >= cfg.max_cost_usd_per_file
-        ):
-            failures.append(
-                f"file cost budget (${cfg.max_cost_usd_per_file}) reached"
-            )
+        if file_budget.cost.exceeded():
+            failures.append(f"file cost budget (${file_budget.cost.limit}) reached")
             break
         if run_budget is not None and run_budget.exceeded():
             failures.append(
                 f"run-wide OpenRouter cost budget (${run_budget.limit}) reached"
             )
             break
-        attempts_used += 1
+        file_budget.record_attempt()
 
         outcome = _attempt_model(
             cfg, invoice_text, model, ladder_index=ladder_index, run_id=run_id,
             source_file=source_file, page_range=page_range,
             label=f"{label}_m{ladder_index}", run_budget=run_budget,
+            file_budget=file_budget, is_chunked=is_chunked,
         )
         usage_records.extend(outcome.usage_records)
-        spent += sum((r.cost_usd or Decimal("0")) for r in outcome.usage_records)
 
         if outcome.invoice is not None:
             return outcome.invoice, outcome.provider_result, usage_records

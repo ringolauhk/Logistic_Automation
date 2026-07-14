@@ -30,7 +30,7 @@ HEADER_FIELDS = [
 
 NUMERIC_HEADER_FIELDS = ["subtotal", "tax_amount", "total_amount"]
 
-LINE_ITEM_FIELDS = ["description", "quantity", "unit_price", "amount"]
+LINE_ITEM_FIELDS = ["line_no", "item_code", "description", "quantity", "unit_price", "amount"]
 NUMERIC_LINE_ITEM_FIELDS = ["quantity", "unit_price", "amount"]
 
 # Fields that must be non-null or the LLM call is treated as a hard failure
@@ -62,6 +62,15 @@ class ExtractionError(Exception):
 class LineItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # line_no: the PRINTED row/sequence number only (e.g. "1", "10A") - NEVER
+    # a SKU/product/article code. item_code: the product/SKU/article/style
+    # identifier (e.g. "31C207") - NEVER a row number. Kept separate from
+    # description and from each other; see prompts.JSON_SCHEMA_BLOCK for the
+    # actual instruction the model sees (a prior ambiguous line_no
+    # description caused a live model to put SKUs there - fixed by adding
+    # this dedicated field and rewording line_no's description).
+    line_no: str | None = None
+    item_code: str | None = None
     description: str | None = None
     quantity: Decimal | None = None
     unit_price: Decimal | None = None
