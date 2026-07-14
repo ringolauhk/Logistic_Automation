@@ -31,16 +31,73 @@ class TestLogging:
             handler.close()
         logger.handlers.clear()
 
-    def test_exc_summary_truncates_long_messages(self):
-        exc = ValueError("x" * 5000)
-        summary = exc_summary(exc)
+    def test_exc_summary_truncates_long_trusted_messages(self):
+        # Truncation applies on the TRUSTED path (our own exception types whose
+        # message is safe to log). ExtractionError is such a type.
+        from invoice_extractor.schema import ExtractionError
+        summary = exc_summary(ExtractionError("y" * 5000))
         assert len(summary) < 300
-        assert summary.startswith("ValueError:")
+        assert summary.startswith("ExtractionError:")
         assert "[truncated]" in summary
 
     def test_exc_summary_flattens_newlines(self):
         summary = exc_summary(RuntimeError("line1\nline2\nline3"))
         assert "\n" not in summary
+
+
+class TestExcSummaryPrivacy:
+    """exc_summary must treat provider SDK / third-party exception strings as
+    UNTRUSTED: never copy their raw message/body into a summary, while still
+    surfacing safe operational diagnostics (class, HTTP status, canonical
+    status). Regression cover for a live-pilot privacy hardening."""
+
+    def test_gemini_429_body_and_invoice_secret_not_leaked(self):
+        from google.genai import errors as genai_errors
+        exc = genai_errors.APIError(
+            429,
+            {"error": {"message": "quota exceeded; INVOICE-SECRET-XYZ raw body",
+                       "status": "RESOURCE_EXHAUSTED"}},
+        )
+        summary = exc_summary(exc)
+        assert "INVOICE-SECRET-XYZ" not in summary
+        assert "raw body" not in summary
+        # ...but the useful operational diagnostics survive
+        assert "HTTP 429" in summary
+        assert "RESOURCE_EXHAUSTED" in summary
+        assert summary.startswith("APIError")
+
+    def test_anthropic_provider_exception_secret_not_leaked(self):
+        import anthropic
+        import httpx
+        req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        exc = anthropic.RateLimitError(
+            "rate limited; CLAUDE-BODY-SECRET-123",
+            response=httpx.Response(429, request=req), body=None,
+        )
+        summary = exc_summary(exc)
+        assert "CLAUDE-BODY-SECRET-123" not in summary
+        assert "HTTP 429" in summary
+        assert summary.startswith("RateLimitError")
+
+    def test_generic_exception_confidential_text_becomes_class_only(self):
+        summary = exc_summary(ValueError("ACME CORP INVOICE #4471 total 9,999 CONFIDENTIAL"))
+        assert "ACME" not in summary
+        assert "CONFIDENTIAL" not in summary
+        assert "4471" not in summary
+        assert summary == "ValueError"  # class name only, nothing else
+
+    def test_connection_error_without_status_is_class_only(self):
+        import httpx
+        summary = exc_summary(httpx.ConnectError("failed to connect to host SECRET-HOST"))
+        assert "SECRET-HOST" not in summary
+        assert summary == "ConnectError"
+
+    def test_our_own_extraction_error_message_is_preserved(self):
+        # Contrast case: ExtractionError messages ARE safe by construction and
+        # remain fully visible for operators.
+        from invoice_extractor.schema import ExtractionError
+        summary = exc_summary(ExtractionError("missing required fields: currency"))
+        assert summary == "ExtractionError: missing required fields: currency"
 
 
 class TestDoctorOffline:

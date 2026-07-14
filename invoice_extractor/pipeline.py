@@ -28,7 +28,7 @@ from invoice_extractor.pdf_utils import (
     PageInfo,
     format_page_ranges,
 )
-from invoice_extractor.schema import Invoice, empty_invoice, validate_invoice
+from invoice_extractor.schema import ExtractionError, Invoice, empty_invoice, validate_invoice
 
 
 @dataclass
@@ -78,14 +78,24 @@ def _run_text_route(cfg: Config, logger: logging.Logger, name: str,
     try:
         inv = gemini_client.extract_from_text(cfg, combined, label=f"{name}_gemini_text")
         provider, model = "gemini", cfg.gemini_text_model
-    except Exception as exc:
+    except Exception as gemini_exc:
         if not cfg.enable_claude_text_fallback:
             logger.warning("%s: Gemini text failed (%s); Claude text fallback is disabled",
-                           name, exc_summary(exc))
+                           name, exc_summary(gemini_exc))
             raise
         logger.warning("%s: Gemini text failed (%s); trying Claude text fallback",
-                       name, exc_summary(exc))
-        inv = claude_client.extract_from_text(cfg, combined, label=f"{name}_claude_text")
+                       name, exc_summary(gemini_exc))
+        try:
+            inv = claude_client.extract_from_text(cfg, combined, label=f"{name}_claude_text")
+        except Exception as claude_exc:
+            # Both providers' sanitized reasons are preserved here - without
+            # this, Claude's exception alone would propagate and Gemini's
+            # original cause (e.g. a 429) would be silently lost.
+            logger.warning("%s: Claude text fallback also failed (%s)",
+                           name, exc_summary(claude_exc))
+            raise ExtractionError(
+                f"Gemini: {exc_summary(gemini_exc)}; Claude: {exc_summary(claude_exc)}"
+            ) from claude_exc
         provider, model = "claude", cfg.claude_text_model
     logger.info("%s: text route (pages %s) ok provider=%s model=%s %.1fs",
                 name, format_page_ranges(pages), provider, model,
@@ -108,12 +118,23 @@ def _run_vision_chunk(cfg: Config, logger: logging.Logger, name: str, path: Path
         inv = gemini_client.extract_from_images(
             cfg, images, label=f"{name}_gemini_vision_c{index}")
         provider, model = "gemini", cfg.gemini_vision_model
-    except Exception as exc:
+    except Exception as gemini_exc:
         logger.warning("%s: vision chunk %d/%d (pages %s): Gemini failed (%s); "
                        "falling back to Claude vision",
-                       name, index, total, page_range, exc_summary(exc))
-        inv = claude_client.extract_from_images(
-            cfg, images, label=f"{name}_claude_vision_c{index}")
+                       name, index, total, page_range, exc_summary(gemini_exc))
+        try:
+            inv = claude_client.extract_from_images(
+                cfg, images, label=f"{name}_claude_vision_c{index}")
+        except Exception as claude_exc:
+            # Both providers' sanitized reasons are preserved here - without
+            # this, Claude's exception alone would propagate and Gemini's
+            # original cause (e.g. a 429) would be silently lost.
+            logger.warning("%s: vision chunk %d/%d (pages %s): Claude vision "
+                           "fallback also failed (%s)",
+                           name, index, total, page_range, exc_summary(claude_exc))
+            raise ExtractionError(
+                f"Gemini: {exc_summary(gemini_exc)}; Claude: {exc_summary(claude_exc)}"
+            ) from claude_exc
         provider, model = "claude", cfg.claude_vision_model
     logger.info("%s: vision chunk %d/%d (pages %s) ok provider=%s model=%s %.1fs",
                 name, index, total, page_range, provider, model,

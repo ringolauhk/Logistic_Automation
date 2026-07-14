@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 from invoice_extractor.schema import (
+    missing_identifier,
     normalize_invoice,
     suspicious_line_item_rows,
     validate_invoice,
@@ -68,9 +69,12 @@ class TestTotalsReconciliation:
 
 class TestStructuralValidation:
     def test_missing_required_fields_flagged(self):
-        reason = validate(invoice_number=None, currency=None)
+        # invoice_number is deliberately excluded from REQUIRED_FIELDS (see
+        # TestMissingIdentifier below) - only currency is a hard-required
+        # field missing here.
+        reason = validate(currency=None)
         assert "missing required fields" in reason
-        assert "invoice_number" in reason and "currency" in reason
+        assert "currency" in reason
 
     def test_no_line_items_flagged(self):
         assert "no line items" in validate(line_items=[])
@@ -79,6 +83,49 @@ class TestStructuralValidation:
         reason = validate(line_items=[{"description": "Freight", "quantity": 1,
                                        "unit_price": None, "amount": None}])
         assert "line items have no amounts" in reason
+
+
+class TestMissingIdentifier:
+    """invoice_number alone is not hard-required (see TestRequiredFields in
+    test_schema.py) - real commercial/customs invoices sometimes have no
+    true invoice number, only a PO number or other reference. This is only
+    flagged for review when NONE of the three identifiers are present."""
+
+    def test_invoice_number_present_needs_no_alternative(self):
+        assert missing_identifier(normalize_invoice(invoice_dict())) is False
+        assert validate() is None  # invoice_dict() defaults include invoice_number
+
+    def test_missing_invoice_number_with_po_number_is_not_flagged(self):
+        inv = normalize_invoice(invoice_dict(invoice_number=None, po_number="PO-4471"))
+        assert missing_identifier(inv) is False
+        assert validate_invoice(inv) is None
+
+    def test_missing_invoice_number_with_reference_is_not_flagged(self):
+        inv = normalize_invoice(
+            invoice_dict(invoice_number=None, reference="SHIP-REF-882")
+        )
+        assert missing_identifier(inv) is False
+        assert validate_invoice(inv) is None
+
+    def test_missing_invoice_number_and_no_alternative_is_flagged(self):
+        inv = normalize_invoice(invoice_dict(invoice_number=None))
+        assert missing_identifier(inv) is True
+        reason = validate_invoice(inv)
+        assert reason is not None
+        assert (
+            "missing invoice_number and no alternative PO/reference identifier"
+            in reason
+        )
+
+    def test_missing_invoice_number_and_no_alternative_does_not_block_otherwise_usable_invoice(
+        self,
+    ):
+        # The rest of the invoice (dates, totals, line items) is fine - this
+        # is needs_review, never a hard failure, and other valid data is
+        # still returned normally.
+        inv = normalize_invoice(invoice_dict(invoice_number=None))
+        assert inv.total_amount == Decimal("119.0")
+        assert len(inv.line_items) == 1
 
 
 class TestSuspiciousLineItemRows:

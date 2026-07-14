@@ -13,7 +13,13 @@ from invoice_extractor.prompts import (
     vision_extraction_prompt,
 )
 from invoice_extractor.retry import call_with_retry
-from invoice_extractor.schema import Invoice, check_required, normalize_invoice, unknown_keys
+from invoice_extractor.schema import (
+    ExtractionError,
+    Invoice,
+    check_required,
+    normalize_invoice,
+    unknown_keys,
+)
 
 logger = logging.getLogger("invoice_extractor")
 

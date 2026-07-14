@@ -118,6 +118,15 @@ unexplained difference may be a legitimate charge. Missing amounts are never
 invented; zero is preserved as `0`, never null. Monetary values are `Decimal`
 internally (converted to numeric Excel cells at export only).
 
+Hard-required fields (missing any one fails the provider call and triggers
+fallback/`needs_review`, not just a soft flag): `invoice_date`, `currency`,
+`seller_name`, `total_amount`. **`invoice_number` is not required** — plenty
+of real commercial/customs invoices have no true invoice number, only a
+`po_number` or other `reference`. A missing `invoice_number` only becomes a
+review flag ("missing invoice_number and no alternative PO/reference
+identifier") if `po_number` and `reference` are *also* both missing; the
+model is instructed never to invent an invoice number from either of them.
+
 ## Setup
 
 Requires Python 3.11+.

@@ -229,3 +229,59 @@ class TestNeedsReviewSheetContent:
             "repeated_table_headers.pdf", "second_hallucination.pdf",
         }
         assert "good.pdf" not in set(review["source_file"])
+
+
+class TestBlankInvoiceNumber:
+    """Real commercial/customs invoices sometimes have no true invoice
+    number - only a PO number or other reference (see schema.py's
+    missing_identifier). The workbook must handle a blank invoice_number
+    like any other optional field, not as an error."""
+
+    def _result(self, **invoice_overrides) -> InvoiceResult:
+        inv = normalize_invoice(invoice_dict(invoice_number=None, **invoice_overrides))
+        reason = validate_invoice(inv)
+        return InvoiceResult(
+            source_file="po_only_invoice.pdf",
+            invoice=inv,
+            document_classification="text-native",
+            extraction_method="text",
+            provider="gemini",
+            model="gemini-test-text",
+            needs_review=reason is not None,
+            review_reason=reason,
+        )
+
+    def test_blank_invoice_number_with_po_number_exports_and_is_not_flagged(
+        self, tmp_path
+    ):
+        result = self._result(po_number="PO-4471")
+        assert result.needs_review is False  # sanity: alternative identifier accepted
+
+        path = export_workbook([result], tmp_path / "out.xlsx")
+        wb = openpyxl.load_workbook(path)
+        assert wb.sheetnames == ["Invoices", "LineItems", "NeedsReview"]
+
+        invoices = pd.read_excel(path, sheet_name="Invoices")
+        assert len(invoices) == 1
+        assert pd.isna(invoices.iloc[0]["invoice_number"])  # blank, not an error
+        assert invoices.iloc[0]["po_number"] == "PO-4471"
+
+        review = pd.read_excel(path, sheet_name="NeedsReview")
+        assert review.empty
+
+    def test_blank_invoice_number_and_no_alternative_is_flagged_but_still_exports(
+        self, tmp_path,
+    ):
+        result = self._result()  # no po_number, no reference either
+        assert result.needs_review is True
+        assert "no alternative PO/reference identifier" in result.review_reason
+
+        path = export_workbook([result], tmp_path / "out.xlsx")
+        invoices = pd.read_excel(path, sheet_name="Invoices")
+        assert pd.isna(invoices.iloc[0]["invoice_number"])
+        # the rest of the invoice is still usable/exported, not discarded
+        assert invoices.iloc[0]["total_amount"] == 119.0
+
+        review = pd.read_excel(path, sheet_name="NeedsReview")
+        assert len(review) == 1
+        assert "no alternative PO/reference identifier" in review.iloc[0]["review_reason"]

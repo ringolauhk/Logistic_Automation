@@ -6,20 +6,70 @@ matching a configured secret is redacted defensively.
 """
 
 import logging
+import re
 import uuid
 from pathlib import Path
+
+from invoice_extractor.schema import ExtractionError
+
+# Exception types whose str() is authored to be safe by THIS codebase and may
+# therefore be logged verbatim (flattened + truncated). ExtractionError's
+# message is guaranteed free of response/invoice content by construction (see
+# its docstring; the raw payload rides on .detail, which is never logged).
+# RuntimeError is raised here only for missing-key / config guards with fixed,
+# safe strings. Every OTHER type - all provider SDK errors, httpx, and any
+# third-party/stdlib exception - is treated as UNTRUSTED: its str()/message
+# may echo request payloads (invoice text/images), response bodies (model
+# output), or raw JSON error bodies, so only safe STRUCTURED fields are
+# emitted for those (class name + HTTP status + canonical status label).
+_TRUSTED_MESSAGE_TYPES = (ExtractionError, RuntimeError)
+
+# A canonical provider status token like RESOURCE_EXHAUSTED / UNAVAILABLE:
+# uppercase letters and underscores only. This shape cannot smuggle a response
+# body or invoice text through the `.status` attribute.
+_CANONICAL_STATUS = re.compile(r"^[A-Z][A-Z_]{1,39}$")
 
 
 def new_run_id() -> str:
     return uuid.uuid4().hex[:8]
 
 
-def exc_summary(exc: BaseException, limit: int = 240) -> str:
-    """Sanitized one-line exception category + message for logs."""
-    msg = " ".join(str(exc).split())
+def _flatten_truncate(text: str, limit: int) -> str:
+    msg = " ".join(text.split())
     if len(msg) > limit:
         msg = msg[:limit] + "...[truncated]"
-    return f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
+    return msg
+
+
+def exc_summary(exc: BaseException, limit: int = 240) -> str:
+    """Sanitized one-line exception summary safe for logs and review reasons.
+
+    Provider SDK exception strings are UNTRUSTED (they can echo invoice
+    content, model output, or raw error bodies). Only our own exception types
+    (see _TRUSTED_MESSAGE_TYPES) have their message included; for everything
+    else, only the class name plus safe structured descriptors (HTTP status
+    and canonical status label, duck-typed off the object) are emitted -
+    never the raw message. Truncation is a secondary defense on the trusted
+    path, not the primary one.
+    """
+    name = type(exc).__name__
+
+    if isinstance(exc, _TRUSTED_MESSAGE_TYPES):
+        msg = _flatten_truncate(str(exc), limit)
+        return f"{name}: {msg}" if msg else name
+
+    # Untrusted: build from structured fields only, never str(exc)/.message.
+    descriptors: list[str] = []
+    code = getattr(exc, "code", None)
+    if not isinstance(code, int) or isinstance(code, bool):
+        code = getattr(exc, "status_code", None)
+    if isinstance(code, int) and not isinstance(code, bool):
+        descriptors.append(f"HTTP {code}")
+    status = getattr(exc, "status", None)
+    if isinstance(status, str) and _CANONICAL_STATUS.match(status):
+        descriptors.append(status)
+
+    return f"{name}: {' '.join(descriptors)}" if descriptors else name
 
 
 class _ContextFilter(logging.Filter):

@@ -7,6 +7,7 @@ provenance - runs for real.
 """
 
 import json
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -378,3 +379,285 @@ class TestFailureContainment:
         assert "unreadable PDF" in corrupt_result.review_reason
         assert good_result.error is False
         assert good_result.invoice.invoice_number == "INV-1001"
+
+
+class TestReferenceOnlyInvoice:
+    """Reproduces a real pilot finding (2026-07): a genuine commercial
+    invoice with no invoice number at all, only a customer PO number
+    ("COMMERCIAL INVOICE.Items without battery.pdf" - confidential, not
+    committed; this fixture is built synthetically, mirroring only the
+    structurally relevant fields observed in it). Before this milestone this
+    failed on BOTH providers with "missing required fields: invoice_number";
+    invoice_number is no longer hard-required (schema.REQUIRED_FIELDS)."""
+
+    def test_po_number_only_invoice_succeeds_without_claude_fallback(
+        self, cfg, logger, text_pdf, monkeypatch
+    ):
+        response = invoice_json(
+            invoice_number=None,
+            po_number="JBNUF20260601 / FOC",
+            seller_name="ImagineX JBY Limited",
+            buyer_name="Carol Cole Company",
+            invoice_date="2026-06-05",
+            subtotal=None,
+            tax_amount=0,
+            total_amount=792.0,
+            line_items=[
+                {"description": "Aqua Gel 3.3oz International", "quantity": 36,
+                 "unit_price": 22.0, "amount": 792.0},
+            ],
+        )
+        gem = Recorder([response])
+        monkeypatch.setattr(gemini_client, "_generate", gem)
+        claude_calls = []
+        monkeypatch.setattr(claude_client, "_request",
+                            lambda *a, **k: claude_calls.append(1))
+
+        result = process_file(text_pdf, cfg, logger)
+
+        assert gem.calls == [cfg.gemini_text_model]  # exactly one call - no failure cascade
+        assert claude_calls == []  # never needed - PO number is a sufficient identifier
+        assert result.error is False
+        assert result.needs_review is False
+        assert result.invoice.invoice_number is None
+        assert result.invoice.po_number == "JBNUF20260601 / FOC"
+        assert result.invoice.total_amount == Decimal("792.0")
+
+    def test_no_invoice_number_and_no_po_or_reference_is_needs_review_not_failure(
+        self, cfg, logger, text_pdf, monkeypatch
+    ):
+        # Same document shape, but with no PO number/reference either - now
+        # needs_review (nothing identifies the document), but still NOT a
+        # hard failure: the rest of the data is usable and is returned.
+        response = invoice_json(
+            invoice_number=None,
+            seller_name="ImagineX JBY Limited",
+            buyer_name="Carol Cole Company",
+            invoice_date="2026-06-05",
+            subtotal=None,
+            tax_amount=0,
+            total_amount=792.0,
+            line_items=[
+                {"description": "Aqua Gel 3.3oz International", "quantity": 36,
+                 "unit_price": 22.0, "amount": 792.0},
+            ],
+        )
+        monkeypatch.setattr(gemini_client, "_generate", Recorder([response]))
+        claude_calls = []
+        monkeypatch.setattr(claude_client, "_request",
+                            lambda *a, **k: claude_calls.append(1))
+
+        result = process_file(text_pdf, cfg, logger)
+
+        assert claude_calls == []  # still no fallback needed - this is not a hard failure
+        assert result.error is False
+        assert result.needs_review is True
+        assert "no alternative PO/reference identifier" in result.review_reason
+        assert result.invoice.total_amount == Decimal("792.0")  # data still usable/returned
+        assert len(result.invoice.line_items) == 1
+
+
+def gemini_rate_limit_error():
+    return genai_errors.APIError(
+        429, {"error": {"message": "RESOURCE_EXHAUSTED", "status": "RESOURCE_EXHAUSTED"}}
+    )
+
+
+class TestFallbackErrorHandling:
+    """Regression tests for a live nine-PDF pilot finding.
+
+    Two distinct bugs, both in the Gemini-fails/Claude-fallback path:
+
+    1. claude_client.py's _finalize referenced ExtractionError in two
+       `except` clauses without importing it. Whenever Claude's OWN response
+       was actually unusable (not just a transport-level failure), evaluating
+       `except ExtractionError` itself raised `NameError: name
+       'ExtractionError' is not defined`, replacing the real, useful reason -
+       hit identically on both the vision and text fallback paths, since both
+       call into this same _finalize.
+    2. Independently, pipeline.py's _run_text_route/_run_vision_chunk called
+       the Claude fallback unguarded inside the except block already holding
+       Gemini's exception. If Claude also failed, only Claude's exception
+       ever reached the caller - Gemini's original cause (e.g. a 429) was
+       silently discarded, not merged.
+    """
+
+    # --- A: Gemini vision fails, Claude vision succeeds --------------------
+
+    def test_a_gemini_vision_fails_claude_vision_succeeds(
+        self, cfg, logger, scan_pdf, monkeypatch
+    ):
+        monkeypatch.setattr(gemini_client, "_generate", Recorder([gemini_rate_limit_error()]))
+        claude = Recorder([invoice_json()])
+        monkeypatch.setattr(claude_client, "_request", claude)
+
+        result = process_file(scan_pdf, cfg, logger)
+
+        assert claude.calls == [cfg.claude_vision_model]  # Claude was actually called
+        assert result.error is False
+        assert result.provider == "claude"
+        assert result.invoice.invoice_number == "INV-1001"  # accepted extraction returned
+
+    # --- B: Gemini vision fails, Claude vision also rejected ---------------
+
+    def test_b_claude_vision_malformed_json_no_nameerror(
+        self, logger, scan_pdf, monkeypatch
+    ):
+        cfg = make_config(max_retries=1)
+        monkeypatch.setattr(gemini_client, "_generate", Recorder([gemini_rate_limit_error()]))
+        monkeypatch.setattr(claude_client, "_request", Recorder(["not valid json at all"]))
+
+        result = process_file(scan_pdf, cfg, logger)
+
+        assert result.error is True
+        assert result.needs_review is True
+        assert "NameError" not in result.review_reason
+        assert "Gemini:" in result.review_reason and "Claude:" in result.review_reason
+        # batch continues with the expected null/partial needs-review result
+        assert result.extraction_method == "failed"
+        assert result.invoice.invoice_number is None
+
+    def test_b_claude_vision_schema_invalid_no_nameerror(
+        self, logger, scan_pdf, monkeypatch
+    ):
+        cfg = make_config(max_retries=1)
+        monkeypatch.setattr(gemini_client, "_generate", Recorder([gemini_rate_limit_error()]))
+        missing_fields = json.dumps({"invoice_number": "X", "total_amount": 100})
+        monkeypatch.setattr(claude_client, "_request", Recorder([missing_fields]))
+
+        result = process_file(scan_pdf, cfg, logger)
+
+        assert result.error is True
+        assert result.needs_review is True
+        assert "NameError" not in result.review_reason
+        assert "missing required fields" in result.review_reason
+        assert "Gemini:" in result.review_reason and "Claude:" in result.review_reason
+
+    # --- C: Gemini text fails, Claude text succeeds -------------------------
+
+    def test_c_gemini_text_fails_claude_text_succeeds(
+        self, logger, text_pdf, monkeypatch
+    ):
+        cfg = make_config(enable_claude_text_fallback=True, max_retries=1)
+        monkeypatch.setattr(gemini_client, "_generate", Recorder([gemini_rate_limit_error()]))
+        claude = Recorder([invoice_json()])
+        monkeypatch.setattr(claude_client, "_request", claude)
+
+        result = process_file(text_pdf, cfg, logger)
+
+        assert claude.calls == [cfg.claude_text_model]
+        assert result.provider == "claude"
+        assert result.error is False
+        assert result.needs_review is False
+
+    # --- D: Gemini text fails, Claude text response is rejected -------------
+
+    def test_d_claude_text_missing_required_field_preserves_both_causes(
+        self, logger, text_pdf, monkeypatch, caplog
+    ):
+        cfg = make_config(enable_claude_text_fallback=True, max_retries=1)
+        monkeypatch.setattr(gemini_client, "_generate", Recorder([gemini_rate_limit_error()]))
+        missing_currency = json.dumps({
+            "invoice_number": "INV-9", "invoice_date": "2026-01-01",
+            "seller_name": "Acme", "total_amount": 500,
+        })  # currency omitted
+        monkeypatch.setattr(claude_client, "_request", Recorder([missing_currency]))
+
+        with caplog.at_level("DEBUG", logger="invoice_extractor"), \
+             caplog.at_level("DEBUG", logger="invoice_extractor_tests"):
+            result = process_file(text_pdf, cfg, logger)
+
+        assert result.error is True
+        assert result.needs_review is True
+        assert "NameError" not in result.review_reason
+        assert "Gemini:" in result.review_reason
+        assert "Claude: ExtractionError: missing required fields: currency" in result.review_reason
+        # no raw response content leaks into logs
+        messages = " ".join(r.message for r in caplog.records)
+        assert "Acme" not in messages
+        assert "INV-9" not in messages
+
+    # --- E: both providers fail on the same route ---------------------------
+
+    def test_e_both_providers_fail_batch_completes_three_sheet_contract_unchanged(
+        self, logger, scan_pdf, monkeypatch, tmp_path
+    ):
+        cfg = make_config(max_retries=1)
+        monkeypatch.setattr(gemini_client, "_generate", Recorder([gemini_rate_limit_error()]))
+        monkeypatch.setattr(claude_client, "_request", Recorder(["not valid json at all"]))
+
+        result = process_file(scan_pdf, cfg, logger)  # completes, never raises
+
+        assert result.error is True
+        assert result.needs_review is True
+        assert result.extraction_method == "failed"
+        assert "NameError" not in result.review_reason
+        assert "Gemini:" in result.review_reason and "Claude:" in result.review_reason
+
+        from invoice_extractor.excel_export import export_workbook
+        import openpyxl
+        path = export_workbook([result], tmp_path / "out.xlsx")
+        wb = openpyxl.load_workbook(path)
+        assert wb.sheetnames == ["Invoices", "LineItems", "NeedsReview"]
+
+    # --- F: privacy regression -----------------------------------------------
+
+    def test_f_no_secret_or_raw_response_leaks_via_double_failure(
+        self, logger, text_pdf, monkeypatch, caplog, tmp_path
+    ):
+        cfg = make_config(
+            enable_claude_text_fallback=True, max_retries=1,
+            gemini_api_key="SECRET-GEM-KEY-SHOULD-NOT-LEAK",
+            anthropic_api_key="SECRET-CLAUDE-KEY-SHOULD-NOT-LEAK",
+        )
+        # Distinctive fake values seeded into all three untrusted vectors:
+        #   1. Claude's raw (malformed) response body
+        #   2. the Gemini provider exception's own message/body
+        #   3. an API-key-like string in config
+        # None may reach normal logs, review_reason, or exported cells.
+        fake_response_marker = "UNIQUE-FAKE-INVOICE-BODY-MARKER-42"
+        fake_exc_marker = "UNIQUE-FAKE-EXC-BODY-MARKER-99"
+        gemini_exc = genai_errors.APIError(
+            429,
+            {"error": {"message": f"RESOURCE_EXHAUSTED; leaked={fake_exc_marker}",
+                       "status": "RESOURCE_EXHAUSTED"}},
+        )
+        monkeypatch.setattr(gemini_client, "_generate", Recorder([gemini_exc]))
+        monkeypatch.setattr(
+            claude_client, "_request",
+            Recorder([f"not valid json {fake_response_marker}"]),
+        )
+
+        with caplog.at_level("DEBUG", logger="invoice_extractor"), \
+             caplog.at_level("DEBUG", logger="invoice_extractor_tests"):
+            result = process_file(text_pdf, cfg, logger)
+
+        assert result.error is True
+
+        forbidden = [
+            fake_response_marker, fake_exc_marker,
+            "SECRET-GEM-KEY-SHOULD-NOT-LEAK", "SECRET-CLAUDE-KEY-SHOULD-NOT-LEAK",
+        ]
+        # 1. normal logs
+        messages = " ".join(r.message for r in caplog.records)
+        for secret in forbidden:
+            assert secret not in messages, f"leaked into logs: {secret}"
+        # 2. review_reason
+        for secret in forbidden:
+            assert secret not in (result.review_reason or ""), f"leaked into review_reason: {secret}"
+        # useful operational diagnostics DO survive
+        assert "HTTP 429" in result.review_reason
+        assert "RESOURCE_EXHAUSTED" in result.review_reason
+
+        # 3. exported workbook cells (Invoices + NeedsReview)
+        from invoice_extractor.excel_export import export_workbook
+        import openpyxl
+        path = export_workbook([result], tmp_path / "out.xlsx")
+        wb = openpyxl.load_workbook(path)
+        assert wb.sheetnames == ["Invoices", "LineItems", "NeedsReview"]
+        for sheet in ("Invoices", "NeedsReview"):
+            cells = " ".join(
+                str(c.value) for row in wb[sheet].iter_rows() for c in row if c.value is not None
+            )
+            for secret in forbidden:
+                assert secret not in cells, f"leaked into {sheet} cells: {secret}"

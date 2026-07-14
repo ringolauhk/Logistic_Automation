@@ -14,6 +14,8 @@ from pydantic import BaseModel, ConfigDict
 
 HEADER_FIELDS = [
     "invoice_number",
+    "po_number",
+    "reference",
     "invoice_date",
     "currency",
     "seller_name",
@@ -31,9 +33,13 @@ NUMERIC_HEADER_FIELDS = ["subtotal", "tax_amount", "total_amount"]
 LINE_ITEM_FIELDS = ["description", "quantity", "unit_price", "amount"]
 NUMERIC_LINE_ITEM_FIELDS = ["quantity", "unit_price", "amount"]
 
-# Fields that must be non-null or the invoice is flagged for review.
+# Fields that must be non-null or the LLM call is treated as a hard failure
+# (triggers provider fallback / the invoice-level failed/needs_review outcome
+# - see check_required below). invoice_number is deliberately NOT here: many
+# real commercial/customs invoices have no true invoice number at all, only a
+# PO number or other reference (see missing_identifier below for the softer,
+# review-only check that covers that case instead).
 REQUIRED_FIELDS = [
-    "invoice_number",
     "invoice_date",
     "currency",
     "seller_name",
@@ -66,6 +72,8 @@ class Invoice(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     invoice_number: str | None = None
+    po_number: str | None = None
+    reference: str | None = None
     invoice_date: str | None = None
     currency: str | None = None
     seller_name: str | None = None
@@ -220,6 +228,19 @@ def check_required(inv: Invoice) -> None:
         raise ExtractionError(f"missing required fields: {', '.join(missing)}")
 
 
+def missing_identifier(inv: Invoice) -> bool:
+    """True when the invoice has no invoice_number AND no po_number AND no
+    reference - nothing a reviewer or downstream system could use to
+    identify or look up this document.
+
+    Not a hard failure (see REQUIRED_FIELDS' docstring): plenty of real
+    commercial/customs invoices only carry a PO number or shipment
+    reference, never a true invoice number. This is a review-only signal,
+    checked in validate_invoice - it never triggers provider fallback.
+    """
+    return inv.invoice_number is None and inv.po_number is None and inv.reference is None
+
+
 def suspicious_line_item_rows(items: list[LineItem]) -> list[int]:
     """1-based indices of line items with no amount at all.
 
@@ -269,6 +290,11 @@ def validate_invoice(
     missing = missing_required_fields(inv)
     if missing:
         reasons.append(f"missing required fields: {', '.join(missing)}")
+
+    if missing_identifier(inv):
+        reasons.append(
+            "missing invoice_number and no alternative PO/reference identifier"
+        )
 
     items = inv.line_items
     if not items:

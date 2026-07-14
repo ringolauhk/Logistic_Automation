@@ -6,7 +6,9 @@ import re
 from invoice_extractor.schema import ExtractionError
 
 JSON_SCHEMA_BLOCK = """{
-  "invoice_number": "string or null",
+  "invoice_number": "string or null - only if the document itself labels a value as the invoice number",
+  "po_number": "string or null - customer purchase order / PO number, if shown",
+  "reference": "string or null - any other shipment/order/reference number shown, if it is not clearly the invoice number or PO number",
   "invoice_date": "string in YYYY-MM-DD format, or null",
   "currency": "3-letter ISO 4217 code (e.g. USD, EUR, GBP), or null",
   "seller_name": "string or null",
@@ -35,7 +37,8 @@ RULES = """Rules:
 - The seller is the party issuing the invoice; the buyer is the party being billed.
 - Include every line item, in the order they appear in the document. Do NOT repeat table header rows as line items, and exclude subtotal/discount/shipping/tax/total rows from line_items.
 - If the same table header repeats on continuation pages, count the items underneath it only once.
-- If a value appears in a non-English language, extract it as-is (do not translate names or addresses)."""
+- If a value appears in a non-English language, extract it as-is (do not translate names or addresses).
+- Not every document has a true invoice number: some commercial/customs invoices only show a PO number or other reference. Extract invoice_number ONLY if the document itself labels a value as the invoice number; otherwise set it to null and populate po_number/reference instead. Never copy a PO number or reference into invoice_number just because invoice_number would otherwise be empty."""
 
 
 def text_extraction_prompt(invoice_text: str) -> str:

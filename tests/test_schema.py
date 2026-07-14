@@ -117,10 +117,20 @@ class TestRequiredFields:
     def test_missing_required(self):
         inv = normalize_invoice({"seller_name": "X"})
         missing = missing_required_fields(inv)
-        assert "invoice_number" in missing
+        assert "invoice_date" in missing
+        assert "currency" in missing
         assert "total_amount" in missing
         with pytest.raises(ExtractionError):
             check_required(inv)
+
+    def test_invoice_number_is_not_a_required_field(self):
+        # Many real commercial/customs invoices have no true invoice number -
+        # missing_required_fields/check_required must never hard-fail on it
+        # alone (see schema.missing_identifier for the softer, review-only
+        # check that covers this case instead).
+        inv = normalize_invoice(invoice_dict(invoice_number=None))
+        assert "invoice_number" not in missing_required_fields(inv)
+        check_required(inv)  # does not raise
 
     def test_complete_passes(self):
         check_required(normalize_invoice(invoice_dict()))
