@@ -10,19 +10,23 @@ import re
 import uuid
 from pathlib import Path
 
+from invoice_extractor.config import ConfigurationError
 from invoice_extractor.schema import ExtractionError
 
 # Exception types whose str() is authored to be safe by THIS codebase and may
 # therefore be logged verbatim (flattened + truncated). ExtractionError's
 # message is guaranteed free of response/invoice content by construction (see
 # its docstring; the raw payload rides on .detail, which is never logged).
-# RuntimeError is raised here only for missing-key / config guards with fixed,
-# safe strings. Every OTHER type - all provider SDK errors, httpx, and any
-# third-party/stdlib exception - is treated as UNTRUSTED: its str()/message
-# may echo request payloads (invoice text/images), response bodies (model
-# output), or raw JSON error bodies, so only safe STRUCTURED fields are
-# emitted for those (class name + HTTP status + canonical status label).
-_TRUSTED_MESSAGE_TYPES = (ExtractionError, RuntimeError)
+# ConfigurationError carries only operator-facing config messages (never
+# secrets/response content). RuntimeError is raised here only for missing-key
+# / config guards with fixed, safe strings. Every OTHER type - all provider
+# SDK errors, httpx, and any third-party/stdlib exception - is treated as
+# UNTRUSTED: its str()/message may echo request payloads (invoice
+# text/images), response bodies (model output), or raw JSON error bodies, so
+# only safe STRUCTURED fields are emitted for those (class name + HTTP status
+# + canonical status label). ProviderError subclasses ExtractionError, so its
+# sanitized message is covered by the ExtractionError entry.
+_TRUSTED_MESSAGE_TYPES = (ExtractionError, ConfigurationError, RuntimeError)
 
 # A canonical provider status token like RESOURCE_EXHAUSTED / UNAVAILABLE:
 # uppercase letters and underscores only. This shape cannot smuggle a response
