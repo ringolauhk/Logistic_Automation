@@ -505,10 +505,13 @@ class TestFallbackErrorHandling:
     ):
         cfg = make_config(max_retries=1)
         monkeypatch.setattr(gemini_client, "_generate", Recorder([gemini_rate_limit_error()]))
-        monkeypatch.setattr(claude_client, "_request", Recorder(["not valid json at all"]))
+        # Claude's original + its one JSON-repair retry, both unusable.
+        claude = Recorder(["not valid json at all", "still not valid json"])
+        monkeypatch.setattr(claude_client, "_request", claude)
 
         result = process_file(scan_pdf, cfg, logger)
 
+        assert claude.calls == [cfg.claude_vision_model, cfg.claude_vision_model]
         assert result.error is True
         assert result.needs_review is True
         assert "NameError" not in result.review_reason
@@ -584,7 +587,9 @@ class TestFallbackErrorHandling:
     ):
         cfg = make_config(max_retries=1)
         monkeypatch.setattr(gemini_client, "_generate", Recorder([gemini_rate_limit_error()]))
-        monkeypatch.setattr(claude_client, "_request", Recorder(["not valid json at all"]))
+        # Claude original + one JSON-repair retry, both unusable.
+        monkeypatch.setattr(claude_client, "_request",
+                            Recorder(["not valid json at all", "still not valid json"]))
 
         result = process_file(scan_pdf, cfg, logger)  # completes, never raises
 
@@ -623,9 +628,11 @@ class TestFallbackErrorHandling:
                        "status": "RESOURCE_EXHAUSTED"}},
         )
         monkeypatch.setattr(gemini_client, "_generate", Recorder([gemini_exc]))
+        # Claude original + its one repair retry, both carrying the fake marker.
         monkeypatch.setattr(
             claude_client, "_request",
-            Recorder([f"not valid json {fake_response_marker}"]),
+            Recorder([f"not valid json {fake_response_marker}",
+                      f"still not valid json {fake_response_marker}"]),
         )
 
         with caplog.at_level("DEBUG", logger="invoice_extractor"), \
@@ -661,3 +668,187 @@ class TestFallbackErrorHandling:
             )
             for secret in forbidden:
                 assert secret not in cells, f"leaked into {sheet} cells: {secret}"
+
+
+class _FakeMessage:
+    """Minimal stand-in for an anthropic Message, for _request unit tests."""
+    class _Block:
+        type = "text"
+        def __init__(self, text): self.text = text
+
+    def __init__(self, text, stop_reason):
+        self.content = [self._Block(text)]
+        self.stop_reason = stop_reason
+
+
+class _FakeAnthropicClient:
+    def __init__(self, message): self._message = message
+    @property
+    def messages(self): return self
+    def create(self, **kwargs): return self._message
+
+
+class TestClaudeJsonRecovery:
+    """Malformed-Claude-JSON recovery, symmetric with gemini's repair path.
+
+    Reproduces a live pilot finding: Claude text fallback for a six-page
+    text-native invoice completed at the provider boundary but failed to
+    parse - most consistent with output truncation at max_tokens. This suite
+    covers local cleanup (already provided by parse_json_response), the new
+    one-shot repair retry, and authoritative truncation detection via
+    stop_reason.
+    """
+
+    # --- A: markdown-fenced Claude response recovers via local cleanup ------
+
+    def test_a_fenced_response_recovered_locally_no_repair(
+        self, logger, text_pdf, monkeypatch
+    ):
+        cfg = make_config(enable_claude_text_fallback=True, max_retries=1)
+        monkeypatch.setattr(gemini_client, "_generate", Recorder([gemini_rate_limit_error()]))
+        claude = Recorder([f"```json\n{invoice_json()}\n```"])
+        monkeypatch.setattr(claude_client, "_request", claude)
+
+        result = process_file(text_pdf, cfg, logger)
+
+        assert claude.calls == [cfg.claude_text_model]  # exactly one call, no repair
+        assert result.provider == "claude"
+        assert result.error is False
+        assert result.needs_review is False
+
+    # --- B: prose around a complete JSON object recovers via local cleanup --
+
+    def test_b_prose_wrapped_json_recovered_locally_no_repair(
+        self, logger, text_pdf, monkeypatch
+    ):
+        cfg = make_config(enable_claude_text_fallback=True, max_retries=1)
+        monkeypatch.setattr(gemini_client, "_generate", Recorder([gemini_rate_limit_error()]))
+        wrapped = f"Here is the extraction you requested:\n{invoice_json()}\nLet me know if you need anything else."
+        claude = Recorder([wrapped])
+        monkeypatch.setattr(claude_client, "_request", claude)
+
+        result = process_file(text_pdf, cfg, logger)
+
+        assert claude.calls == [cfg.claude_text_model]  # local extraction, no repair call
+        assert result.provider == "claude"
+        assert result.error is False
+        assert result.needs_review is False
+
+    # --- C: malformed JSON -> one repair call -> success --------------------
+
+    def test_c_malformed_json_repaired_via_one_retry(
+        self, logger, text_pdf, monkeypatch
+    ):
+        cfg = make_config(enable_claude_text_fallback=True, max_retries=1)
+        monkeypatch.setattr(gemini_client, "_generate", Recorder([gemini_rate_limit_error()]))
+        claude = Recorder(["not valid json at all", invoice_json()])  # repair succeeds
+        monkeypatch.setattr(claude_client, "_request", claude)
+
+        result = process_file(text_pdf, cfg, logger)
+
+        assert claude.calls == [cfg.claude_text_model, cfg.claude_text_model]
+        assert result.provider == "claude"
+        assert result.error is False
+        assert result.needs_review is False
+        assert result.invoice.invoice_number == "INV-1001"
+
+    # --- D: repair also malformed -> controlled failure/needs_review --------
+
+    def test_d_repair_also_malformed_is_controlled_failure(
+        self, logger, text_pdf, monkeypatch
+    ):
+        cfg = make_config(enable_claude_text_fallback=True, max_retries=1)
+        monkeypatch.setattr(gemini_client, "_generate", Recorder([gemini_rate_limit_error()]))
+        claude = Recorder(["not valid json at all", "still not valid json"])
+        monkeypatch.setattr(claude_client, "_request", claude)
+
+        result = process_file(text_pdf, cfg, logger)
+
+        assert claude.calls == [cfg.claude_text_model, cfg.claude_text_model]
+        assert result.error is True
+        assert result.needs_review is True
+        assert "NameError" not in result.review_reason
+        assert "malformed JSON" in result.review_reason or "no JSON object" in result.review_reason
+
+    # --- E: truncation by output limit -> sanitized reason ------------------
+
+    def test_e_request_raises_sanitized_reason_on_max_tokens_truncation(self):
+        cfg = make_config()
+        truncated = _FakeMessage('{"invoice_number": "INV-1", "line_items": [{"desc',
+                                 stop_reason="max_tokens")
+        import invoice_extractor.claude_client as cc
+        cc._client = _FakeAnthropicClient(truncated)  # bypass real _get_client
+        cc._client_key = cfg.anthropic_api_key
+        try:
+            with pytest.raises(cc.ExtractionError) as excinfo:
+                cc._request(cfg, cfg.claude_text_model, "prompt")
+        finally:
+            cc._client = None
+            cc._client_key = None
+        assert "truncated" in str(excinfo.value)
+        assert "max_tokens" in str(excinfo.value)
+
+    def test_e_truncated_claude_surfaces_as_needs_review_not_syntax_error(
+        self, logger, text_pdf, monkeypatch
+    ):
+        # End-to-end: a truncation ExtractionError from _request propagates to
+        # a clean needs_review outcome (never a repair loop, never a NameError).
+        cfg = make_config(enable_claude_text_fallback=True, max_retries=1)
+        monkeypatch.setattr(gemini_client, "_generate", Recorder([gemini_rate_limit_error()]))
+
+        def truncated_request(cfg_, model, content):
+            raise claude_client.ExtractionError(
+                "Claude response truncated before valid JSON completed (stop_reason=max_tokens)"
+            )
+        monkeypatch.setattr(claude_client, "_request", truncated_request)
+
+        result = process_file(text_pdf, cfg, logger)
+
+        assert result.error is True
+        assert result.needs_review is True
+        assert "truncated" in result.review_reason
+        assert "Claude:" in result.review_reason
+
+    # --- F: vision fallback shares the same repair/finalize path -------------
+
+    def test_f_vision_malformed_json_repaired_via_one_retry(
+        self, cfg, logger, scan_pdf, monkeypatch
+    ):
+        monkeypatch.setattr(gemini_client, "_generate", Recorder([gemini_rate_limit_error()]))
+        claude = Recorder(["not valid json at all", invoice_json()])  # vision repair succeeds
+        monkeypatch.setattr(claude_client, "_request", claude)
+
+        result = process_file(scan_pdf, cfg, logger)
+
+        assert claude.calls == [cfg.claude_vision_model, cfg.claude_vision_model]
+        assert result.provider == "claude"
+        assert result.extraction_method == "vision"
+        assert result.error is False
+        assert result.needs_review is False
+
+    # --- G: no raw output / invoice text / secrets in logs or reasons -------
+
+    def test_g_repair_path_leaks_no_response_content_or_secrets(
+        self, logger, text_pdf, monkeypatch, caplog
+    ):
+        cfg = make_config(
+            enable_claude_text_fallback=True, max_retries=1,
+            anthropic_api_key="SECRET-CLAUDE-KEY-XYZ",
+        )
+        marker = "UNIQUE-CLAUDE-BODY-MARKER-77"
+        monkeypatch.setattr(gemini_client, "_generate", Recorder([gemini_rate_limit_error()]))
+        monkeypatch.setattr(
+            claude_client, "_request",
+            Recorder([f"not valid json {marker}", f"still not valid json {marker}"]),
+        )
+
+        with caplog.at_level("DEBUG", logger="invoice_extractor"), \
+             caplog.at_level("DEBUG", logger="invoice_extractor_tests"):
+            result = process_file(text_pdf, cfg, logger)
+
+        assert result.error is True
+        messages = " ".join(r.message for r in caplog.records)
+        assert marker not in messages
+        assert "SECRET-CLAUDE-KEY-XYZ" not in messages
+        assert marker not in (result.review_reason or "")
+        assert "SECRET-CLAUDE-KEY-XYZ" not in (result.review_reason or "")
