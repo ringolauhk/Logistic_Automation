@@ -1,10 +1,11 @@
-"""OpenRouter gateway boundary (M1: boundary + normalization only).
+"""OpenRouter gateway boundary and text-route model ladder.
 
-Direct httpx against the OpenRouter chat-completions API. This milestone adds
-ONLY the request/response boundary and safe normalization - it does NOT run
-extraction, JSON repair, schema validation, the model ladder, or any pipeline
-wiring, and makes no live calls in the test suite (the network-blocking
-autouse fixture guards; tests mock `_chat_completion`).
+Direct httpx against the OpenRouter chat-completions API. `extract_from_text`
+(M2) is a single-model extraction, kept as-is for its existing tests;
+`extract_from_text_ladder` (M3) tries an ordered list of models, escalating
+on any unusable result and stopping at the first accepted extraction. Makes
+no live calls in the test suite (the network-blocking autouse fixture
+guards; tests mock `_chat_completion`).
 
 Privacy: the API key lives only in the HTTP client's headers, never on a
 returned object and never in a log line or exception. Provider error bodies
@@ -15,6 +16,8 @@ category are retained (see ProviderError).
 import base64
 import logging
 import time
+from dataclasses import dataclass
+from decimal import Decimal
 
 import httpx
 
@@ -26,6 +29,7 @@ from invoice_extractor.prompts import (
     text_extraction_prompt,
 )
 from invoice_extractor.provider import (
+    ATTEMPT_ESCALATION,
     ATTEMPT_PRIMARY,
     ATTEMPT_REPAIR,
     MODE_JSON_OBJECT,
@@ -44,6 +48,13 @@ from invoice_extractor.schema import (
     check_required,
     normalize_invoice,
     unknown_keys,
+)
+from invoice_extractor.logging_setup import exc_summary
+from invoice_extractor.usage import (
+    LadderExhaustedError,
+    RunBudget,
+    usage_record_for_failed_attempt,
+    usage_record_from_result,
 )
 
 logger = logging.getLogger("invoice_extractor")
@@ -104,6 +115,32 @@ def _categorize(status: int) -> str:
     if status >= 500:
         return "server_error"
     return "client_error"
+
+
+# Embedded-error-envelope numeric codes -> safe category (a 200-status HTTP
+# response whose JSON body carries {"error": {...}} instead of "choices" -
+# this is the shape a live pilot hit for an unsupported response_format).
+# Only the numeric code/status is ever inspected - message/metadata are
+# untrusted and never surfaced (see ProviderError's docstring).
+_ERROR_CODE_CATEGORIES = {
+    402: "payment_required",
+    404: "model_unavailable",
+    408: "timeout",
+    429: "rate_limited",
+}
+
+
+def _categorize_error_envelope(error_obj: dict) -> tuple[str, int | None]:
+    code = error_obj.get("code")
+    if isinstance(code, bool) or not isinstance(code, int):
+        return "malformed_envelope", None
+    if code in _ERROR_CODE_CATEGORIES:
+        return _ERROR_CODE_CATEGORIES[code], code
+    if code >= 500:
+        return "server_error", code
+    if code >= 400:
+        return "client_error", code
+    return "malformed_envelope", code
 
 
 def _chat_completion(
@@ -174,6 +211,14 @@ def parse_completion(
         )
     choices = raw.get("choices")
     if not isinstance(choices, list) or not choices:
+        error_obj = raw.get("error")
+        if isinstance(error_obj, dict):
+            category, http_status = _categorize_error_envelope(error_obj)
+            raise ProviderError(
+                "OpenRouter returned an embedded error response"
+                + (f" (code {http_status})" if http_status is not None else ""),
+                category=category, http_status=http_status,
+            )
         raise ProviderError(
             "OpenRouter response has no choices", category="malformed_envelope"
         )
@@ -361,3 +406,223 @@ def extract_from_text(
 
     inv = _finalize(cfg, data, result.text, label, model)
     return inv, result
+
+
+# --- Application-controlled model ladder (M3) --------------------------------
+
+@dataclass
+class _AttemptOutcome:
+    """Internal: the result of trying ONE model (primary [+ one repair] call).
+
+    usage_records covers every HTTP attempt made for this model (primary
+    and, if it happened, repair) regardless of outcome - collected here so
+    the ladder driver can accumulate them even when this model is ultimately
+    rejected and escalation continues to the next one.
+    """
+
+    invoice: Invoice | None
+    provider_result: ProviderResult | None
+    usage_records: list
+    failure_summary: str | None  # None only when invoice is not None
+    budget_exhausted: bool = False  # True => ladder must stop, not escalate
+
+
+def _attempt_model(
+    cfg: Config, invoice_text: str, model: str, *, ladder_index: int,
+    run_id: str, source_file: str, page_range: str, label: str,
+    run_budget: RunBudget | None = None,
+) -> _AttemptOutcome:
+    """Try exactly one model: primary request, local cleanup, at most one
+    repair, then schema + hard-required validation. Never raises - failures
+    are reported via the returned _AttemptOutcome so the ladder can escalate.
+
+    run_budget, when given, is the shared run-wide cost tracker: its live
+    `spent` total is updated immediately after every usage record is built
+    (never batched), and is checked immediately before the primary call and
+    again before the repair call - the two HTTP call sites inside this
+    function - so a run-wide crossing stops further calls at the earliest
+    possible point, even mid-file.
+    """
+    usage_records = []
+    mode = cfg.openrouter_structured_output
+    response_format = build_response_format(mode)
+    prompt = text_extraction_prompt(invoice_text)
+    messages = build_text_messages(prompt)
+    attempt_type = ATTEMPT_PRIMARY if ladder_index == 0 else ATTEMPT_ESCALATION
+
+    def failed_record(attempt_type_, category, http_status=None):
+        usage_records.append(usage_record_for_failed_attempt(
+            run_id=run_id, source_file=source_file, route=ROUTE_TEXT,
+            page_range=page_range, attempt_type=attempt_type_,
+            ladder_index=ladder_index, requested_model=model,
+            structured_mode=mode, rejection_category=category, http_status=http_status,
+        ))
+        if run_budget is not None:
+            run_budget.add(None)  # failed attempts never carry a cost
+
+    def outcome_record(result, *, accepted, category=None):
+        usage_records.append(usage_record_from_result(
+            result, run_id=run_id, source_file=source_file, page_range=page_range,
+            ladder_index=ladder_index, accepted=accepted, rejection_category=category,
+        ))
+        if run_budget is not None:
+            run_budget.add(result.cost_usd)
+
+    if run_budget is not None and run_budget.exceeded():
+        return _AttemptOutcome(
+            None, None, usage_records,
+            f"{model}: run-wide OpenRouter cost budget (${run_budget.limit}) "
+            "reached before this model could be attempted",
+            budget_exhausted=True,
+        )
+
+    # --- primary request ---
+    try:
+        result = _run_attempt(cfg, model, messages, response_format, mode,
+                              attempt_type, 0, label)
+    except ProviderError as exc:
+        failed_record(attempt_type, exc.category, exc.http_status)
+        return _AttemptOutcome(None, None, usage_records, f"{model}: {exc_summary(exc)}")
+    except ExtractionError as exc:
+        # Raised by _run_attempt itself for truncation or empty content -
+        # before any JSON parsing, so there is nothing to repair.
+        category = "truncated" if is_truncated_message(exc) else "empty"
+        failed_record(attempt_type, category)
+        return _AttemptOutcome(None, None, usage_records, f"{model}: {exc_summary(exc)}")
+
+    # --- local cleanup, then at most one repair ---
+    try:
+        data = parse_json_response(result.text)
+    except ExtractionError as parse_exc:
+        outcome_record(result, accepted=False, category="malformed_json")
+        if run_budget is not None and run_budget.exceeded():
+            # The primary call's own cost (just recorded above) may have
+            # crossed the run-wide budget - that overshoot is unavoidable
+            # since cost is only known after the response, but no further
+            # OpenRouter call (the repair retry) may now be issued.
+            return _AttemptOutcome(
+                None, None, usage_records,
+                f"{model}: run-wide OpenRouter cost budget (${run_budget.limit}) "
+                "reached; repair retry skipped",
+                budget_exhausted=True,
+            )
+        logger.warning("%s: OpenRouter response from %s was not valid JSON (%s); "
+                       "attempting one repair retry", label, model, parse_exc)
+        try:
+            repair = _run_attempt(
+                cfg, model, _repair_messages(prompt, result.text), response_format,
+                mode, ATTEMPT_REPAIR, 1, label,
+            )
+        except ProviderError as exc:
+            failed_record(ATTEMPT_REPAIR, exc.category, exc.http_status)
+            return _AttemptOutcome(
+                None, None, usage_records, f"{model}: repair {exc_summary(exc)}"
+            )
+        except ExtractionError as exc:
+            category = "truncated" if is_truncated_message(exc) else "empty"
+            failed_record(ATTEMPT_REPAIR, category)
+            return _AttemptOutcome(
+                None, None, usage_records, f"{model}: repair {exc_summary(exc)}"
+            )
+        try:
+            data = parse_json_response(repair.text)
+        except ExtractionError as repair_parse_exc:
+            outcome_record(repair, accepted=False, category="malformed_json")
+            logger.warning("%s: JSON repair retry did not produce valid JSON; "
+                           "escalating if another model is configured", label)
+            return _AttemptOutcome(
+                None, None, usage_records, f"{model}: {exc_summary(repair_parse_exc)}"
+            )
+        logger.info("%s: JSON repair retry recovered valid JSON", label)
+        result = repair  # provenance reflects the successful (repair) attempt
+
+    # --- schema + hard-required validation ---
+    try:
+        inv = _finalize(cfg, data, result.text, label, model)
+    except ExtractionError as exc:
+        outcome_record(result, accepted=False, category="missing_required_fields")
+        return _AttemptOutcome(None, None, usage_records, f"{model}: {exc_summary(exc)}")
+
+    outcome_record(result, accepted=True)
+    return _AttemptOutcome(inv, result, usage_records, None)
+
+
+def is_truncated_message(exc: ExtractionError) -> bool:
+    """True for the specific ExtractionError _run_attempt raises on
+    finish_reason=length (vs. the sibling empty-content case)."""
+    return "truncated" in str(exc)
+
+
+def extract_from_text_ladder(
+    cfg: Config, invoice_text: str, *, run_id: str, source_file: str,
+    page_range: str, label: str = "openrouter_text",
+    run_budget: RunBudget | None = None,
+) -> tuple[Invoice, ProviderResult, list]:
+    """Try each configured OPENROUTER_TEXT_MODELS entry in order (1-4 models);
+    the first accepted extraction stops the ladder. Escalates on any unusable
+    result (transport/HTTP failure, embedded error envelope, empty content,
+    truncation, malformed JSON after one repair, or missing hard-required
+    fields) - never on soft validation outcomes, since validate_invoice() is
+    only called later in pipeline.py, after a model has already been accepted.
+
+    run_budget, when given, is the shared run-wide cost tracker (see
+    usage.RunBudget) - checked here before every model attempt (covering both
+    the first/"primary" model and later "escalation" models uniformly, since
+    this loop drives both) and, one level deeper, inside _attempt_model before
+    its repair call. Either checkpoint tripping stops this ladder immediately
+    (budget_exhausted=True) rather than trying the next model, since a
+    run-wide crossing blocks every model equally.
+
+    Returns (Invoice, accepted ProviderResult, usage_records for every
+    attempt across the whole ladder). Raises LadderExhaustedError (carrying
+    all usage_records collected so far) if every model fails or a per-file
+    budget/attempt cap (or the run-wide budget) stops escalation first.
+    """
+    models = cfg.openrouter_text_models
+    usage_records: list = []
+    failures: list[str] = []
+    spent = Decimal("0")
+    attempts_used = 0
+
+    for ladder_index, model in enumerate(models):
+        if (
+            cfg.max_model_attempts_per_file is not None
+            and attempts_used >= cfg.max_model_attempts_per_file
+        ):
+            failures.append(
+                f"model-attempt cap ({cfg.max_model_attempts_per_file}) reached"
+            )
+            break
+        if (
+            cfg.max_cost_usd_per_file is not None
+            and spent >= cfg.max_cost_usd_per_file
+        ):
+            failures.append(
+                f"file cost budget (${cfg.max_cost_usd_per_file}) reached"
+            )
+            break
+        if run_budget is not None and run_budget.exceeded():
+            failures.append(
+                f"run-wide OpenRouter cost budget (${run_budget.limit}) reached"
+            )
+            break
+        attempts_used += 1
+
+        outcome = _attempt_model(
+            cfg, invoice_text, model, ladder_index=ladder_index, run_id=run_id,
+            source_file=source_file, page_range=page_range,
+            label=f"{label}_m{ladder_index}", run_budget=run_budget,
+        )
+        usage_records.extend(outcome.usage_records)
+        spent += sum((r.cost_usd or Decimal("0")) for r in outcome.usage_records)
+
+        if outcome.invoice is not None:
+            return outcome.invoice, outcome.provider_result, usage_records
+        failures.append(outcome.failure_summary)
+        if outcome.budget_exhausted:
+            break
+
+    raise LadderExhaustedError(
+        "; ".join(failures) if failures else "no OpenRouter text models configured",
+        usage_records,
+    )

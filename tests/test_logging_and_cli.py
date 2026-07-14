@@ -262,6 +262,10 @@ class TestRunCommand:
     test_smoke_script.py - same exit-code policy, but this is what ships."""
 
     def _samples_with_one_pdf(self, tmp_path, monkeypatch, name="inv.pdf"):
+        # Must not depend on the developer's local .env - this class tests
+        # the DIRECT gateway explicitly, regardless of what LLM_GATEWAY (or
+        # any OPENROUTER_* var) happens to be set to on this machine.
+        monkeypatch.delenv("LLM_GATEWAY", raising=False)
         monkeypatch.setenv("GEMINI_API_KEY", "test-key")
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         samples = tmp_path / "samples"
@@ -306,6 +310,7 @@ class TestRunCommand:
         assert len(review) == 1
 
     def test_exit_zero_when_one_file_fails_batch_continues(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("LLM_GATEWAY", raising=False)  # must not depend on local .env
         monkeypatch.setenv("GEMINI_API_KEY", "test-key")
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         samples = tmp_path / "samples"
@@ -333,6 +338,7 @@ class TestRunCommand:
         # failure (see README "Review outcomes vs program failure").
         monkeypatch.delenv("GEMINI_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("LLM_GATEWAY", raising=False)  # must not depend on local .env
         # Must not depend on the developer's local .env - explicitly pin
         # this rather than relying on the documented default, so the test
         # stays deterministic regardless of what's in a real .env on disk.

@@ -110,6 +110,67 @@ class TestParseCompletion:
         assert ei.value.category == "malformed_envelope"
 
 
+class TestEmbeddedErrorEnvelope:
+    """A 200-status HTTP response whose JSON body carries {"error": {...}}
+    instead of "choices" - the exact shape a live pilot hit for an
+    unsupported response_format. Only the numeric code is ever inspected;
+    message/metadata are untrusted and never surfaced."""
+
+    def test_embedded_400_maps_to_client_error(self):
+        raw = {"id": "gen-1", "error": {"code": 400, "message": "FAKE-SECRET-BODY"}}
+        with pytest.raises(ProviderError) as ei:
+            orc.parse_completion(raw, requested_model="m", route="text")
+        assert ei.value.category == "client_error"
+        assert ei.value.http_status == 400
+        assert "FAKE-SECRET-BODY" not in str(ei.value)
+
+    def test_embedded_402_maps_to_payment_required(self):
+        raw = {"id": "gen-1", "error": {"code": 402, "message": "FAKE-INVOICE-TEXT"}}
+        with pytest.raises(ProviderError) as ei:
+            orc.parse_completion(raw, requested_model="m", route="text")
+        assert ei.value.category == "payment_required"
+        assert ei.value.http_status == 402
+        assert "FAKE-INVOICE-TEXT" not in str(ei.value)
+
+    def test_embedded_429_maps_to_rate_limited(self):
+        raw = {"id": "gen-1", "error": {"code": 429, "message": "FAKE-SECRET"}}
+        with pytest.raises(ProviderError) as ei:
+            orc.parse_completion(raw, requested_model="m", route="text")
+        assert ei.value.category == "rate_limited"
+        assert ei.value.http_status == 429
+        assert "FAKE-SECRET" not in str(ei.value)
+
+    def test_embedded_5xx_maps_to_server_error(self):
+        raw = {"id": "gen-1", "error": {"code": 503, "message": "FAKE-METADATA-BODY",
+                                        "metadata": {"raw": "FAKE-RAW-BODY"}}}
+        with pytest.raises(ProviderError) as ei:
+            orc.parse_completion(raw, requested_model="m", route="text")
+        assert ei.value.category == "server_error"
+        assert ei.value.http_status == 503
+        assert "FAKE-METADATA-BODY" not in str(ei.value)
+        assert "FAKE-RAW-BODY" not in str(ei.value)
+
+    def test_embedded_404_maps_to_model_unavailable(self):
+        raw = {"id": "gen-1", "error": {"code": 404, "message": "unknown model"}}
+        with pytest.raises(ProviderError) as ei:
+            orc.parse_completion(raw, requested_model="m", route="text")
+        assert ei.value.category == "model_unavailable"
+        assert ei.value.http_status == 404
+
+    def test_no_choices_and_no_error_remains_generic(self):
+        with pytest.raises(ProviderError) as ei:
+            orc.parse_completion({"id": "gen-1"}, requested_model="m", route="text")
+        assert ei.value.category == "malformed_envelope"
+        assert ei.value.http_status is None
+
+    def test_error_object_without_numeric_code_is_malformed_envelope(self):
+        raw = {"id": "gen-1", "error": {"message": "FAKE-SECRET-NO-CODE"}}
+        with pytest.raises(ProviderError) as ei:
+            orc.parse_completion(raw, requested_model="m", route="text")
+        assert ei.value.category == "malformed_envelope"
+        assert "FAKE-SECRET-NO-CODE" not in str(ei.value)
+
+
 class TestChatCompletionErrorNormalization:
     def test_success_returns_raw_dict(self, monkeypatch):
         fake = _FakeClient(response=_FakeResponse(200, _success_envelope()))

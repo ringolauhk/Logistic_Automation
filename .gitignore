@@ -18,5 +18,10 @@ real_invoice_test_*/
 samples_real/
 tmp/
 
+# OpenRouter usage/cost sidecar reports - already covered by output/ when
+# written to the default location, but a custom --output path could land
+# elsewhere; never commit these regardless.
+*.usage.csv
+
 # macOS Finder metadata
 .DS_Store

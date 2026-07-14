@@ -19,6 +19,10 @@ def no_real_keys(monkeypatch):
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("ENABLE_CLAUDE_TEXT_FALLBACK", raising=False)
+    # This whole smoke script tests the direct gateway explicitly - must not
+    # depend on the developer's local .env (e.g. LLM_GATEWAY=openrouter left
+    # over from a live OpenRouter pilot session).
+    monkeypatch.delenv("LLM_GATEWAY", raising=False)
 
 
 def run(tmp_path, samples: Path) -> tuple[int, Path]:

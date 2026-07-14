@@ -43,10 +43,14 @@ class RouteResult:
     provider: str  # "gemini" | "claude" | "openrouter"
     model: str
     # Safe OpenRouter provenance/usage metadata (gateway, requested vs actual
-    # model, structured mode, finish reason, tokens, cost, generation id).
-    # Carried internally only - NOT exported to the workbook; retained here so
-    # the M3 usage sidecar can consume it without changing the sheet contract.
+    # model, structured mode, finish reason, tokens, cost, generation id) for
+    # the ACCEPTED attempt. Carried internally only - NOT exported to the
+    # workbook; retained here so the M3 usage sidecar can consume it without
+    # changing the sheet contract.
     provider_result: ProviderResult | None = None
+    # Usage records for EVERY OpenRouter attempt on this route (accepted and
+    # rejected, across the whole model ladder) - internal only, same reason.
+    usage_records: list = field(default_factory=list)
 
 
 @dataclass

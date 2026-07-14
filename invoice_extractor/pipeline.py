@@ -24,7 +24,7 @@ from invoice_extractor.config import (
     describe_models,
     validate_openrouter_config,
 )
-from invoice_extractor.logging_setup import exc_summary
+from invoice_extractor.logging_setup import exc_summary, new_run_id
 from invoice_extractor.pdf_utils import (
     DOC_ERROR,
     PAGE_BLANK,
@@ -34,6 +34,7 @@ from invoice_extractor.pdf_utils import (
     format_page_ranges,
 )
 from invoice_extractor.schema import ExtractionError, Invoice, empty_invoice, validate_invoice
+from invoice_extractor.usage import RunBudget, UsageRecord
 
 
 @dataclass
@@ -54,6 +55,11 @@ class InvoiceResult:
     review_reason: str | None = None
     error: bool = False  # hard failure: no structured result at all
     elapsed_seconds: float = 0.0
+    # OpenRouter usage records for every attempt (accepted + rejected) made
+    # for this file, across all routes/chunks. Internal only - never exported
+    # to the workbook; consumed by cli.py to write the .usage.csv sidecar.
+    # Always empty for the direct gateway.
+    usage_records: list[UsageRecord] = field(default_factory=list)
 
 
 def _chunked(items: list, size: int) -> list[list]:
@@ -71,17 +77,23 @@ def _chunked(items: list, size: int) -> list[list]:
 
 
 def _run_text_route(cfg: Config, logger: logging.Logger, name: str,
-                    text_pages: list[PageInfo]) -> RouteResult:
+                    text_pages: list[PageInfo], run_id: str,
+                    run_budget: RunBudget | None = None) -> RouteResult:
     """Gemini text normalization; Claude TEXT fallback only when enabled.
 
     With ENABLE_CLAUDE_TEXT_FALLBACK=false (the default, matching the original
     cost/routing design) a Gemini failure propagates - Claude is never called.
+
+    run_budget is only meaningful for the OpenRouter branch below; the direct
+    gateway (Gemini/Claude) branch ignores it entirely (unchanged).
     """
     pages = [p.number for p in text_pages]
     combined = "\n\n".join(f"--- PAGE {p.number} ---\n{p.text}" for p in text_pages)
     started = time.perf_counter()
     if cfg.llm_gateway == "openrouter":
-        return _run_openrouter_text_route(cfg, logger, name, pages, combined, started)
+        return _run_openrouter_text_route(
+            cfg, logger, name, pages, combined, started, run_id, run_budget,
+        )
     try:
         inv = gemini_client.extract_from_text(cfg, combined, label=f"{name}_gemini_text")
         provider, model = "gemini", cfg.gemini_text_model
@@ -112,30 +124,44 @@ def _run_text_route(cfg: Config, logger: logging.Logger, name: str,
 
 def _run_openrouter_text_route(
     cfg: Config, logger: logging.Logger, name: str,
-    pages: list[int], combined: str, started: float,
+    pages: list[int], combined: str, started: float, run_id: str,
+    run_budget: RunBudget | None = None,
 ) -> RouteResult:
-    """Text extraction via the single configured OpenRouter text model
-    (LLM_GATEWAY=openrouter, M2). No ladder/escalation - one model, at most
-    one JSON-repair retry (handled inside openrouter_client.extract_from_text).
+    """Text extraction via the configured OpenRouter text model LADDER
+    (LLM_GATEWAY=openrouter, M3): each model is tried in order, escalating on
+    any unusable result, stopping at the first accepted extraction. Usage
+    records for every attempt (accepted and rejected) are carried on the
+    returned RouteResult even when the ultimately-accepted model isn't the
+    first one tried.
 
     validate_openrouter_config runs here (immediately before the live call),
     not at config-load time, so import/--help/classify/render/offline doctor
     stay key-free even when LLM_GATEWAY=openrouter is configured. A missing
-    key or empty model list surfaces as the same clean per-route failure/
-    needs_review outcome as any other provider failure - never a crash.
+    key, empty model list, or fully-exhausted ladder surfaces as the same
+    clean per-route failure/needs_review outcome as any other provider
+    failure - never a crash - and still carries whatever usage records were
+    collected before failing (see the LadderExhaustedError recovery in
+    process_file).
+
+    run_budget (the shared run-wide cost tracker) is passed straight through
+    to the ladder, which is the only place that consults or updates it.
     """
     validate_openrouter_config(cfg, require_vision=False)
     label = f"{name}_openrouter_text"
-    inv, provider_result = openrouter_client.extract_from_text(cfg, combined, label=label)
+    page_range = format_page_ranges(pages)
+    inv, provider_result, usage_records = openrouter_client.extract_from_text_ladder(
+        cfg, combined, run_id=run_id, source_file=name, page_range=page_range,
+        label=label, run_budget=run_budget,
+    )
     model = provider_result.actual_model or provider_result.requested_model
     logger.info(
         "%s: text route (pages %s) ok provider=openrouter requested=%s actual=%s "
         "mode=%s finish=%s gen=%s %.1fs",
-        name, format_page_ranges(pages), provider_result.requested_model, model,
+        name, page_range, provider_result.requested_model, model,
         provider_result.structured_mode, provider_result.finish_reason,
         provider_result.generation_id, time.perf_counter() - started,
     )
-    return RouteResult("text", pages, inv, "openrouter", model, provider_result)
+    return RouteResult("text", pages, inv, "openrouter", model, provider_result, usage_records)
 
 
 def _run_vision_chunk(cfg: Config, logger: logging.Logger, name: str, path: Path,
@@ -195,8 +221,12 @@ def _reason_categories(result: InvoiceResult) -> str:
     return ", ".join(dict.fromkeys(categories))
 
 
-def process_file(path: Path, cfg: Config, logger: logging.Logger) -> InvoiceResult:
+def process_file(
+    path: Path, cfg: Config, logger: logging.Logger, run_id: str | None = None,
+    run_budget: RunBudget | None = None,
+) -> InvoiceResult:
     started = time.perf_counter()
+    run_id = run_id or new_run_id()
     result = InvoiceResult(source_file=path.name)
 
     # Stage 1-2: per-page text extraction + classification
@@ -234,7 +264,9 @@ def process_file(path: Path, cfg: Config, logger: logging.Logger) -> InvoiceResu
 
     if text_pages:
         try:
-            routes.append(_run_text_route(cfg, logger, path.name, text_pages))
+            routes.append(_run_text_route(
+                cfg, logger, path.name, text_pages, run_id, run_budget,
+            ))
         except Exception as exc:
             label = f"text route (pages {format_page_ranges(result.text_pages)})"
             route_failures.append((label, exc))
@@ -260,6 +292,17 @@ def process_file(path: Path, cfg: Config, logger: logging.Logger) -> InvoiceResu
                                "providers (%s); continuing with remaining chunks",
                                path.name, index, len(chunks), page_range,
                                exc_summary(exc))
+
+    # OpenRouter usage records survive regardless of outcome: successful
+    # routes carry every attempt made (accepted + rejected) on RouteResult;
+    # a fully-exhausted ladder attaches its own accumulated records to the
+    # raised exception (see usage.LadderExhaustedError) - recovered here via
+    # getattr so direct-gateway exceptions (which never have this attribute)
+    # are unaffected.
+    for route in routes:
+        result.usage_records.extend(route.usage_records)
+    for _, exc in route_failures:
+        result.usage_records.extend(getattr(exc, "usage_records", None) or [])
 
     if not routes:
         # No structured result at all: emit a reviewable null row, never crash.
@@ -324,20 +367,49 @@ def find_pdfs(input_dir: Path) -> list[Path]:
                   if p.is_file() and p.suffix.lower() == ".pdf")
 
 
-def process_directory(input_dir: Path, cfg: Config, logger: logging.Logger) -> list[InvoiceResult]:
+def process_directory(
+    input_dir: Path, cfg: Config, logger: logging.Logger, run_id: str | None = None,
+) -> list[InvoiceResult]:
     pdfs = find_pdfs(input_dir)
     if not pdfs:
         logger.warning("No PDF files found in %s", input_dir)
         return []
     logger.info("Processing %d PDF(s) from %s", len(pdfs), input_dir)
     logger.info(describe_models(cfg))
+    run_id = run_id or new_run_id()
     results = []
+    # Run-wide OpenRouter cost budget: ONE shared, mutable RunBudget is
+    # threaded by reference through every file's ladder (process_file ->
+    # _run_text_route -> _run_openrouter_text_route -> extract_from_text_ladder
+    # -> _attempt_model), which is the only place that ever mutates
+    # `.spent` - immediately after each usage record's cost becomes known, not
+    # in bulk after the file returns. That means the check here, before each
+    # new file, always sees the live total (never a stale per-file copy), and
+    # the SAME object already stopped this file's own ladder mid-flight (no
+    # repair/escalation calls past the crossing point) if it tripped during
+    # processing. Irrelevant (never exceeded, since nothing ever adds to it)
+    # for the direct gateway.
+    run_budget = RunBudget(cfg.max_cost_usd_per_run)
     for path in pdfs:
+        if cfg.llm_gateway == "openrouter" and run_budget.exceeded():
+            logger.warning(
+                "%s: run-wide OpenRouter cost budget ($%s) already reached; "
+                "skipping without any provider call",
+                path.name, cfg.max_cost_usd_per_run,
+            )
+            results.append(InvoiceResult(
+                source_file=path.name, needs_review=True, error=True,
+                review_reason=(
+                    f"run-wide OpenRouter cost budget (${cfg.max_cost_usd_per_run}) "
+                    "reached before this file could be processed"
+                ),
+            ))
+            continue
         try:
-            results.append(process_file(path, cfg, logger))
+            result = process_file(path, cfg, logger, run_id=run_id, run_budget=run_budget)
         except Exception as exc:  # belt and braces: one file must never stop the batch
             logger.error("%s: unexpected pipeline error (%s)", path.name, exc_summary(exc))
-            failed = InvoiceResult(source_file=path.name, needs_review=True, error=True,
+            result = InvoiceResult(source_file=path.name, needs_review=True, error=True,
                                    review_reason=f"unexpected pipeline error: {exc_summary(exc)}")
-            results.append(failed)
+        results.append(result)
     return results

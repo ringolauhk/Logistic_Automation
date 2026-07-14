@@ -57,6 +57,20 @@ def _csv_models(raw: str | None) -> tuple[str, ...]:
     return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
+def _optional_int(raw: str | None) -> int | None:
+    """Unset/empty means "no limit" (None), never a restrictive default."""
+    if raw is None or not raw.strip():
+        return None
+    return int(raw)
+
+
+def _optional_decimal(raw: str | None) -> Decimal | None:
+    """Unset/empty means "no limit" (None), never a restrictive default."""
+    if raw is None or not raw.strip():
+        return None
+    return Decimal(raw)
+
+
 @dataclass(frozen=True)
 class Config:
     gemini_api_key: str | None
@@ -98,6 +112,12 @@ class Config:
     openrouter_app_name: str = DEFAULT_OPENROUTER_APP_NAME
     openrouter_site_url: str | None = None
     openrouter_structured_output: str = "json_schema"
+    # Bounded-spend controls (M3). None/unset = no limit - never a silently
+    # restrictive default. See pipeline.py/openrouter_client.py for exactly
+    # how each is enforced (per-file model-ladder cap vs. run-wide cost cap).
+    max_model_attempts_per_file: int | None = None
+    max_cost_usd_per_file: Decimal | None = None
+    max_cost_usd_per_run: Decimal | None = None
 
     def __post_init__(self) -> None:
         # Runs on EVERY construction path - load_config() and direct
@@ -126,6 +146,21 @@ class Config:
             raise ConfigurationError(
                 f"OPENROUTER_STRUCTURED_OUTPUT must be one of {STRUCTURED_OUTPUT_MODES} "
                 f"(got {self.openrouter_structured_output!r})"
+            )
+        if self.max_model_attempts_per_file is not None and self.max_model_attempts_per_file < 1:
+            raise ConfigurationError(
+                "MAX_MODEL_ATTEMPTS_PER_FILE must be at least 1 if set "
+                f"(got {self.max_model_attempts_per_file})"
+            )
+        if self.max_cost_usd_per_file is not None and self.max_cost_usd_per_file < 0:
+            raise ConfigurationError(
+                f"MAX_COST_USD_PER_FILE must be non-negative if set "
+                f"(got {self.max_cost_usd_per_file})"
+            )
+        if self.max_cost_usd_per_run is not None and self.max_cost_usd_per_run < 0:
+            raise ConfigurationError(
+                f"MAX_COST_USD_PER_RUN must be non-negative if set "
+                f"(got {self.max_cost_usd_per_run})"
             )
 
 
@@ -162,6 +197,9 @@ def load_config() -> Config:
         openrouter_structured_output=(
             os.getenv("OPENROUTER_STRUCTURED_OUTPUT") or "json_schema"
         ).strip().lower(),
+        max_model_attempts_per_file=_optional_int(os.getenv("MAX_MODEL_ATTEMPTS_PER_FILE")),
+        max_cost_usd_per_file=_optional_decimal(os.getenv("MAX_COST_USD_PER_FILE")),
+        max_cost_usd_per_run=_optional_decimal(os.getenv("MAX_COST_USD_PER_RUN")),
     )
 
 

@@ -26,10 +26,10 @@ MODE_JSON_SCHEMA = "json_schema"
 MODE_JSON_OBJECT = "json_object"
 MODE_PROMPT_ONLY = "prompt_only"
 
-# Attempt classification for usage accounting / escalation (a later milestone).
+# Attempt classification for usage accounting / escalation.
 ATTEMPT_PRIMARY = "primary"
 ATTEMPT_REPAIR = "repair"
-ATTEMPT_FALLBACK = "fallback"  # escalation to the next model in the ladder
+ATTEMPT_ESCALATION = "escalation"  # the first call for a model AFTER model 0
 
 # OpenRouter's normalized finish_reason for output that hit the token cap.
 FINISH_LENGTH = "length"

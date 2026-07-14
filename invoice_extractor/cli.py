@@ -17,6 +17,7 @@ from invoice_extractor.config import describe_models, load_config, provider_key_
 from invoice_extractor.excel_export import export_workbook
 from invoice_extractor.logging_setup import exc_summary, new_run_id, setup_logging
 from invoice_extractor.pipeline import InvoiceResult, find_pdfs, process_directory
+from invoice_extractor.usage import format_usage_summary, usage_csv_path, write_usage_csv
 
 
 @click.group()
@@ -84,7 +85,8 @@ def run(input_dir: Path, output_path: Path, log_file: Path | None):
     try:
         logger = setup_logging(
             log_path, run_id=run_id,
-            secrets=(cfg.gemini_api_key or "", cfg.anthropic_api_key or ""),
+            secrets=(cfg.gemini_api_key or "", cfg.anthropic_api_key or "",
+                    cfg.openrouter_api_key or ""),
         )
     except Exception as exc:
         raise SystemExit(f"FATAL: cannot create log/output location: {exc_summary(exc)}")
@@ -102,7 +104,7 @@ def run(input_dir: Path, output_path: Path, log_file: Path | None):
         return
 
     try:
-        results = process_directory(input_dir, cfg, logger)
+        results = process_directory(input_dir, cfg, logger, run_id=run_id)
     except Exception as exc:
         logger.error("batch did not complete: %s", exc_summary(exc))
         raise SystemExit(f"FATAL: batch did not complete: {exc_summary(exc)}")
@@ -114,6 +116,23 @@ def run(input_dir: Path, output_path: Path, log_file: Path | None):
         raise SystemExit(
             f"FATAL: workbook could not be written to {output_path}: {exc_summary(exc)}"
         )
+
+    # OpenRouter usage sidecar + summary. The direct gateway never produces
+    # usage records and gets no .usage.csv at all - there is nothing to
+    # report. A zero-attempt OpenRouter run still writes the sidecar (header
+    # row only), so its presence/absence tells you which gateway ran.
+    if cfg.llm_gateway == "openrouter":
+        usage_records = [r for res in results for r in res.usage_records]
+        usage_path = usage_csv_path(output_path)
+        try:
+            write_usage_csv(usage_records, usage_path)
+        except Exception as exc:
+            logger.error("usage report could not be written: %s", exc_summary(exc))
+            raise SystemExit(
+                f"FATAL: usage report could not be written to {usage_path}: {exc_summary(exc)}"
+            )
+        logger.info("Wrote %s", usage_path)
+        click.echo(format_usage_summary(usage_records, len(results)))
 
     logger.info("Wrote %s (log: %s)", output_path, log_path)
     print_summary(results, output_path)
