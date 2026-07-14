@@ -16,9 +16,14 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from invoice_extractor import claude_client, gemini_client, pdf_utils
+from invoice_extractor import claude_client, gemini_client, openrouter_client, pdf_utils
 from invoice_extractor.aggregation import RouteResult, aggregate
-from invoice_extractor.config import Config, describe_models
+from invoice_extractor.config import (
+    Config,
+    ConfigurationError,
+    describe_models,
+    validate_openrouter_config,
+)
 from invoice_extractor.logging_setup import exc_summary
 from invoice_extractor.pdf_utils import (
     DOC_ERROR,
@@ -38,7 +43,7 @@ class InvoiceResult:
     page_count: int = 0
     document_classification: str = DOC_ERROR  # text-native | image-only | mixed | error
     extraction_method: str = "failed"  # text | vision | mixed | failed
-    provider: str = "none"  # gemini | claude | mixed | none
+    provider: str = "none"  # gemini | claude | openrouter | mixed | none
     model: str | None = None  # actual model id(s) that produced the result
     text_pages: list[int] = field(default_factory=list)
     image_pages: list[int] = field(default_factory=list)
@@ -75,6 +80,8 @@ def _run_text_route(cfg: Config, logger: logging.Logger, name: str,
     pages = [p.number for p in text_pages]
     combined = "\n\n".join(f"--- PAGE {p.number} ---\n{p.text}" for p in text_pages)
     started = time.perf_counter()
+    if cfg.llm_gateway == "openrouter":
+        return _run_openrouter_text_route(cfg, logger, name, pages, combined, started)
     try:
         inv = gemini_client.extract_from_text(cfg, combined, label=f"{name}_gemini_text")
         provider, model = "gemini", cfg.gemini_text_model
@@ -103,6 +110,34 @@ def _run_text_route(cfg: Config, logger: logging.Logger, name: str,
     return RouteResult("text", pages, inv, provider, model)
 
 
+def _run_openrouter_text_route(
+    cfg: Config, logger: logging.Logger, name: str,
+    pages: list[int], combined: str, started: float,
+) -> RouteResult:
+    """Text extraction via the single configured OpenRouter text model
+    (LLM_GATEWAY=openrouter, M2). No ladder/escalation - one model, at most
+    one JSON-repair retry (handled inside openrouter_client.extract_from_text).
+
+    validate_openrouter_config runs here (immediately before the live call),
+    not at config-load time, so import/--help/classify/render/offline doctor
+    stay key-free even when LLM_GATEWAY=openrouter is configured. A missing
+    key or empty model list surfaces as the same clean per-route failure/
+    needs_review outcome as any other provider failure - never a crash.
+    """
+    validate_openrouter_config(cfg, require_vision=False)
+    label = f"{name}_openrouter_text"
+    inv, provider_result = openrouter_client.extract_from_text(cfg, combined, label=label)
+    model = provider_result.actual_model or provider_result.requested_model
+    logger.info(
+        "%s: text route (pages %s) ok provider=openrouter requested=%s actual=%s "
+        "mode=%s finish=%s gen=%s %.1fs",
+        name, format_page_ranges(pages), provider_result.requested_model, model,
+        provider_result.structured_mode, provider_result.finish_reason,
+        provider_result.generation_id, time.perf_counter() - started,
+    )
+    return RouteResult("text", pages, inv, "openrouter", model, provider_result)
+
+
 def _run_vision_chunk(cfg: Config, logger: logging.Logger, name: str, path: Path,
                       chunk: list[PageInfo], index: int, total: int) -> RouteResult:
     """One vision request for one chunk: Gemini first, Claude on any failure.
@@ -113,6 +148,14 @@ def _run_vision_chunk(cfg: Config, logger: logging.Logger, name: str, path: Path
     pages = [p.number for p in chunk]
     page_range = format_page_ranges(pages)
     started = time.perf_counter()
+    if cfg.llm_gateway == "openrouter":
+        # OpenRouter vision is not implemented yet (a later milestone) -
+        # fail clearly before rendering/spending anything, rather than
+        # silently falling back to direct and mixing billing gateways.
+        raise ConfigurationError(
+            "OpenRouter vision route is not implemented yet (text-only so far); "
+            "set LLM_GATEWAY=direct to process image pages"
+        )
     images = pdf_utils.render_pages_png(str(path), pages, dpi=cfg.render_dpi)
     try:
         inv = gemini_client.extract_from_images(

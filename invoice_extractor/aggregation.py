@@ -26,6 +26,7 @@ documented rules:
 from dataclasses import dataclass, field
 
 from invoice_extractor.pdf_utils import format_page_ranges
+from invoice_extractor.provider import ProviderResult
 from invoice_extractor.schema import (
     HEADER_FIELDS,
     NUMERIC_HEADER_FIELDS,
@@ -39,8 +40,13 @@ class RouteResult:
     route: str  # "text" | "vision"
     pages: list[int]  # 1-based pages this route covered
     invoice: Invoice
-    provider: str  # "gemini" | "claude"
+    provider: str  # "gemini" | "claude" | "openrouter"
     model: str
+    # Safe OpenRouter provenance/usage metadata (gateway, requested vs actual
+    # model, structured mode, finish reason, tokens, cost, generation id).
+    # Carried internally only - NOT exported to the workbook; retained here so
+    # the M3 usage sidecar can consume it without changing the sheet contract.
+    provider_result: ProviderResult | None = None
 
 
 @dataclass

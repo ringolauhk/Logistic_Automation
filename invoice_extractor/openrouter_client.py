@@ -14,22 +14,58 @@ category are retained (see ProviderError).
 
 import base64
 import logging
+import time
 
 import httpx
 
+from invoice_extractor.artifacts import save_debug_artifact
 from invoice_extractor.config import Config
+from invoice_extractor.prompts import (
+    JSON_SCHEMA_BLOCK,
+    parse_json_response,
+    text_extraction_prompt,
+)
 from invoice_extractor.provider import (
+    ATTEMPT_PRIMARY,
+    ATTEMPT_REPAIR,
     MODE_JSON_OBJECT,
     MODE_JSON_SCHEMA,
-    ATTEMPT_PRIMARY,
     MODE_PROMPT_ONLY,
+    ROUTE_TEXT,
     ProviderError,
     ProviderResult,
     coerce_cost,
+    is_truncated,
 )
-from invoice_extractor.schema import Invoice
+from invoice_extractor.retry import call_with_retry
+from invoice_extractor.schema import (
+    ExtractionError,
+    Invoice,
+    check_required,
+    normalize_invoice,
+    unknown_keys,
+)
 
 logger = logging.getLogger("invoice_extractor")
+
+# Output-token ceiling for OpenRouter requests. Fixed for M2 (mirrors the
+# Claude client); per-model sizing from capability metadata is a later
+# milestone. A response that hits this cap surfaces as finish_reason=length
+# and is classified as a truncation, never a random JSON syntax error.
+_MAX_TOKENS = 8192
+
+# Transport-layer categories worth a bounded retry (mirrors the transient
+# policy of the direct clients). Malformed envelopes and 4xx client errors are
+# NOT transient - they raise immediately.
+_TRANSIENT_CATEGORIES = ("rate_limited", "server_error", "timeout", "transport")
+
+# Repair instruction (kept local to avoid a client-to-client import; mirrors
+# gemini_client/claude_client). Points at the same shared JSON_SCHEMA_BLOCK.
+_REPAIR_INSTRUCTION = (
+    "Your previous response was not valid JSON. Return the same extraction "
+    "as strict JSON only, matching this exact schema. Do not include "
+    "markdown fences, comments, or explanation.\n\n" + JSON_SCHEMA_BLOCK
+)
 
 _client: httpx.Client | None = None
 _client_key: str | None = None
@@ -221,3 +257,107 @@ def build_response_format(mode: str, schema: dict | None = None):
     if mode == MODE_JSON_OBJECT:
         return {"type": "json_object"}
     return None  # prompt_only
+
+
+# --- Text extraction through one configured OpenRouter model (M2) ------------
+
+def _is_transient(exc: BaseException) -> bool:
+    return isinstance(exc, ProviderError) and exc.category in _TRANSIENT_CATEGORIES
+
+
+def _run_attempt(
+    cfg: Config, model: str, messages: list, response_format, structured_mode: str,
+    attempt_type: str, attempt_index: int, label: str,
+) -> ProviderResult:
+    """One OpenRouter request (with bounded transport retry), normalized and
+    checked for truncation/empty content BEFORE any JSON parsing.
+
+    Truncation (finish_reason=length) and empty content raise a clear,
+    sanitized ExtractionError - neither is retried and neither triggers the
+    JSON-repair path (repair is only for malformed-but-complete JSON).
+    """
+    started = time.perf_counter()
+    raw, _attempts = call_with_retry(
+        lambda: _chat_completion(
+            cfg, model=model, messages=messages,
+            response_format=response_format, max_tokens=_MAX_TOKENS,
+        ),
+        _is_transient, cfg.max_retries, f"{label}_{attempt_type}",
+    )
+    latency_ms = (time.perf_counter() - started) * 1000.0
+    result = parse_completion(
+        raw, requested_model=model, route=ROUTE_TEXT,
+        attempt_index=attempt_index, attempt_type=attempt_type,
+        structured_mode=structured_mode, latency_ms=latency_ms,
+    )
+    if is_truncated(result):
+        raise ExtractionError(
+            "OpenRouter response truncated before valid JSON completed "
+            "(finish_reason=length)"
+        )
+    if not result.text.strip():
+        raise ExtractionError("empty response from model")
+    return result
+
+
+def _finalize(cfg: Config, data: dict, raw_text: str, label: str, model: str) -> Invoice:
+    extras = unknown_keys(data)
+    if extras:
+        logger.debug("%s: dropped %d unexpected key(s): %s",
+                     label, len(extras), ", ".join(extras[:8]))
+    inv = normalize_invoice(data)
+    try:
+        check_required(inv)
+    except ExtractionError as exc:
+        save_debug_artifact(cfg, label, model=model, reason=str(exc), raw_text=raw_text)
+        raise
+    return inv
+
+
+def _repair_messages(prompt: str, raw_text: str) -> list:
+    return build_text_messages(
+        f"{prompt}\n\nYour previous response was:\n\n{raw_text}\n\n{_REPAIR_INSTRUCTION}"
+    )
+
+
+def extract_from_text(
+    cfg: Config, invoice_text: str, label: str = "openrouter_text",
+) -> tuple[Invoice, ProviderResult]:
+    """Extract an invoice from text via the single configured OpenRouter text
+    model (index 0; the model ladder is a later milestone).
+
+    Returns (Invoice, ProviderResult) - the result carries safe provenance/
+    usage metadata for the caller. Applies local JSON cleanup, then exactly
+    ONE repair request to the same model if still malformed, then schema +
+    hard-required validation. Raw model output is never logged.
+    """
+    model = cfg.openrouter_text_models[0]
+    mode = cfg.openrouter_structured_output
+    prompt = text_extraction_prompt(invoice_text)
+    messages = build_text_messages(prompt)
+    response_format = build_response_format(mode)
+
+    result = _run_attempt(
+        cfg, model, messages, response_format, mode, ATTEMPT_PRIMARY, 0, label,
+    )
+    try:
+        data = parse_json_response(result.text)
+    except ExtractionError as exc:
+        logger.warning("%s: OpenRouter response from %s was not valid JSON (%s); "
+                       "attempting one repair retry", label, model, exc)
+        repair = _run_attempt(
+            cfg, model, _repair_messages(prompt, result.text), response_format, mode,
+            ATTEMPT_REPAIR, 1, label,
+        )
+        try:
+            data = parse_json_response(repair.text)
+        except ExtractionError as repair_exc:
+            logger.warning("%s: JSON repair retry did not produce valid JSON; "
+                           "surfacing failure for review", label)
+            save_debug_artifact(cfg, label, model=model, reason=str(exc), raw_text=result.text)
+            raise exc from repair_exc
+        logger.info("%s: JSON repair retry recovered valid JSON", label)
+        result = repair  # provenance reflects the successful (repair) attempt
+
+    inv = _finalize(cfg, data, result.text, label, model)
+    return inv, result

@@ -18,6 +18,11 @@ DEFAULT_CLAUDE_MODEL = "claude-sonnet-5"
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_OPENROUTER_APP_NAME = "Invoice Extractor"
 GATEWAYS = ("direct", "openrouter")
+# Structured-output request mode for the OpenRouter route. json_schema is
+# preferred; runtime mode-fallback based on model capability is a later
+# milestone (needs the model-metadata endpoint), so M2 uses one configured
+# mode as-is. Values mirror provider.MODE_* string constants.
+STRUCTURED_OUTPUT_MODES = ("json_schema", "json_object", "prompt_only")
 
 # An OpenRouter model id is "vendor/model", optionally with a :tag suffix
 # (e.g. "openai/gpt-5-mini", "mistralai/mistral-small-3.2-24b-instruct",
@@ -92,6 +97,7 @@ class Config:
     openrouter_vision_models: tuple[str, ...] = ()
     openrouter_app_name: str = DEFAULT_OPENROUTER_APP_NAME
     openrouter_site_url: str | None = None
+    openrouter_structured_output: str = "json_schema"
 
     def __post_init__(self) -> None:
         # Runs on EVERY construction path - load_config() and direct
@@ -115,6 +121,11 @@ class Config:
         if self.llm_gateway not in GATEWAYS:
             raise ConfigurationError(
                 f"LLM_GATEWAY must be one of {GATEWAYS} (got {self.llm_gateway!r})"
+            )
+        if self.openrouter_structured_output not in STRUCTURED_OUTPUT_MODES:
+            raise ConfigurationError(
+                f"OPENROUTER_STRUCTURED_OUTPUT must be one of {STRUCTURED_OUTPUT_MODES} "
+                f"(got {self.openrouter_structured_output!r})"
             )
 
 
@@ -148,6 +159,9 @@ def load_config() -> Config:
         openrouter_vision_models=_csv_models(os.getenv("OPENROUTER_VISION_MODELS")),
         openrouter_app_name=os.getenv("OPENROUTER_APP_NAME") or DEFAULT_OPENROUTER_APP_NAME,
         openrouter_site_url=os.getenv("OPENROUTER_SITE_URL") or None,
+        openrouter_structured_output=(
+            os.getenv("OPENROUTER_STRUCTURED_OUTPUT") or "json_schema"
+        ).strip().lower(),
     )
 
 
@@ -165,19 +179,22 @@ def _validate_model_ids(models: tuple[str, ...], var_name: str) -> None:
             )
 
 
-def validate_openrouter_config(cfg: "Config") -> None:
+def validate_openrouter_config(cfg: "Config", *, require_vision: bool = True) -> None:
     """Raise ConfigurationError if the OpenRouter gateway is not usable for a
     LIVE run (missing key, empty list, or malformed model id).
 
-    Called only immediately before making real OpenRouter calls (a future
-    milestone) - NEVER on offline paths (import/--help/classify/render/offline
-    doctor), so those remain key- and model-list-free even when
-    LLM_GATEWAY=openrouter is set.
+    Called only immediately before making real OpenRouter calls - NEVER on
+    offline paths (import/--help/classify/render/offline doctor), so those
+    remain key- and model-list-free even when LLM_GATEWAY=openrouter is set.
+
+    require_vision=False is used by the text-only path (M2): a vision model
+    list is not required when only text extraction runs through OpenRouter.
     """
     if not cfg.openrouter_api_key:
         raise ConfigurationError("OPENROUTER_API_KEY is not set")
     _validate_model_ids(cfg.openrouter_text_models, "OPENROUTER_TEXT_MODELS")
-    _validate_model_ids(cfg.openrouter_vision_models, "OPENROUTER_VISION_MODELS")
+    if require_vision:
+        _validate_model_ids(cfg.openrouter_vision_models, "OPENROUTER_VISION_MODELS")
 
 
 def describe_models(cfg: Config) -> str:
