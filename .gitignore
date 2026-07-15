@@ -23,5 +23,16 @@ tmp/
 # elsewhere; never commit these regardless.
 *.usage.csv
 
+# Benchmark real-data (M6): reports and ground truth may contain expected/
+# actual invoice field values - never commit real-data cases or run outputs.
+# The committed, synthetic-only examples under benchmark/examples/ stay
+# visible (negated below); everything else under benchmark/ is local.
+benchmark/manifest.json
+benchmark/thresholds.json
+benchmark/ground_truth/
+benchmark/results/
+benchmark_report.xlsx
+benchmark_report.json
+
 # macOS Finder metadata
 .DS_Store

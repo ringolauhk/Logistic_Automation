@@ -60,7 +60,13 @@ def print_summary(results: list[InvoiceResult], output_path: Path) -> None:
               help="Excel workbook to write.")
 @click.option("--log-file", default=None, type=click.Path(dir_okay=False, path_type=Path),
               help="Log file path (default: <output dir>/run.log).")
-def run(input_dir: Path, output_path: Path, log_file: Path | None):
+@click.option("--run-metadata", "run_metadata_path", default=None,
+              type=click.Path(dir_okay=False, path_type=Path),
+              help="OPT-IN: write a small run-metadata JSON (run id, timestamps, and "
+                   "per-file runtime/method/provider/model/needs_review/error - NO invoice "
+                   "content) for the offline benchmark. Omit for byte-identical normal output.")
+def run(input_dir: Path, output_path: Path, log_file: Path | None,
+        run_metadata_path: Path | None):
     """Run the full extraction pipeline over a folder of PDFs.
 
     Exit-code policy (invoice-level review is NOT a program failure - see
@@ -103,11 +109,14 @@ def run(input_dir: Path, output_path: Path, log_file: Path | None):
         click.echo(f"No PDFs found in {input_dir} - nothing to do.")
         return
 
+    from datetime import datetime, timezone
+    started_at = datetime.now(timezone.utc).isoformat()
     try:
         results = process_directory(input_dir, cfg, logger, run_id=run_id)
     except Exception as exc:
         logger.error("batch did not complete: %s", exc_summary(exc))
         raise SystemExit(f"FATAL: batch did not complete: {exc_summary(exc)}")
+    finished_at = datetime.now(timezone.utc).isoformat()
 
     try:
         export_workbook(results, output_path)
@@ -134,8 +143,134 @@ def run(input_dir: Path, output_path: Path, log_file: Path | None):
         logger.info("Wrote %s", usage_path)
         click.echo(format_usage_summary(usage_records, len(results)))
 
+    # OPT-IN run metadata: only written when --run-metadata is passed. Persists
+    # NO invoice content (no review reasons, values, text, prompts, responses,
+    # or page details) - just run id, timestamps, and safe per-file fields for
+    # the offline benchmark's runtime metrics.
+    if run_metadata_path is not None:
+        import json
+        meta = {
+            "run_id": run_id, "started_at": started_at, "finished_at": finished_at,
+            "files": [
+                {
+                    "source_file": r.source_file,
+                    "elapsed_seconds": round(r.elapsed_seconds, 3),
+                    "extraction_method": r.extraction_method,
+                    "provider": r.provider, "model": r.model,
+                    "needs_review": r.needs_review, "error": r.error,
+                }
+                for r in results
+            ],
+        }
+        try:
+            run_metadata_path.parent.mkdir(parents=True, exist_ok=True)
+            run_metadata_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+        except Exception as exc:
+            logger.error("run metadata could not be written: %s", exc_summary(exc))
+            raise SystemExit(
+                f"FATAL: run metadata could not be written to {run_metadata_path}: "
+                f"{exc_summary(exc)}"
+            )
+        logger.info("Wrote %s", run_metadata_path)
+
     logger.info("Wrote %s (log: %s)", output_path, log_path)
     print_summary(results, output_path)
+
+
+# --- benchmark (M6): offline ground-truth scoring; makes NO provider calls ----
+
+@cli.group()
+def benchmark():
+    """Offline ground-truth benchmark tooling (no network/provider calls)."""
+
+
+@benchmark.command("score")
+@click.option("--manifest", "manifest_path", required=True,
+              type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Benchmark manifest JSON.")
+@click.option("--workbook", "workbook_path", required=True,
+              type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Extraction workbook to score (results.xlsx).")
+@click.option("--usage", "usage_path", default=None,
+              type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Extraction usage CSV (results.usage.csv), if available.")
+@click.option("--run-metadata", "run_metadata_path", default=None,
+              type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Optional run-metadata JSON for end-to-end runtime.")
+@click.option("--thresholds", "thresholds_path", default=None,
+              type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Optional thresholds JSON; failures set a nonzero exit code.")
+@click.option("--enable-fuzzy-line-matching", is_flag=True, default=False,
+              help="Enable the optional fuzzy description matching tier (OFF by default).")
+@click.option("--fuzzy-threshold", default="0.90", show_default=True,
+              help="Fuzzy match ratio threshold (only used with fuzzy matching enabled).")
+@click.option("--output", "output_path", default="./output/benchmark_report.xlsx",
+              type=click.Path(dir_okay=False, path_type=Path), show_default=True,
+              help="Report workbook path (a sibling .json summary is written too).")
+def benchmark_score(manifest_path, workbook_path, usage_path, run_metadata_path,
+                    thresholds_path, enable_fuzzy_line_matching, fuzzy_threshold,
+                    output_path):
+    """Score an extraction workbook against benchmark ground truth (offline).
+
+    Exit codes:
+      0  scoring completed and all supplied thresholds passed (or none supplied)
+      1  one or more supplied thresholds failed
+      2  invalid benchmark manifest / ground truth / config (nothing scored)
+    """
+    from decimal import Decimal, InvalidOperation
+
+    from invoice_extractor.benchmark.dataset import (
+        BenchmarkConfigError, load_manifest, load_thresholds,
+    )
+    from invoice_extractor.benchmark.report import (
+        write_json_summary, write_report_workbook,
+    )
+    from invoice_extractor.benchmark.scoring import score_benchmark
+
+    try:
+        dataset = load_manifest(manifest_path)
+        if thresholds_path is not None:
+            dataset.thresholds = load_thresholds(thresholds_path)
+        dataset.fuzzy_enabled = bool(enable_fuzzy_line_matching)
+        try:
+            dataset.fuzzy_threshold = Decimal(str(fuzzy_threshold))
+        except InvalidOperation:
+            raise BenchmarkConfigError(f"--fuzzy-threshold {fuzzy_threshold!r} is not a decimal")
+    except BenchmarkConfigError as exc:
+        # Exit code 2 for benchmark configuration / ground-truth errors
+        # (distinct from 1 = threshold failure). SystemExit(str) would yield
+        # exit 1, so echo the message and raise an explicit integer code.
+        click.echo(f"BENCHMARK CONFIG ERROR: {exc}", err=True)
+        raise SystemExit(2)
+
+    report = score_benchmark(
+        dataset, workbook_path, usage_path=usage_path,
+        run_metadata_path=run_metadata_path,
+    )
+
+    output_path = Path(output_path)
+    json_path = output_path.with_suffix(".json")
+    write_report_workbook(report, output_path)
+    write_json_summary(report, json_path)
+
+    a = report.aggregates
+    click.echo(f"Benchmark: {a['num_cases']} case(s), "
+               f"header micro acc={a['header_micro_accuracy']}, "
+               f"line F1={a['line_f1']}, "
+               f"review F1={a['review_f1']}")
+    click.echo(f"Total reported cost: {a['total_reported_cost']}"
+               + (f" (incomplete: {a['unknown_cost_requests']} unknown-cost request(s))"
+                  if a["cost_incomplete"] else ""))
+    if report.errors:
+        click.echo(f"Errors sheet: {len(report.errors)} anomaly row(s) "
+                   "(missing/duplicate/extra workbook cases)")
+    for t in report.threshold_results:
+        click.echo(f"  threshold {t['threshold']}: target={t['target']} "
+                   f"actual={t['actual']} {'PASS' if t['passed'] else 'FAIL'}")
+    click.echo(f"Wrote {output_path} and {json_path}")
+
+    if report.threshold_results and not report.thresholds_passed:
+        raise SystemExit(1)
 
 
 @cli.command()

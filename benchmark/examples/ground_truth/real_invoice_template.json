@@ -1,0 +1,20 @@
+{
+  "case_id": "real_invoice_template",
+  "__status__": "REQUIRES_HUMAN_VERIFICATION - blank template. Fill in from the",
+  "__status_2__": "actual invoice by hand. Do NOT paste extractor output here;",
+  "__status_3__": "ground truth must be human-authored. Remove the __status__ keys",
+  "__status_4__": "before use (they are not approved schema fields and will be rejected).",
+  "invoice": {
+    "invoice_number": null,
+    "invoice_date": null,
+    "currency": null,
+    "seller_name": null,
+    "total_amount": null
+  },
+  "line_items": [],
+  "expected_needs_review": false,
+  "accepted_review_categories": [],
+  "ignored_fields": [],
+  "field_tolerances": {},
+  "notes": "Blank real-invoice template - populate by hand before benchmarking."
+}

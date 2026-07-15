@@ -1,0 +1,25 @@
+{
+  "case_id": "syn_text_single",
+  "invoice": {
+    "invoice_number": "INV-1001",
+    "invoice_date": "2026-07-01",
+    "currency": "EUR",
+    "seller_name": "Acme Logistics GmbH",
+    "seller_address": "Hafenstrasse 12, Hamburg",
+    "buyer_name": "Global Trade Ltd",
+    "buyer_address": "1 Harbour Rd, Hong Kong",
+    "subtotal": "100.00",
+    "tax": "19.00",
+    "total_amount": "119.00",
+    "po_number": null,
+    "reference": null
+  },
+  "line_items": [
+    {"line_no": "1", "description": "Ocean freight", "quantity": "1", "unit_price": "100.00", "amount": "100.00"}
+  ],
+  "expected_needs_review": false,
+  "accepted_review_categories": [],
+  "ignored_fields": [],
+  "field_tolerances": {"total_amount": "0.02"},
+  "notes": "SYNTHETIC example - fully populated because the fixture owns its construction."
+}

@@ -1,0 +1,21 @@
+{
+  "case_id": "syn_mixed",
+  "invoice": {
+    "invoice_number": "INV-2002",
+    "invoice_date": "2026-07-02",
+    "currency": "USD",
+    "seller_name": "Acme Logistics GmbH",
+    "total_amount": "60.00",
+    "ship_to": "Warehouse 7, Rotterdam",
+    "country_of_origin": "DE"
+  },
+  "line_items": [
+    {"line_no": "1", "item_code": "31C207", "description": "Text-page item", "quantity": "1", "unit_price": "10.00", "amount": "10.00"},
+    {"line_no": "2", "item_code": "73SA041601", "description": "Vision-page item", "quantity": "1", "unit_price": "50.00", "amount": "50.00", "hs_code": "8471.30"}
+  ],
+  "expected_needs_review": false,
+  "accepted_review_categories": [],
+  "ignored_fields": ["seller_address", "buyer_name", "buyer_address"],
+  "field_tolerances": {},
+  "notes": "SYNTHETIC mixed example. ship_to/country_of_origin/hs_code are approved but not-extractable and are excluded from scored denominators."
+}

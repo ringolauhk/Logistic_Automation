@@ -1,0 +1,11 @@
+{
+  "__doc__": "Example thresholds. Supply via --thresholds. A failed threshold makes 'benchmark score' exit 1. Absent keys are not enforced. Do not hardcode arbitrary targets - tune to your own accepted baseline.",
+  "minimum_header_micro_accuracy": "0.90",
+  "minimum_line_recall": "0.90",
+  "minimum_line_precision": "0.90",
+  "minimum_numeric_accuracy": "0.95",
+  "maximum_false_review_rate": "0.20",
+  "maximum_missed_problem_rate": "0.10",
+  "maximum_average_cost_per_invoice": "0.05",
+  "maximum_average_runtime_seconds": "60"
+}

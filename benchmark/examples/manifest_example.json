@@ -1,0 +1,22 @@
+{
+  "__doc__": "Example benchmark manifest. Copy to ../manifest.json (gitignored) and point source_file at your local PDFs. Ground-truth paths are relative to this manifest file.",
+  "cases": [
+    {
+      "case_id": "syn_text_single",
+      "source_file": "text_single.pdf",
+      "document_type": "text_single_page",
+      "expected_outcome": "extracted",
+      "ground_truth": "ground_truth/syn_text_single.json",
+      "notes": "Simple one-page text invoice (synthetic)."
+    },
+    {
+      "case_id": "syn_mixed",
+      "source_file": "mixed.pdf",
+      "document_type": "mixed",
+      "expected_outcome": "extracted",
+      "ground_truth": "ground_truth/syn_mixed.json",
+      "notes": "Mixed text/image invoice (synthetic)."
+    }
+  ],
+  "thresholds": {}
+}
