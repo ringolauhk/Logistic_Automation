@@ -10,6 +10,19 @@ provenance.
 
 ## Quick start
 
+**Docker (recommended for pilot users)** — no Python setup, no poppler; rendering
+runs in-process via PyMuPDF:
+
+```bash
+cp .env.example .env                       # then fill in keys
+mkdir -p input output
+docker compose build
+docker compose run --rm invoice-extractor doctor        # offline; no paid calls
+./scripts/run-invoices.sh                                # extract ./input -> ./output
+```
+
+**Native Python (developers):**
+
 ```bash
 source .venv/bin/activate
 cp .env.example .env                       # then fill in keys
@@ -17,6 +30,14 @@ python -m invoice_extractor doctor         # offline readiness check (no paid ca
 python -m invoice_extractor classify --input ./samples
 python -m invoice_extractor run --input ./samples --output ./output/results.xlsx
 ```
+
+Both entry points are equivalent: `invoice-extractor <cmd>` (console script) and
+`python -m invoice_extractor <cmd>`. `invoice-extractor --version` reports the
+package version. Full deployment guide: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+
+> **Privacy:** extraction sends invoice page content (text, and rendered images
+> for scans) to the **configured external model provider** — data is not fully
+> local during extraction. Everything else stays on your machine.
 
 Outputs (all written atomically, three-sheet workbook contract unchanged):
 `results.xlsx` (`Invoices` / `LineItems` / `NeedsReview`), plus a

@@ -39,5 +39,18 @@ benchmark_report.json
 # on failure - never commit a stray one if a process was killed mid-write.
 *.tmp-*
 
+# Local deployment archives built by scripts/build-release.sh (M8).
+release/
+
+# Operator input folder (M8 Docker/native workflow) - holds the user's real
+# invoice PDFs; never commit it. Mounted read-only into the container.
+input/
+
 # macOS Finder metadata
 .DS_Store
+
+# Python packaging artifacts
+build/
+dist/
+*.egg-info/
+*.py[cod]

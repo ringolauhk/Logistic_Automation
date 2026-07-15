@@ -1,2 +1,6 @@
+# Development/test dependencies: the pinned production set plus the test
+# runner. NEVER installed into the production image (the Dockerfile installs
+# requirements.txt only). Install for local dev with:
+#   pip install -r requirements-dev.txt && pip install -e .
 -r requirements.txt
-pytest>=8.0
+pytest==9.1.1

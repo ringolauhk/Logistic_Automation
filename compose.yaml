@@ -1,0 +1,39 @@
+# Docker Compose for the invoice extractor (M8). One service, no ports, no
+# database, no privileged mode, no secrets baked in.
+#
+# Setup once:
+#   cp .env.example .env          # fill in your key(s)
+#   mkdir -p input output
+#   docker compose build
+#   docker compose run --rm invoice-extractor doctor
+#
+# Extract:
+#   docker compose run --rm invoice-extractor run \
+#     --input /data/input --output /data/output/results.xlsx
+#
+# Linux hosts: to make generated files owned by your user, export HOST_UID /
+# HOST_GID before running (see docs/DEPLOYMENT.md):
+#   HOST_UID=$(id -u) HOST_GID=$(id -g) docker compose run --rm ...
+services:
+  invoice-extractor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: invoice-extractor:0.1.0
+    # Non-root by default (1000:1000, matching the image's appuser). Override
+    # to the host user on Linux so mounted-output files are host-owned; on
+    # macOS Docker Desktop the file-sharing layer already maps ownership.
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    env_file:
+      - .env
+    volumes:
+      - ./input:/data/input:ro        # invoices in (read-only)
+      - ./output:/data/output         # workbook/usage/metadata out (writable)
+      - ./benchmark:/data/benchmark   # optional: local benchmark data
+    # tini (image ENTRYPOINT) forwards SIGINT/SIGTERM; give Python time to
+    # write partial output and exit 130 on Ctrl+C.
+    init: false
+    stop_signal: SIGINT
+    stop_grace_period: 30s
+    # Harmless default (image CMD is --help); operators pass a real subcommand:
+    #   docker compose run --rm invoice-extractor run --input /data/input ...

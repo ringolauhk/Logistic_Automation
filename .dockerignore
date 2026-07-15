@@ -1,0 +1,65 @@
+# Strict build-context exclusions (M8). Keep secrets, real data, generated
+# outputs, tests, and history OUT of the image. Only the application package,
+# packaging metadata, and README are copied by the Dockerfile.
+
+# Secrets / env
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+
+# Version control & IDE / OS metadata
+.git
+.gitignore
+.github/
+.idea/
+.vscode/
+.DS_Store
+.claude/
+
+# Python environments & caches
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Tests (never shipped in the runtime image)
+tests/
+test_pipeline.py
+pytest.ini
+
+# Real invoice data & pilot folders (never in an image)
+input/
+output/
+samples/
+samples_real/
+real_invoice_test/
+real_invoice_test_*/
+tmp/
+
+# Generated artifacts
+*.xlsx
+*.usage.csv
+*.log
+*.tmp-*
+benchmark_report.*
+
+# Local benchmark real data (committed synthetic examples under
+# benchmark/examples/ are not needed at RUNTIME and are excluded from the
+# image; they remain in the source tree / release archive).
+benchmark/
+
+# Dev/deployment tooling not needed inside the image
+requirements-dev.txt
+scripts/
+docs/
+release/
+**/__pycache__/
+*.py[cod]

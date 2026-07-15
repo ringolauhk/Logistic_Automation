@@ -13,7 +13,7 @@ from pathlib import Path
 
 import click
 
-from invoice_extractor import pdf_utils
+from invoice_extractor import __version__, pdf_utils
 from invoice_extractor.config import describe_models, load_config, provider_key_status
 from invoice_extractor.excel_export import export_workbook
 from invoice_extractor.logging_setup import exc_summary, new_run_id, setup_logging
@@ -22,6 +22,8 @@ from invoice_extractor.usage import format_usage_summary, usage_csv_path, write_
 
 
 @click.group()
+@click.version_option(version=__version__, prog_name="invoice-extractor",
+                      message="%(prog)s %(version)s")
 def cli():
     """Batch invoice PDF extraction to Excel."""
 
@@ -521,6 +523,7 @@ def doctor(input_dir: Path, output_dir: Path, live: bool, provider: str, route: 
     cfg = load_config()
     ok = True
 
+    click.echo(f"invoice-extractor {__version__}")
     click.echo("Environment:")
     py = sys.version_info
     ok &= _check(py >= (3, 11), f"Python {py.major}.{py.minor}.{py.micro} (>= 3.11 required)")
@@ -537,6 +540,16 @@ def doctor(input_dir: Path, output_dir: Path, live: bool, provider: str, route: 
             ok &= _check(True, f"{pkg}", ver)
         except Exception as exc:
             ok &= _check(False, f"{pkg}", f"import failed: {type(exc).__name__}")
+
+    # PDF rendering runs entirely in-process via PyMuPDF - no external
+    # poppler/pdftoppm binary is required or invoked.
+    try:
+        import fitz
+        ok &= _check(True, "PDF rendering (PyMuPDF, in-process)",
+                     f"MuPDF {getattr(fitz, 'mupdf_version', getattr(fitz, 'VersionFitz', '?'))} "
+                     "- no poppler/pdftoppm needed")
+    except Exception as exc:
+        ok &= _check(False, "PDF rendering (PyMuPDF)", f"import failed: {type(exc).__name__}")
 
     click.echo("Paths:")
     ok &= _check(input_dir.is_dir(),
