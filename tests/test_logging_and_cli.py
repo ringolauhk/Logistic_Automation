@@ -369,7 +369,10 @@ class TestRunCommand:
     def test_no_pdfs_found_exits_zero(self, tmp_path):
         samples = tmp_path / "samples"
         samples.mkdir()
-        result = CliRunner().invoke(cli, ["run", "--input", str(samples)])
+        # Explicit tmp_path output keeps this hermetic - no repo path is touched
+        # (and M7's console-only default means no run.log is written anyway).
+        result = CliRunner().invoke(
+            cli, ["run", "--input", str(samples), "--output", str(tmp_path / "out" / "r.xlsx")])
         assert result.exit_code == 0, result.output
         assert "No PDFs found" in result.output
 
@@ -416,4 +419,7 @@ class TestRunCommand:
         )
 
         assert result.exit_code != 0
-        assert "workbook could not be written" in result.output
+        # M7: outputs are written as one staged artifact set; a failure names
+        # the set and confirms existing outputs were left unchanged.
+        assert "outputs could not be written" in result.output
+        assert "left unchanged" in result.output

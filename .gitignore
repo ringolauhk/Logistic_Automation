@@ -34,5 +34,10 @@ benchmark/results/
 benchmark_report.xlsx
 benchmark_report.json
 
+# Atomic-write temporaries (M7): staged artifacts are written to
+# <final>.tmp-<pid>-<n> beside their final path and removed after replace or
+# on failure - never commit a stray one if a process was killed mid-write.
+*.tmp-*
+
 # macOS Finder metadata
 .DS_Store

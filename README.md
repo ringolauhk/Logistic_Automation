@@ -8,6 +8,27 @@ provenance.
 > later phase). **Assumes one invoice per PDF** — likely multi-invoice files
 > are detected and flagged for review, not segmented.
 
+## Quick start
+
+```bash
+source .venv/bin/activate
+cp .env.example .env                       # then fill in keys
+python -m invoice_extractor doctor         # offline readiness check (no paid calls)
+python -m invoice_extractor classify --input ./samples
+python -m invoice_extractor run --input ./samples --output ./output/results.xlsx
+```
+
+Outputs (all written atomically, three-sheet workbook contract unchanged):
+`results.xlsx` (`Invoices` / `LineItems` / `NeedsReview`), plus a
+`results.usage.csv` sidecar under the OpenRouter gateway. Existing outputs are
+**not** overwritten without `--overwrite`. Console logging is always on; pass
+`--log-file` for a persistent log (there is no automatic `output/run.log`).
+Press **Ctrl+C** to stop safely (partial output for completed files, exit 130).
+
+**Operators:** see [`docs/OPERATIONS.md`](docs/OPERATIONS.md) (progress logs,
+overwrite, interruption, cost & chunk-size guidance, benchmark scoring) and
+[`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md).
+
 ## Architecture and routing
 
 Every page is classified independently; a mixed PDF uses text extraction for

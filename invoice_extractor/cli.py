@@ -7,6 +7,7 @@
 """
 
 import importlib
+import os
 import sys
 from pathlib import Path
 
@@ -25,7 +26,8 @@ def cli():
     """Batch invoice PDF extraction to Excel."""
 
 
-def print_summary(results: list[InvoiceResult], output_path: Path) -> None:
+def print_summary(results: list[InvoiceResult], output_path: Path,
+                  usage_records=None, interrupted: bool = False) -> None:
     """Operator-facing summary. Counts and a file path only - never secrets,
     provider config, or raw LLM prompts/responses."""
     processed = len(results)
@@ -34,12 +36,15 @@ def print_summary(results: list[InvoiceResult], output_path: Path) -> None:
     line_items = sum(len(r.invoice.line_items) for r in results)
     needs_review = sum(1 for r in results if r.needs_review)
     errors = sum(1 for r in results if r.error)
+    elapsed = sum(r.elapsed_seconds for r in results)
     by_method: dict[str, int] = {}
     for r in results:
         by_method[r.extraction_method] = by_method.get(r.extraction_method, 0) + 1
 
     click.echo("")
     click.echo("=" * 52)
+    if interrupted:
+        click.echo("  ** INTERRUPTED (Ctrl+C) - partial results below **")
     click.echo(f"  Files processed:      {processed}")
     click.echo(f"  Invoices extracted:   {successful}")
     click.echo(f"  Line items extracted: {line_items}")
@@ -47,6 +52,18 @@ def print_summary(results: list[InvoiceResult], output_path: Path) -> None:
     click.echo(f"  Failed/problem:       {errors}")
     for method, count in sorted(by_method.items()):
         click.echo(f"    - {method}: {count}")
+    if usage_records:
+        from decimal import Decimal
+        reqs = len(usage_records)
+        repair = sum(1 for u in usage_records if u.attempt_type == "repair")
+        escalation = sum(1 for u in usage_records if u.attempt_type == "escalation")
+        unknown = sum(1 for u in usage_records if u.cost_usd is None)
+        cost = sum((u.cost_usd or Decimal("0") for u in usage_records), Decimal("0"))
+        click.echo(f"  Provider requests:    {reqs} "
+                   f"(repair={repair} escalation={escalation})")
+        click.echo(f"  Reported cost (USD):  {cost}"
+                   + (f" (incomplete: {unknown} unknown-cost request(s))" if unknown else ""))
+    click.echo(f"  Total elapsed:        {elapsed:.1f}s")
     click.echo(f"  Output written:       {output_path}")
     click.echo("=" * 52)
 
@@ -59,122 +76,195 @@ def print_summary(results: list[InvoiceResult], output_path: Path) -> None:
               type=click.Path(dir_okay=False, path_type=Path), show_default=True,
               help="Excel workbook to write.")
 @click.option("--log-file", default=None, type=click.Path(dir_okay=False, path_type=Path),
-              help="Log file path (default: <output dir>/run.log).")
+              help="Write a persistent run log to this path. Omit for console-only "
+                   "logging (there is no automatic ./output/run.log anymore).")
 @click.option("--run-metadata", "run_metadata_path", default=None,
               type=click.Path(dir_okay=False, path_type=Path),
-              help="OPT-IN: write a small run-metadata JSON (run id, timestamps, and "
-                   "per-file runtime/method/provider/model/needs_review/error - NO invoice "
-                   "content) for the offline benchmark. Omit for byte-identical normal output.")
+              help="OPT-IN: write a small run-metadata JSON (run id, timestamps, status, "
+                   "and per-file runtime/method/provider/model/needs_review/error/completed/"
+                   "request_count/cost - NO invoice content). Omit for none.")
+@click.option("--overwrite", is_flag=True, default=False,
+              help="Replace existing output artifacts. Without it, the run REFUSES (before "
+                   "any provider call) if the workbook, its .usage.csv, or the run-metadata "
+                   "JSON already exists.")
 def run(input_dir: Path, output_path: Path, log_file: Path | None,
-        run_metadata_path: Path | None):
+        run_metadata_path: Path | None, overwrite: bool):
     """Run the full extraction pipeline over a folder of PDFs.
 
     Exit-code policy (invoice-level review is NOT a program failure - see
     README "Review outcomes vs program failure"):
 
-      0  batch completed and the workbook was written - even if some or
-         every invoice is needs_review (e.g. missing API keys, provider
-         failures); also 0 when no PDFs are found (nothing to do)
-      2  --input does not exist (enforced by click.Path(exists=True) before
-         this function ever runs)
-      1  config could not be loaded, the log/output location could not be
-         created, the batch could not complete, or the workbook could not
-         be written (fatal tool-level failures)
+      0    batch completed and outputs were written - even if some or every
+           invoice is needs_review; also 0 when no PDFs are found
+      2    --input does not exist (enforced by click before this runs)
+      130  interrupted by the operator (Ctrl+C): new calls/retries stop, a
+           valid PARTIAL workbook/usage CSV is written if >=1 file completed
+           (none if 0 completed), no traceback
+      1    config/log/output error, output collision without --overwrite, an
+           unwritable output location, the batch could not complete, or an
+           output could not be written (fatal tool-level failures)
     """
+    import json
+    from datetime import datetime, timezone
+
+    from invoice_extractor.atomic import StagedArtifacts
+    from invoice_extractor.pipeline import BatchInterrupted
+
     try:
         cfg = load_config()
     except Exception as exc:
         raise SystemExit(f"FATAL: configuration error: {exc_summary(exc)}")
 
     run_id = new_run_id()
-    log_path = log_file or output_path.parent / "run.log"
     try:
         logger = setup_logging(
-            log_path, run_id=run_id,
+            log_file, run_id=run_id,
             secrets=(cfg.gemini_api_key or "", cfg.anthropic_api_key or "",
                     cfg.openrouter_api_key or ""),
         )
     except Exception as exc:
-        raise SystemExit(f"FATAL: cannot create log/output location: {exc_summary(exc)}")
+        raise SystemExit(f"FATAL: cannot create log location: {exc_summary(exc)}")
 
     logger.info("run %s starting; %s", run_id, describe_models(cfg))
 
     key_status = provider_key_status(cfg)
-    if not key_status["gemini"]:
-        logger.warning("GEMINI_API_KEY not set - Gemini calls will fail")
-    if not key_status["anthropic"]:
-        logger.warning("ANTHROPIC_API_KEY not set - Claude fallback is unavailable")
+    if cfg.llm_gateway == "direct":
+        if not key_status["gemini"]:
+            logger.warning("GEMINI_API_KEY not set - Gemini calls will fail")
+        if not key_status["anthropic"]:
+            logger.warning("ANTHROPIC_API_KEY not set - Claude fallback is unavailable")
 
+    # No-safety-limits warning (OpenRouter only, once per run): a run with no
+    # per-file/run attempt or cost cap can issue an unbounded number of paid
+    # calls on a large/dense document. Non-blocking - just a safe pointer.
+    if cfg.llm_gateway == "openrouter" and (
+        cfg.max_model_attempts_per_file is None
+        and cfg.max_cost_usd_per_file is None
+        and cfg.max_cost_usd_per_run is None
+    ):
+        logger.warning(
+            "no OpenRouter safety limits configured (MAX_MODEL_ATTEMPTS_PER_FILE, "
+            "MAX_COST_USD_PER_FILE, MAX_COST_USD_PER_RUN all unset); paid-call count "
+            "is bounded only by chunks x models x retries - see docs/OPERATIONS.md"
+        )
+
+    # Nothing to do: return BEFORE any output preflight so an empty input dir
+    # never creates or probes the output location (keeps this path hermetic).
     if not find_pdfs(input_dir):
         click.echo(f"No PDFs found in {input_dir} - nothing to do.")
         return
 
-    from datetime import datetime, timezone
+    # --- Output preflight: writability + collision, BEFORE any provider call ---
+    if output_path.exists() and output_path.is_dir():
+        raise SystemExit(f"FATAL: --output {output_path} is a directory, not a file")
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        probe = output_path.parent / f".preflight-{os.getpid()}"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except Exception as exc:
+        raise SystemExit(
+            f"FATAL: output location {output_path.parent} is not writable "
+            f"({exc_summary(exc)})"
+        )
+
+    # Planned artifact set (one set - see StagedArtifacts): workbook always;
+    # usage CSV only under OpenRouter; run metadata only when requested.
+    usage_path = usage_csv_path(output_path) if cfg.llm_gateway == "openrouter" else None
+    planned = [output_path]
+    if usage_path is not None:
+        planned.append(usage_path)
+    if run_metadata_path is not None:
+        planned.append(run_metadata_path)
+    collisions = [p for p in planned if p.exists()]
+    if collisions and not overwrite:
+        listing = ", ".join(str(p) for p in collisions)
+        raise SystemExit(
+            f"FATAL: output already exists ({listing}); no provider calls were made. "
+            "Re-run with --overwrite to replace, or choose a different --output."
+        )
+
     started_at = datetime.now(timezone.utc).isoformat()
+    interrupted = False
     try:
         results = process_directory(input_dir, cfg, logger, run_id=run_id)
+    except BatchInterrupted as bi:
+        results = bi.results
+        interrupted = True
     except Exception as exc:
         logger.error("batch did not complete: %s", exc_summary(exc))
         raise SystemExit(f"FATAL: batch did not complete: {exc_summary(exc)}")
     finished_at = datetime.now(timezone.utc).isoformat()
 
-    try:
-        export_workbook(results, output_path)
-    except Exception as exc:
-        logger.error("workbook could not be written: %s", exc_summary(exc))
-        raise SystemExit(
-            f"FATAL: workbook could not be written to {output_path}: {exc_summary(exc)}"
-        )
+    # Interrupted with zero recorded files: per policy, write no output.
+    if interrupted and not results:
+        click.echo("Interrupted before any file completed - no output written.")
+        raise SystemExit(130)
 
-    # OpenRouter usage sidecar + summary. The direct gateway never produces
-    # usage records and gets no .usage.csv at all - there is nothing to
-    # report. A zero-attempt OpenRouter run still writes the sidecar (header
-    # row only), so its presence/absence tells you which gateway ran.
-    if cfg.llm_gateway == "openrouter":
-        usage_records = [r for res in results for r in res.usage_records]
-        usage_path = usage_csv_path(output_path)
-        try:
-            write_usage_csv(usage_records, usage_path)
-        except Exception as exc:
-            logger.error("usage report could not be written: %s", exc_summary(exc))
-            raise SystemExit(
-                f"FATAL: usage report could not be written to {usage_path}: {exc_summary(exc)}"
-            )
-        logger.info("Wrote %s", usage_path)
-        click.echo(format_usage_summary(usage_records, len(results)))
+    usage_records = [r for res in results for r in res.usage_records]
 
-    # OPT-IN run metadata: only written when --run-metadata is passed. Persists
-    # NO invoice content (no review reasons, values, text, prompts, responses,
-    # or page details) - just run id, timestamps, and safe per-file fields for
-    # the offline benchmark's runtime metrics.
-    if run_metadata_path is not None:
-        import json
+    def _write_metadata(dst: Path):
         meta = {
             "run_id": run_id, "started_at": started_at, "finished_at": finished_at,
-            "files": [
-                {
-                    "source_file": r.source_file,
-                    "elapsed_seconds": round(r.elapsed_seconds, 3),
-                    "extraction_method": r.extraction_method,
-                    "provider": r.provider, "model": r.model,
-                    "needs_review": r.needs_review, "error": r.error,
-                }
-                for r in results
-            ],
+            "interrupted": interrupted, "exit_code": 130 if interrupted else 0,
+            "input_dir": str(input_dir),
+            "output_artifacts": sorted(p.name for p in planned),
+            "files": [_safe_run_metadata_row(r) for r in results],
         }
-        try:
-            run_metadata_path.parent.mkdir(parents=True, exist_ok=True)
-            run_metadata_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
-        except Exception as exc:
-            logger.error("run metadata could not be written: %s", exc_summary(exc))
-            raise SystemExit(
-                f"FATAL: run metadata could not be written to {run_metadata_path}: "
-                f"{exc_summary(exc)}"
-            )
-        logger.info("Wrote %s", run_metadata_path)
+        dst.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
 
-    logger.info("Wrote %s (log: %s)", output_path, log_path)
-    print_summary(results, output_path)
+    # Stage ALL temp artifacts, then replace finals together (atomic per file;
+    # temps are all written before any final is touched - a failure at any
+    # stage leaves every existing final untouched). See atomic.StagedArtifacts.
+    try:
+        with StagedArtifacts() as stage:
+            stage.stage(output_path, lambda p: export_workbook(results, p))
+            if usage_path is not None:
+                stage.stage(usage_path, lambda p: write_usage_csv(usage_records, p))
+            if run_metadata_path is not None:
+                stage.stage(run_metadata_path, _write_metadata)
+            stage.commit()
+    except Exception as exc:
+        logger.error("outputs could not be written: %s", exc_summary(exc))
+        raise SystemExit(
+            f"FATAL: outputs could not be written ({exc_summary(exc)}); "
+            "any existing outputs were left unchanged"
+        )
+
+    if usage_path is not None:
+        logger.info("Wrote %s", usage_path)
+        click.echo(format_usage_summary(usage_records, len(results)))
+    if run_metadata_path is not None:
+        logger.info("Wrote %s", run_metadata_path)
+    logger.info("Wrote %s%s", output_path,
+                f" (log: {log_file})" if log_file else "")
+
+    print_summary(results, output_path, usage_records=usage_records,
+                  interrupted=interrupted)
+    if interrupted:
+        click.echo("Interrupted (Ctrl+C): wrote partial output for completed files.")
+        raise SystemExit(130)
+
+
+def _safe_run_metadata_row(r) -> dict:
+    """One run-metadata file row: SAFE fields only - never review reasons,
+    invoice values, text, prompts, responses, stack traces, or image data."""
+    reqs = sum(1 for _ in r.usage_records)
+    unknown = sum(1 for u in r.usage_records if u.cost_usd is None)
+    from decimal import Decimal
+    cost = sum((u.cost_usd or Decimal("0") for u in r.usage_records), Decimal("0"))
+    completed = not r.error and "interrupted by operator" not in (r.review_reason or "")
+    return {
+        "source_file": r.source_file,
+        "elapsed_seconds": round(r.elapsed_seconds, 3),
+        "extraction_method": r.extraction_method,
+        "provider": r.provider, "model": r.model,
+        "needs_review": r.needs_review, "error": r.error,
+        "completed": completed,
+        "interrupted": "interrupted by operator" in (r.review_reason or ""),
+        "request_count": reqs, "reported_cost": str(cost),
+        "unknown_cost_count": unknown,
+    }
 
 
 # --- benchmark (M6): offline ground-truth scoring; makes NO provider calls ----
@@ -207,9 +297,12 @@ def benchmark():
 @click.option("--output", "output_path", default="./output/benchmark_report.xlsx",
               type=click.Path(dir_okay=False, path_type=Path), show_default=True,
               help="Report workbook path (a sibling .json summary is written too).")
+@click.option("--overwrite", is_flag=True, default=False,
+              help="Replace existing report outputs. Without it, scoring REFUSES if the "
+                   "report workbook or its .json summary already exists.")
 def benchmark_score(manifest_path, workbook_path, usage_path, run_metadata_path,
                     thresholds_path, enable_fuzzy_line_matching, fuzzy_threshold,
-                    output_path):
+                    output_path, overwrite):
     """Score an extraction workbook against benchmark ground truth (offline).
 
     Exit codes:
@@ -222,9 +315,7 @@ def benchmark_score(manifest_path, workbook_path, usage_path, run_metadata_path,
     from invoice_extractor.benchmark.dataset import (
         BenchmarkConfigError, load_manifest, load_thresholds,
     )
-    from invoice_extractor.benchmark.report import (
-        write_json_summary, write_report_workbook,
-    )
+    from invoice_extractor.benchmark.report import write_report
     from invoice_extractor.benchmark.scoring import score_benchmark
 
     try:
@@ -243,15 +334,23 @@ def benchmark_score(manifest_path, workbook_path, usage_path, run_metadata_path,
         click.echo(f"BENCHMARK CONFIG ERROR: {exc}", err=True)
         raise SystemExit(2)
 
+    output_path = Path(output_path)
+    json_path = output_path.with_suffix(".json")
+    collisions = [p for p in (output_path, json_path) if p.exists()]
+    if collisions and not overwrite:
+        listing = ", ".join(str(p) for p in collisions)
+        raise SystemExit(
+            f"FATAL: report output already exists ({listing}); re-run with --overwrite "
+            "to replace, or choose a different --output."
+        )
+
     report = score_benchmark(
         dataset, workbook_path, usage_path=usage_path,
         run_metadata_path=run_metadata_path,
     )
 
-    output_path = Path(output_path)
-    json_path = output_path.with_suffix(".json")
-    write_report_workbook(report, output_path)
-    write_json_summary(report, json_path)
+    # Both artifacts written as one staged set (temps first, then replace).
+    write_report(report, output_path, json_path)
 
     a = report.aggregates
     click.echo(f"Benchmark: {a['num_cases']} case(s), "
@@ -477,6 +576,39 @@ def doctor(input_dir: Path, output_dir: Path, live: bool, provider: str, route: 
     _check(gem or claude, "vision extraction (Gemini + Claude fallback)",
            ("full chain" if (gem and claude) else "PARTIAL: one provider only")
            if (gem or claude) else "blocked: no keys")
+
+    # OpenRouter gateway readiness - offline, no paid calls, keys never printed.
+    click.echo(f"Gateway: {cfg.llm_gateway}")
+    if cfg.llm_gateway == "openrouter":
+        click.echo("OpenRouter (offline checks; --live does not probe OpenRouter):")
+        or_key = bool(cfg.openrouter_api_key)
+        _check(or_key, "OPENROUTER_API_KEY", "set" if or_key else "NOT SET")
+        _check(bool(cfg.openrouter_text_models), "OPENROUTER_TEXT_MODELS",
+               ", ".join(cfg.openrouter_text_models) or "NOT SET")
+        _check(bool(cfg.openrouter_vision_models), "OPENROUTER_VISION_MODELS",
+               ", ".join(cfg.openrouter_vision_models) or "NOT SET (vision pages will fail)")
+        click.echo(f"  structured_output = {cfg.openrouter_structured_output}")
+        click.echo(f"  MAX_TEXT_PAGES={cfg.max_text_pages}  MAX_VISION_PAGES={cfg.max_vision_pages}"
+                   f"  (dense scans: pilot MAX_VISION_PAGES=1-2 to avoid truncation)")
+        click.echo(f"  MAX_RETRIES={cfg.max_retries}  "
+                   f"REQUEST_TIMEOUT_SECONDS={cfg.request_timeout_seconds}")
+        limits = []
+        if cfg.max_model_attempts_per_file is not None:
+            limits.append(f"MAX_MODEL_ATTEMPTS_PER_FILE={cfg.max_model_attempts_per_file}")
+        if cfg.max_cost_usd_per_file is not None:
+            limits.append(f"MAX_COST_USD_PER_FILE={cfg.max_cost_usd_per_file}")
+        if cfg.max_cost_usd_per_run is not None:
+            limits.append(f"MAX_COST_USD_PER_RUN={cfg.max_cost_usd_per_run}")
+        if limits:
+            click.echo("  safety limits: " + ", ".join(limits))
+        else:
+            click.echo("  [WARN] no safety limits configured (MAX_MODEL_ATTEMPTS_PER_FILE / "
+                       "MAX_COST_USD_PER_FILE / MAX_COST_USD_PER_RUN all unset) - see "
+                       "docs/OPERATIONS.md")
+    click.echo("Output policy: existing outputs are NOT overwritten unless --overwrite "
+               "is passed (run and benchmark score).")
+    click.echo(f"Debug artifacts: {'ENABLED' if cfg.save_debug_artifacts else 'disabled'} "
+               "(when enabled, failed responses may contain invoice content)")
 
     if live:
         run_gemini = provider in ("gemini", "all")

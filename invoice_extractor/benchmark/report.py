@@ -253,9 +253,7 @@ def _cost_runtime_rows(report):
     return rows
 
 
-def write_report_workbook(report: BenchmarkReport, path: Path) -> Path:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _build_workbook(report: BenchmarkReport):
     wb = openpyxl.Workbook()
     wb.remove(wb.active)  # drop the default sheet; we create all 8 explicitly
 
@@ -291,7 +289,18 @@ def write_report_workbook(report: BenchmarkReport, path: Path) -> Path:
                   "runtime_seconds", "runtime_basis", "accepted_models", "routes",
                   "model_basis"], _cost_runtime_rows(report))
     _write_sheet(wb, "Errors", ["case_id", "source_file", "category"], report.errors)
-    wb.save(path)
+    return wb
+
+
+def write_report_workbook(report: BenchmarkReport, path: Path) -> Path:
+    """Write the report workbook. Atomic when possible: writes to a temp beside
+    the final path, then os.replace (a partial/failed write never clobbers an
+    existing report)."""
+    from invoice_extractor.atomic import StagedArtifacts
+    path = Path(path)
+    with StagedArtifacts() as stage:
+        stage.stage(path, lambda p: _build_workbook(report).save(str(p)))
+        stage.commit()
     return path
 
 
@@ -339,9 +348,26 @@ def build_json_summary(report: BenchmarkReport) -> dict:
 
 
 def write_json_summary(report: BenchmarkReport, path: Path) -> Path:
+    """Write the deterministic JSON summary atomically (temp + os.replace)."""
+    from invoice_extractor.atomic import StagedArtifacts
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = build_json_summary(report)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n",
-                    encoding="utf-8")
+    body = json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n"
+    with StagedArtifacts() as stage:
+        stage.stage(path, lambda p: p.write_text(body, encoding="utf-8"))
+        stage.commit()
     return path
+
+
+def write_report(report: BenchmarkReport, workbook_path: Path, json_path: Path) -> None:
+    """Write BOTH benchmark artifacts as one staged set: both temps are written
+    before either final is replaced, so a failure leaves both existing finals
+    untouched (see atomic.StagedArtifacts and its documented multi-file
+    limitation)."""
+    from invoice_extractor.atomic import StagedArtifacts
+    payload = build_json_summary(report)
+    body = json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n"
+    with StagedArtifacts() as stage:
+        stage.stage(Path(workbook_path), lambda p: _build_workbook(report).save(str(p)))
+        stage.stage(Path(json_path), lambda p: p.write_text(body, encoding="utf-8"))
+        stage.commit()

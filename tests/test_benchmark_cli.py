@@ -148,10 +148,15 @@ class TestRunMetadataOptIn:
                                           "--output", str(out), "--run-metadata", str(meta)])
         assert result.exit_code == 0, result.output
         payload = json.loads(meta.read_text())
-        assert set(payload) == {"run_id", "started_at", "finished_at", "files"}
+        # M7 extended the sidecar with operational status (still no invoice content).
+        assert set(payload) == {"run_id", "started_at", "finished_at", "interrupted",
+                                "exit_code", "input_dir", "output_artifacts", "files"}
+        assert payload["interrupted"] is False
         entry = payload["files"][0]
         assert set(entry) == {"source_file", "elapsed_seconds", "extraction_method",
-                              "provider", "model", "needs_review", "error"}
+                              "provider", "model", "needs_review", "error", "completed",
+                              "interrupted", "request_count", "reported_cost",
+                              "unknown_cost_count"}
         # No invoice content / review reasons / prompts / responses persisted.
         blob = meta.read_text()
         for forbidden in ("review_reason", "INV-1001", "Ocean freight", "prompt", "Acme"):

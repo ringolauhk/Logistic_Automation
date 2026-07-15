@@ -465,7 +465,7 @@ def _attempt_model(
     cfg: Config, model: str, *, messages: list, repair_prompt: str, route: str,
     ladder_index: int, run_id: str, source_file: str, page_range: str, label: str,
     run_budget: RunBudget | None = None, file_budget: FileBudget | None = None,
-    require_hard_fields: bool = True,
+    require_hard_fields: bool = True, progress: str = "", model_count: int = 1,
 ) -> _AttemptOutcome:
     """Try exactly one model: primary request, local cleanup, at most one
     repair, then schema + (usually) hard-required validation. Never raises -
@@ -536,6 +536,8 @@ def _attempt_model(
     # outer gate, so it checks explicitly.
 
     # --- primary request ---
+    _log_progress(source_file, progress, route, page_range, attempt_type,
+                  ladder_index, model_count, model, cfg.request_timeout_seconds)
     try:
         result = _run_attempt(cfg, model, messages, response_format, mode,
                               attempt_type, 0, label, route)
@@ -571,6 +573,8 @@ def _attempt_model(
             )
         logger.warning("%s: OpenRouter response from %s was not valid JSON (%s); "
                        "attempting one repair retry", label, model, parse_exc)
+        _log_progress(source_file, progress, route, page_range, ATTEMPT_REPAIR,
+                      ladder_index, model_count, model, cfg.request_timeout_seconds)
         try:
             repair = _run_attempt(
                 cfg, model, _repair_messages(repair_prompt, result.text),
@@ -621,11 +625,25 @@ def is_truncated_message(exc: ExtractionError) -> bool:
     return "truncated" in str(exc)
 
 
+def _log_progress(source_file, progress, route, page_range, attempt_type,
+                  ladder_index, model_count, model, timeout):
+    """Safe pre-call progress line (M7). Metadata only - never prompt, invoice
+    text, image bytes, base64, key, or response. Emitted immediately BEFORE
+    each application-issued OpenRouter request so a slow call is visibly in
+    flight rather than looking frozen."""
+    scope = progress or f"{route} route"
+    logger.info(
+        "%s: %s pages %s - starting %s model %d/%d requested=%s timeout=%ds",
+        source_file, scope, page_range, attempt_type,
+        ladder_index + 1, model_count, model, timeout,
+    )
+
+
 def _run_ladder(
     cfg: Config, models: tuple, *, messages: list, repair_prompt: str, route: str,
     run_id: str, source_file: str, page_range: str, label: str,
     run_budget: RunBudget | None, file_budget: FileBudget | None,
-    require_hard_fields: bool,
+    require_hard_fields: bool, progress: str = "",
 ) -> tuple[Invoice, ProviderResult, list]:
     """Shared ladder driver for BOTH routes (M4): try each model in `models`
     in order; the first accepted extraction stops the ladder. Escalates on
@@ -678,6 +696,7 @@ def _run_ladder(
             page_range=page_range, label=f"{label}_m{ladder_index}",
             run_budget=run_budget, file_budget=file_budget,
             require_hard_fields=require_hard_fields,
+            progress=progress, model_count=len(models),
         )
         usage_records.extend(outcome.usage_records)
 
@@ -697,14 +716,15 @@ def extract_from_text_ladder(
     cfg: Config, invoice_text: str, *, run_id: str, source_file: str,
     page_range: str, label: str = "openrouter_text",
     run_budget: RunBudget | None = None, file_budget: FileBudget | None = None,
-    is_chunked: bool = False,
+    is_chunked: bool = False, progress: str = "",
 ) -> tuple[Invoice, ProviderResult, list]:
     """OPENROUTER_TEXT_MODELS ladder over one text chunk (or a whole
     text-native document when it fits in a single request). Thin wrapper:
     builds the text prompt/messages (with the partial-document chunk context
     when is_chunked) and delegates to the shared _run_ladder - see its
     docstring for escalation/budget semantics. is_chunked also relaxes the
-    per-chunk hard-required check (see _attempt_model)."""
+    per-chunk hard-required check (see _attempt_model). `progress` is a safe
+    chunk descriptor (e.g. "text chunk 2/3") for the pre-call progress log."""
     chunk_context = text_chunk_context(page_range) if is_chunked else None
     prompt = text_extraction_prompt(invoice_text, chunk_context=chunk_context)
     return _run_ladder(
@@ -712,7 +732,7 @@ def extract_from_text_ladder(
         repair_prompt=prompt, route=ROUTE_TEXT, run_id=run_id,
         source_file=source_file, page_range=page_range, label=label,
         run_budget=run_budget, file_budget=file_budget,
-        require_hard_fields=not is_chunked,
+        require_hard_fields=not is_chunked, progress=progress,
     )
 
 
@@ -720,7 +740,7 @@ def extract_from_vision_ladder(
     cfg: Config, images: list[bytes], *, run_id: str, source_file: str,
     page_range: str, label: str = "openrouter_vision",
     run_budget: RunBudget | None = None, file_budget: FileBudget | None = None,
-    is_chunked: bool = False,
+    is_chunked: bool = False, progress: str = "",
 ) -> tuple[Invoice, ProviderResult, list]:
     """OPENROUTER_VISION_MODELS ladder over one vision chunk's rendered PNG
     page images (M4). Builds ONE multimodal message (base64 PNG data-URL
@@ -744,5 +764,5 @@ def extract_from_vision_ladder(
         repair_prompt=prompt, route=ROUTE_VISION, run_id=run_id,
         source_file=source_file, page_range=page_range, label=label,
         run_budget=run_budget, file_budget=file_budget,
-        require_hard_fields=not is_chunked,
+        require_hard_fields=not is_chunked, progress=progress,
     )

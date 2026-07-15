@@ -51,6 +51,21 @@ from invoice_extractor.schema import ExtractionError, Invoice, empty_invoice, va
 from invoice_extractor.usage import FileBudget, RunBudget, UsageRecord
 
 
+class BatchInterrupted(Exception):
+    """Raised by process_directory when the operator presses Ctrl+C (M7).
+
+    Carries the results accumulated so far (completed files, plus one
+    controlled interrupted review row for the in-flight file when its source
+    identity is known) so the CLI can write a valid PARTIAL workbook/usage CSV
+    and exit 130 without a traceback. Never wraps a provider failure - it is
+    raised only for a genuine KeyboardInterrupt.
+    """
+
+    def __init__(self, results: "list[InvoiceResult]"):
+        super().__init__("run interrupted by operator")
+        self.results = results
+
+
 @dataclass
 class InvoiceResult:
     source_file: str
@@ -174,7 +189,7 @@ def _run_openrouter_text_chunk(
     inv, provider_result, usage_records = openrouter_client.extract_from_text_ladder(
         cfg, combined, run_id=run_id, source_file=name, page_range=page_range,
         label=label, run_budget=run_budget, file_budget=file_budget,
-        is_chunked=is_chunked,
+        is_chunked=is_chunked, progress=f"text chunk {index}/{total}",
     )
     model = provider_result.actual_model or provider_result.requested_model
     logger.info(
@@ -219,7 +234,7 @@ def _run_openrouter_vision_chunk(
     inv, provider_result, usage_records = openrouter_client.extract_from_vision_ladder(
         cfg, images, run_id=run_id, source_file=name, page_range=page_range,
         label=label, run_budget=run_budget, file_budget=file_budget,
-        is_chunked=is_chunked,
+        is_chunked=is_chunked, progress=f"vision chunk {index}/{total}",
     )
     model = provider_result.actual_model or provider_result.requested_model
     logger.info(
@@ -510,11 +525,16 @@ def process_file(
         # No structured result at all: emit a reviewable null row, never crash.
         result.needs_review = True
         result.error = True
+        # "all configured models" is accurate under the OpenRouter gateway
+        # (only the configured model ladder was attempted); the direct gateway
+        # genuinely tries multiple providers, so it keeps "all providers".
+        failed_on = ("all configured models" if cfg.llm_gateway == "openrouter"
+                     else "all providers")
         if result.document_classification == DOC_ERROR:
             result.review_reason = "no meaningful pages (document is blank)"
         else:
             result.review_reason = "; ".join(
-                f"{label} failed on all providers: {exc_summary(exc)}"
+                f"{label} failed on {failed_on}: {exc_summary(exc)}"
                 for label, exc in route_failures
             )
         result.elapsed_seconds = time.perf_counter() - started
@@ -580,15 +600,29 @@ def process_file(
         result.review_reason = "; ".join(reasons)
 
     result.elapsed_seconds = time.perf_counter() - started
+    reqs = _attempt_counts(result.usage_records)
     logger.info(
         "%s: done in %.1fs class=%s method=%s provider=%s model=%s "
-        "vision_chunks=%d text_chunks=%d needs_review=%s (%s)",
+        "vision_chunks=%d text_chunks=%d requests=%d repair=%d escalation=%d "
+        "needs_review=%s (%s)",
         path.name, result.elapsed_seconds, result.document_classification,
         result.extraction_method, result.provider, result.model,
         result.vision_chunk_count, result.text_chunk_count,
+        reqs["total"], reqs["repair"], reqs["escalation"],
         result.needs_review, _reason_categories(result),
     )
     return result
+
+
+def _attempt_counts(usage_records) -> dict:
+    """Safe provider-request counts for the completion log / run summary -
+    metadata only, never invoice content."""
+    return {
+        "total": len(usage_records),
+        "primary": sum(1 for r in usage_records if r.attempt_type == "primary"),
+        "repair": sum(1 for r in usage_records if r.attempt_type == "repair"),
+        "escalation": sum(1 for r in usage_records if r.attempt_type == "escalation"),
+    }
 
 
 def find_pdfs(input_dir: Path) -> list[Path]:
@@ -619,26 +653,49 @@ def process_directory(
     # past the crossing point) if it tripped during processing. Irrelevant
     # (never exceeded, since nothing ever adds to it) for the direct gateway.
     run_budget = RunBudget(cfg.max_cost_usd_per_run)
-    for path in pdfs:
-        if cfg.llm_gateway == "openrouter" and run_budget.exceeded():
-            logger.warning(
-                "%s: run-wide OpenRouter cost budget ($%s) already reached; "
-                "skipping without any provider call",
-                path.name, cfg.max_cost_usd_per_run,
-            )
+    in_flight: Path | None = None
+    try:
+        for path in pdfs:
+            in_flight = path
+            if cfg.llm_gateway == "openrouter" and run_budget.exceeded():
+                logger.warning(
+                    "%s: run-wide OpenRouter cost budget ($%s) already reached; "
+                    "skipping without any provider call",
+                    path.name, cfg.max_cost_usd_per_run,
+                )
+                results.append(InvoiceResult(
+                    source_file=path.name, needs_review=True, error=True,
+                    review_reason=(
+                        f"run-wide OpenRouter cost budget (${cfg.max_cost_usd_per_run}) "
+                        "reached before this file could be processed"
+                    ),
+                ))
+                in_flight = None
+                continue
+            try:
+                result = process_file(path, cfg, logger, run_id=run_id, run_budget=run_budget)
+            except Exception as exc:  # belt and braces: one file must never stop the batch
+                # NOTE: `except Exception` deliberately does NOT catch
+                # KeyboardInterrupt (a BaseException), so Ctrl+C propagates to
+                # the handler below rather than becoming a per-file error row.
+                logger.error("%s: unexpected pipeline error (%s)", path.name, exc_summary(exc))
+                result = InvoiceResult(source_file=path.name, needs_review=True, error=True,
+                                       review_reason=f"unexpected pipeline error: {exc_summary(exc)}")
+            results.append(result)
+            in_flight = None
+    except KeyboardInterrupt:
+        # Stop immediately: no new provider calls, no retries. The in-flight
+        # file (identity known) gets one controlled review row so it is not
+        # silently lost; completed files are preserved as-is. The CLI writes a
+        # partial workbook/usage CSV and exits 130 (see BatchInterrupted).
+        if in_flight is not None:
             results.append(InvoiceResult(
-                source_file=path.name, needs_review=True, error=True,
-                review_reason=(
-                    f"run-wide OpenRouter cost budget (${cfg.max_cost_usd_per_run}) "
-                    "reached before this file could be processed"
-                ),
+                source_file=in_flight.name, needs_review=True, error=True,
+                review_reason="run interrupted by operator (Ctrl+C) before this file completed",
             ))
-            continue
-        try:
-            result = process_file(path, cfg, logger, run_id=run_id, run_budget=run_budget)
-        except Exception as exc:  # belt and braces: one file must never stop the batch
-            logger.error("%s: unexpected pipeline error (%s)", path.name, exc_summary(exc))
-            result = InvoiceResult(source_file=path.name, needs_review=True, error=True,
-                                   review_reason=f"unexpected pipeline error: {exc_summary(exc)}")
-        results.append(result)
+        logger.warning(
+            "run interrupted by operator (Ctrl+C); %d file(s) recorded, no further "
+            "provider calls will be made", len(results),
+        )
+        raise BatchInterrupted(results)
     return results

@@ -102,15 +102,21 @@ class _ContextFilter(logging.Filter):
 
 
 def setup_logging(
-    log_path: str | Path,
+    log_path: str | Path | None = None,
     run_id: str | None = None,
     secrets: tuple[str, ...] = (),
     verbose: bool = True,
 ) -> logging.Logger:
-    """Log to the run log file (full detail) and the console."""
+    """Configure the console logger and, ONLY when log_path is given, a
+    persistent file log (M7).
+
+    The console handler is always attached. A persistent file handler is added
+    only when the caller supplies an explicit log_path - there is no automatic
+    project-global log file anymore, so unrelated runs never accumulate in one
+    ambiguous file and offline tests never touch a repo path. Passing None (the
+    default) is console-only.
+    """
     run_id = run_id or new_run_id()
-    log_path = Path(log_path)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
 
     logger = logging.getLogger("invoice_extractor")
     logger.setLevel(logging.DEBUG)
@@ -120,13 +126,16 @@ def setup_logging(
 
     context = _ContextFilter(run_id, secrets)
 
-    file_handler = logging.FileHandler(log_path, encoding="utf-8")
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)-7s [%(run_id)s] %(message)s")
-    )
-    file_handler.addFilter(context)
-    logger.addHandler(file_handler)
+    if log_path is not None:
+        log_path = Path(log_path)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)-7s [%(run_id)s] %(message)s")
+        )
+        file_handler.addFilter(context)
+        logger.addHandler(file_handler)
 
     console = logging.StreamHandler()
     console.setLevel(logging.INFO if verbose else logging.WARNING)
