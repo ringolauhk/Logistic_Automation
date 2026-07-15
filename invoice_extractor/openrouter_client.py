@@ -1,16 +1,23 @@
-"""OpenRouter gateway boundary and text-route model ladder.
+"""OpenRouter gateway boundary and the text/vision model ladders.
 
 Direct httpx against the OpenRouter chat-completions API. `extract_from_text`
 (M2) is a single-model extraction, kept as-is for its existing tests;
-`extract_from_text_ladder` (M3) tries an ordered list of models, escalating
-on any unusable result and stopping at the first accepted extraction. Makes
-no live calls in the test suite (the network-blocking autouse fixture
-guards; tests mock `_chat_completion`).
+`extract_from_text_ladder` (M3) and `extract_from_vision_ladder` (M4) try an
+ordered list of models (OPENROUTER_TEXT_MODELS / OPENROUTER_VISION_MODELS
+respectively) via the shared `_run_ladder`, escalating on any unusable result
+and stopping at the first accepted extraction. Vision requests are one
+multimodal message (base64 PNG data-URL blocks + prompt); vision REPAIR
+requests are text-only - images are never resent. Makes no live calls in the
+test suite (the network-blocking autouse fixture guards; tests mock
+`_chat_completion`).
 
 Privacy: the API key lives only in the HTTP client's headers, never on a
 returned object and never in a log line or exception. Provider error bodies
 are untrusted and are never surfaced - only the HTTP status code and a fixed
-category are retained (see ProviderError).
+category are retained (see ProviderError). Image bytes/base64 exist only in
+the in-memory request messages: never logged, never stored on results or
+exceptions, never written by save_debug_artifact (which persists response
+TEXT only, and only when SAVE_DEBUG_ARTIFACTS is explicitly enabled).
 """
 
 import base64
@@ -24,6 +31,7 @@ from invoice_extractor.artifacts import save_debug_artifact
 from invoice_extractor.config import Config
 from invoice_extractor.prompts import (
     JSON_SCHEMA_BLOCK,
+    openrouter_vision_prompt,
     parse_json_response,
     text_chunk_context,
     text_extraction_prompt,
@@ -36,6 +44,7 @@ from invoice_extractor.provider import (
     MODE_JSON_SCHEMA,
     MODE_PROMPT_ONLY,
     ROUTE_TEXT,
+    ROUTE_VISION,
     ProviderError,
     ProviderResult,
     coerce_cost,
@@ -313,7 +322,7 @@ def _is_transient(exc: BaseException) -> bool:
 
 def _run_attempt(
     cfg: Config, model: str, messages: list, response_format, structured_mode: str,
-    attempt_type: str, attempt_index: int, label: str,
+    attempt_type: str, attempt_index: int, label: str, route: str = ROUTE_TEXT,
 ) -> ProviderResult:
     """One OpenRouter request (with bounded transport retry), normalized and
     checked for truncation/empty content BEFORE any JSON parsing.
@@ -338,7 +347,7 @@ def _run_attempt(
     )
     latency_ms = (time.perf_counter() - started) * 1000.0
     result = parse_completion(
-        raw, requested_model=model, route=ROUTE_TEXT,
+        raw, requested_model=model, route=route,
         attempt_index=attempt_index, attempt_type=attempt_type,
         structured_mode=structured_mode, latency_ms=latency_ms,
     )
@@ -453,15 +462,19 @@ class _AttemptOutcome:
 
 
 def _attempt_model(
-    cfg: Config, invoice_text: str, model: str, *, ladder_index: int,
-    run_id: str, source_file: str, page_range: str, label: str,
+    cfg: Config, model: str, *, messages: list, repair_prompt: str, route: str,
+    ladder_index: int, run_id: str, source_file: str, page_range: str, label: str,
     run_budget: RunBudget | None = None, file_budget: FileBudget | None = None,
-    is_chunked: bool = False,
+    require_hard_fields: bool = True,
 ) -> _AttemptOutcome:
     """Try exactly one model: primary request, local cleanup, at most one
     repair, then schema + (usually) hard-required validation. Never raises -
     failures are reported via the returned _AttemptOutcome so the ladder can
-    escalate.
+    escalate. Route-agnostic (M4): the caller supplies the prebuilt primary
+    `messages` (text-only or multimodal) and the textual `repair_prompt`; the
+    repair request is ALWAYS text-only (built by _repair_messages from
+    repair_prompt + the malformed response), so a vision chunk's repair never
+    resends its images.
 
     run_budget/file_budget, when given, are the shared run-wide/file-wide
     cost trackers: their live totals are updated immediately after every
@@ -470,26 +483,21 @@ def _attempt_model(
     sites inside this function - so a crossing stops further calls at the
     earliest possible point, even mid-file/mid-chunk.
 
-    is_chunked=True (M3.1) means this call is ONE chunk of a multi-chunk
-    text-native document: the prompt gets an extra "partial document"
-    paragraph (see prompts.text_chunk_context), and _finalize's hard-required
-    check is skipped for THIS chunk (a line-item-only chunk legitimately
-    lacks headers) - the full hard-required contract is still enforced once,
-    on the aggregated invoice, by pipeline.process_file's Stage 6. Defaults
-    to False (today's exact single-chunk behavior) everywhere except the new
-    multi-chunk orchestration in pipeline.py.
+    require_hard_fields=False means this call is ONE chunk of a document
+    whose OpenRouter extraction spans multiple requests: _finalize's
+    hard-required check is skipped for THIS chunk (a line-item-only chunk
+    legitimately lacks headers) - the full hard-required contract is still
+    enforced once, on the aggregated invoice, by pipeline.process_file's
+    Stage 6.
     """
     usage_records = []
     mode = cfg.openrouter_structured_output
     response_format = build_response_format(mode)
-    chunk_context = text_chunk_context(page_range) if is_chunked else None
-    prompt = text_extraction_prompt(invoice_text, chunk_context=chunk_context)
-    messages = build_text_messages(prompt)
     attempt_type = ATTEMPT_PRIMARY if ladder_index == 0 else ATTEMPT_ESCALATION
 
     def failed_record(attempt_type_, category, http_status=None):
         usage_records.append(usage_record_for_failed_attempt(
-            run_id=run_id, source_file=source_file, route=ROUTE_TEXT,
+            run_id=run_id, source_file=source_file, route=route,
             page_range=page_range, attempt_type=attempt_type_,
             ladder_index=ladder_index, requested_model=model,
             structured_mode=mode, rejection_category=category, http_status=http_status,
@@ -530,7 +538,7 @@ def _attempt_model(
     # --- primary request ---
     try:
         result = _run_attempt(cfg, model, messages, response_format, mode,
-                              attempt_type, 0, label)
+                              attempt_type, 0, label, route)
     except ProviderError as exc:
         failed_record(attempt_type, exc.category, exc.http_status)
         return _AttemptOutcome(None, None, usage_records, f"{model}: {exc_summary(exc)}")
@@ -565,8 +573,8 @@ def _attempt_model(
                        "attempting one repair retry", label, model, parse_exc)
         try:
             repair = _run_attempt(
-                cfg, model, _repair_messages(prompt, result.text), response_format,
-                mode, ATTEMPT_REPAIR, 1, label,
+                cfg, model, _repair_messages(repair_prompt, result.text),
+                response_format, mode, ATTEMPT_REPAIR, 1, label, route,
             )
         except ProviderError as exc:
             failed_record(ATTEMPT_REPAIR, exc.category, exc.http_status)
@@ -598,7 +606,7 @@ def _attempt_model(
     # --- schema + (usually) hard-required validation ---
     try:
         inv = _finalize(cfg, data, result.text, label, model,
-                        require_hard_fields=not is_chunked)
+                        require_hard_fields=require_hard_fields)
     except ExtractionError as exc:
         outcome_record(result, accepted=False, category="missing_required_fields")
         return _AttemptOutcome(None, None, usage_records, f"{model}: {exc_summary(exc)}")
@@ -613,39 +621,37 @@ def is_truncated_message(exc: ExtractionError) -> bool:
     return "truncated" in str(exc)
 
 
-def extract_from_text_ladder(
-    cfg: Config, invoice_text: str, *, run_id: str, source_file: str,
-    page_range: str, label: str = "openrouter_text",
-    run_budget: RunBudget | None = None, file_budget: FileBudget | None = None,
-    is_chunked: bool = False,
+def _run_ladder(
+    cfg: Config, models: tuple, *, messages: list, repair_prompt: str, route: str,
+    run_id: str, source_file: str, page_range: str, label: str,
+    run_budget: RunBudget | None, file_budget: FileBudget | None,
+    require_hard_fields: bool,
 ) -> tuple[Invoice, ProviderResult, list]:
-    """Try each configured OPENROUTER_TEXT_MODELS entry in order (1-4 models);
-    the first accepted extraction stops the ladder. Escalates on any unusable
-    result (transport/HTTP failure, embedded error envelope, empty content,
-    truncation, malformed JSON after one repair, or missing hard-required
-    fields, unless is_chunked - see _attempt_model) - never on soft validation
-    outcomes, since validate_invoice() is only called later in pipeline.py,
-    after a model has already been accepted.
+    """Shared ladder driver for BOTH routes (M4): try each model in `models`
+    in order; the first accepted extraction stops the ladder. Escalates on
+    any unusable result (transport/HTTP failure, embedded error envelope,
+    empty content, truncation, malformed JSON after one repair, or - when
+    require_hard_fields - missing hard-required fields) - never on soft
+    validation outcomes, since validate_invoice() is only called later in
+    pipeline.py, after a model has already been accepted.
 
     run_budget, when given, is the shared run-wide cost tracker (see
     usage.RunBudget). file_budget, when given, is the shared per-file cost/
     attempt tracker (see usage.FileBudget) spanning every chunk of the SAME
-    file - when omitted, a fresh one is created here scoped to just this one
-    call, so a caller that doesn't chunk (or calls this directly) gets
-    identical behavior to before M3.1: one call == one file == one budget.
-    Both are checked before every model attempt (covering both the first/
-    "primary" model and later "escalation" models uniformly, since this loop
-    drives both) and, one level deeper, inside _attempt_model before its
-    repair call. Any checkpoint tripping stops this ladder immediately
-    (budget_exhausted=True) rather than trying the next model, since a
-    crossing blocks every model equally.
+    file across BOTH routes - when omitted, a fresh one is created here
+    scoped to just this one call, so a caller that doesn't chunk gets one
+    call == one file == one budget. Both are checked before every model
+    attempt (covering both the first/"primary" model and later "escalation"
+    models uniformly, since this loop drives both) and, one level deeper,
+    inside _attempt_model before its repair call. Any checkpoint tripping
+    stops this ladder immediately (budget_exhausted=True) rather than trying
+    the next model, since a crossing blocks every model equally.
 
     Returns (Invoice, accepted ProviderResult, usage_records for every
     attempt across the whole ladder). Raises LadderExhaustedError (carrying
     all usage_records collected so far) if every model fails or a per-file
     budget/attempt cap (or the run-wide budget) stops escalation first.
     """
-    models = cfg.openrouter_text_models
     usage_records: list = []
     failures: list[str] = []
     file_budget = file_budget or FileBudget(
@@ -667,10 +673,11 @@ def extract_from_text_ladder(
         file_budget.record_attempt()
 
         outcome = _attempt_model(
-            cfg, invoice_text, model, ladder_index=ladder_index, run_id=run_id,
-            source_file=source_file, page_range=page_range,
-            label=f"{label}_m{ladder_index}", run_budget=run_budget,
-            file_budget=file_budget, is_chunked=is_chunked,
+            cfg, model, messages=messages, repair_prompt=repair_prompt, route=route,
+            ladder_index=ladder_index, run_id=run_id, source_file=source_file,
+            page_range=page_range, label=f"{label}_m{ladder_index}",
+            run_budget=run_budget, file_budget=file_budget,
+            require_hard_fields=require_hard_fields,
         )
         usage_records.extend(outcome.usage_records)
 
@@ -681,6 +688,61 @@ def extract_from_text_ladder(
             break
 
     raise LadderExhaustedError(
-        "; ".join(failures) if failures else "no OpenRouter text models configured",
+        "; ".join(failures) if failures else f"no OpenRouter {route} models configured",
         usage_records,
+    )
+
+
+def extract_from_text_ladder(
+    cfg: Config, invoice_text: str, *, run_id: str, source_file: str,
+    page_range: str, label: str = "openrouter_text",
+    run_budget: RunBudget | None = None, file_budget: FileBudget | None = None,
+    is_chunked: bool = False,
+) -> tuple[Invoice, ProviderResult, list]:
+    """OPENROUTER_TEXT_MODELS ladder over one text chunk (or a whole
+    text-native document when it fits in a single request). Thin wrapper:
+    builds the text prompt/messages (with the partial-document chunk context
+    when is_chunked) and delegates to the shared _run_ladder - see its
+    docstring for escalation/budget semantics. is_chunked also relaxes the
+    per-chunk hard-required check (see _attempt_model)."""
+    chunk_context = text_chunk_context(page_range) if is_chunked else None
+    prompt = text_extraction_prompt(invoice_text, chunk_context=chunk_context)
+    return _run_ladder(
+        cfg, cfg.openrouter_text_models, messages=build_text_messages(prompt),
+        repair_prompt=prompt, route=ROUTE_TEXT, run_id=run_id,
+        source_file=source_file, page_range=page_range, label=label,
+        run_budget=run_budget, file_budget=file_budget,
+        require_hard_fields=not is_chunked,
+    )
+
+
+def extract_from_vision_ladder(
+    cfg: Config, images: list[bytes], *, run_id: str, source_file: str,
+    page_range: str, label: str = "openrouter_vision",
+    run_budget: RunBudget | None = None, file_budget: FileBudget | None = None,
+    is_chunked: bool = False,
+) -> tuple[Invoice, ProviderResult, list]:
+    """OPENROUTER_VISION_MODELS ladder over one vision chunk's rendered PNG
+    page images (M4). Builds ONE multimodal message (base64 PNG data-URL
+    blocks in page order + the vision prompt, which always states the page
+    range and adds the partial-document context when is_chunked) and
+    delegates to the shared _run_ladder - identical escalation, repair,
+    budget, and usage semantics to the text route, with route="vision" on
+    every usage record.
+
+    Repair requests are TEXT-ONLY (the images are never resent): the
+    malformed JSON is already the model's reading of the images, so repair
+    is purely a formatting fix - cheaper, and it keeps image bytes out of
+    every retry path. Image bytes/base64 live only in the in-memory request
+    messages: never logged, never stored on exceptions/dataclasses, never
+    written to debug artifacts (save_debug_artifact receives response TEXT
+    only, and only when SAVE_DEBUG_ARTIFACTS is explicitly enabled).
+    """
+    prompt = openrouter_vision_prompt(len(images), page_range, is_chunked=is_chunked)
+    return _run_ladder(
+        cfg, cfg.openrouter_vision_models, messages=build_vision_messages(prompt, images),
+        repair_prompt=prompt, route=ROUTE_VISION, run_id=run_id,
+        source_file=source_file, page_range=page_range, label=label,
+        run_budget=run_budget, file_budget=file_budget,
+        require_hard_fields=not is_chunked,
     )

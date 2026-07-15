@@ -688,15 +688,17 @@ class TestDirectGatewayUnaffected:
         assert result.provider == "gemini"
 
 
-# --- W: OpenRouter vision remains unsupported ---------------------------------
+# --- W: OpenRouter vision requires OPENROUTER_VISION_MODELS (M4) --------------
 
-class TestVisionStillUnsupported:
-    def test_w_openrouter_vision_rejected_cleanly(self, logger, pdf_factory, monkeypatch):
-        cfg = ladder_cfg(1)
+class TestVisionNeedsOwnModelList:
+    def test_w_openrouter_vision_without_models_rejected_cleanly(
+        self, logger, pdf_factory, monkeypatch
+    ):
+        cfg = ladder_cfg(1)  # text models only - no vision list configured
         pdf = Path(pdf_factory([("image",)], name="scan.pdf"))
         result = process_file(pdf, cfg, logger)
         assert result.error is True
-        assert "vision" in result.review_reason.lower()
+        assert "OPENROUTER_VISION_MODELS" in result.review_reason
 
 
 # --- X: three-sheet workbook contract unchanged -------------------------------

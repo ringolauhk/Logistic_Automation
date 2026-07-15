@@ -51,10 +51,15 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def _csv_models(raw: str | None) -> tuple[str, ...]:
-    """Parse a comma-separated model list, dropping blanks/whitespace."""
-    if not raw:
+    """Parse a comma-separated model list. Entries are whitespace-trimmed but
+    EMPTY entries are preserved as "" (not silently dropped) so that
+    _validate_model_ids can reject stray-comma typos like "model-a,,model-b"
+    with a clear error at live-call time (M4) - a silently dropped entry
+    could mask a mistyped ladder. An unset/blank variable still parses to ()
+    ("not configured"), which is a different, valid state."""
+    if raw is None or not raw.strip():
         return ()
-    return tuple(item.strip() for item in raw.split(",") if item.strip())
+    return tuple(item.strip() for item in raw.split(","))
 
 
 def _optional_int(raw: str | None) -> int | None:
@@ -224,6 +229,12 @@ def _validate_model_ids(models: tuple[str, ...], var_name: str) -> None:
             "(comma-separated) to use the openrouter gateway."
         )
     for model in models:
+        if not model:
+            raise ConfigurationError(
+                f"{var_name} contains an empty entry (a stray leading, "
+                "double, or trailing comma); remove it - empty entries are "
+                "rejected rather than silently dropped."
+            )
         if not _MODEL_ID_RE.match(model):
             raise ConfigurationError(
                 f"{var_name} contains a malformed model id: {model!r} "
@@ -231,9 +242,12 @@ def _validate_model_ids(models: tuple[str, ...], var_name: str) -> None:
             )
 
 
-def validate_openrouter_config(cfg: "Config", *, require_vision: bool = True) -> None:
+def validate_openrouter_config(
+    cfg: "Config", *, require_vision: bool = True, require_text: bool = True,
+) -> None:
     """Raise ConfigurationError if the OpenRouter gateway is not usable for a
-    LIVE run (missing key, empty list, or malformed model id).
+    LIVE run (missing key, empty list, empty list entry, or malformed model
+    id).
 
     Called only immediately before making real OpenRouter calls - NEVER on
     offline paths (import/--help/classify/render/offline doctor), so those
@@ -241,10 +255,13 @@ def validate_openrouter_config(cfg: "Config", *, require_vision: bool = True) ->
 
     require_vision=False is used by the text-only path (M2): a vision model
     list is not required when only text extraction runs through OpenRouter.
+    require_text=False is the symmetric case (M4): an image-only PDF's vision
+    route must not demand a text model list it will never use.
     """
     if not cfg.openrouter_api_key:
         raise ConfigurationError("OPENROUTER_API_KEY is not set")
-    _validate_model_ids(cfg.openrouter_text_models, "OPENROUTER_TEXT_MODELS")
+    if require_text:
+        _validate_model_ids(cfg.openrouter_text_models, "OPENROUTER_TEXT_MODELS")
     if require_vision:
         _validate_model_ids(cfg.openrouter_vision_models, "OPENROUTER_VISION_MODELS")
 

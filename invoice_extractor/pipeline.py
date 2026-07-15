@@ -2,8 +2,10 @@
 
 Vision pages are processed in ordered chunks of MAX_VISION_PAGES pages per
 request - every meaningful page is processed, none are silently dropped.
-Each chunk gets the full Gemini-first / Claude-fallback treatment; a chunk
-failing both providers is recorded (failed_pages + review reason with the
+Under the direct gateway each chunk gets the full Gemini-first /
+Claude-fallback treatment; under LLM_GATEWAY=openrouter each chunk runs the
+ordered OPENROUTER_VISION_MODELS ladder instead (M4). A chunk failing all
+its providers/models is recorded (failed_pages + review reason with the
 page range) while later chunks still run.
 
 Text pages under LLM_GATEWAY=openrouter are chunked the same way, in ordered
@@ -12,6 +14,11 @@ large text-native invoice's single JSON response doesn't hit the output-
 token cap and get rejected as truncated on every configured model). The
 direct Gemini/Claude text route is UNCHANGED - it still sends all text pages
 combined in one request; only the OpenRouter ladder chunks.
+
+Mixed PDFs under openrouter use both routes for one file - text chunks and
+vision chunks each contribute RouteResults, aggregation happens once, and
+ONE shared FileBudget (attempt cap + file cost) spans the whole PDF across
+both routes.
 
 Assumes one invoice per PDF (documented PoC limitation). Likely multi-invoice
 PDFs are detected via conflicting invoice numbers and flagged for review
@@ -130,7 +137,7 @@ def _run_text_route(cfg: Config, logger: logging.Logger, name: str,
 def _run_openrouter_text_chunk(
     cfg: Config, logger: logging.Logger, name: str,
     chunk: list[PageInfo], index: int, total: int, run_id: str,
-    run_budget: RunBudget | None, file_budget: FileBudget,
+    run_budget: RunBudget | None, file_budget: FileBudget, is_chunked: bool,
 ) -> RouteResult:
     """One OpenRouter text chunk (LLM_GATEWAY=openrouter, M3.1): runs the
     full model ladder independently for just this chunk's pages, escalating
@@ -145,11 +152,14 @@ def _run_openrouter_text_chunk(
     (aggregate() over multiple RouteResults) that already work for vision
     chunks apply to text chunks with no changes to either mechanism.
 
-    is_chunked=True is passed to the ladder whenever there is more than one
-    chunk for this file - see extract_from_text_ladder/_attempt_model for
-    what that relaxes (chunk-level hard-required validation) and what it
-    does not relax (the final aggregated invoice's hard-required check,
-    still enforced unchanged in process_file's Stage 6).
+    is_chunked=True means this file's OpenRouter extraction spans more than
+    one request overall - across BOTH routes (M4): a mixed PDF's single text
+    chunk is still a partial view of the document, since its image pages go
+    out as separate vision requests. See extract_from_text_ladder/
+    _attempt_model for what the flag relaxes (chunk-level hard-required
+    validation + partial-document prompt context) and what it does not relax
+    (the final aggregated invoice's hard-required check, still enforced
+    unchanged in process_file's Stage 6).
 
     validate_openrouter_config runs here (immediately before the live call),
     not at config-load time, so import/--help/classify/render/offline doctor
@@ -164,7 +174,7 @@ def _run_openrouter_text_chunk(
     inv, provider_result, usage_records = openrouter_client.extract_from_text_ladder(
         cfg, combined, run_id=run_id, source_file=name, page_range=page_range,
         label=label, run_budget=run_budget, file_budget=file_budget,
-        is_chunked=total > 1,
+        is_chunked=is_chunked,
     )
     model = provider_result.actual_model or provider_result.requested_model
     logger.info(
@@ -177,9 +187,57 @@ def _run_openrouter_text_chunk(
     return RouteResult("text", pages, inv, "openrouter", model, provider_result, usage_records)
 
 
+def _run_openrouter_vision_chunk(
+    cfg: Config, logger: logging.Logger, name: str, path: Path,
+    chunk: list[PageInfo], index: int, total: int, run_id: str,
+    run_budget: RunBudget | None, file_budget: FileBudget, is_chunked: bool,
+) -> RouteResult:
+    """One OpenRouter vision chunk (LLM_GATEWAY=openrouter, M4): renders just
+    this chunk's pages to PNG and runs the full VISION model ladder
+    (OPENROUTER_VISION_MODELS) over one multimodal request, escalating on any
+    unusable result and stopping at the first accepted extraction. Usage
+    records (route=vision) for every attempt are carried on the returned
+    RouteResult.
+
+    ORDERING (deliberate, tested): vision-model configuration is validated
+    once by the caller BEFORE its chunk loop starts, and both budgets are
+    checked by the caller BEFORE each call to this function - so a missing
+    model list or an already-exhausted budget causes ZERO rendering work and
+    zero HTTP calls. Rendering happens here only after those gates pass,
+    immediately before the provider call that needs the images.
+
+    Image bytes/base64 exist only inside the in-memory request messages -
+    never logged, never stored on results/exceptions, never written to debug
+    artifacts. Repair requests are text-only (images are not resent) - see
+    extract_from_vision_ladder.
+    """
+    pages = [p.number for p in chunk]
+    page_range = format_page_ranges(pages)
+    label = f"{name}_openrouter_vision_c{index}"
+    started = time.perf_counter()
+    images = pdf_utils.render_pages_png(str(path), pages, dpi=cfg.render_dpi)
+    inv, provider_result, usage_records = openrouter_client.extract_from_vision_ladder(
+        cfg, images, run_id=run_id, source_file=name, page_range=page_range,
+        label=label, run_budget=run_budget, file_budget=file_budget,
+        is_chunked=is_chunked,
+    )
+    model = provider_result.actual_model or provider_result.requested_model
+    logger.info(
+        "%s: vision chunk %d/%d (pages %s) ok provider=openrouter requested=%s actual=%s "
+        "mode=%s finish=%s gen=%s %.1fs",
+        name, index, total, page_range, provider_result.requested_model, model,
+        provider_result.structured_mode, provider_result.finish_reason,
+        provider_result.generation_id, time.perf_counter() - started,
+    )
+    return RouteResult("vision", pages, inv, "openrouter", model, provider_result, usage_records)
+
+
 def _run_vision_chunk(cfg: Config, logger: logging.Logger, name: str, path: Path,
                       chunk: list[PageInfo], index: int, total: int) -> RouteResult:
-    """One vision request for one chunk: Gemini first, Claude on any failure.
+    """One DIRECT-gateway vision request for one chunk: Gemini first, Claude
+    on any failure. LLM_GATEWAY=openrouter never reaches this function -
+    process_file routes its image pages to _run_openrouter_vision_chunk
+    instead (M4).
 
     Per-chunk attempt counts are logged by the clients (same label prefix);
     normal logs never carry invoice text or response bodies.
@@ -187,14 +245,6 @@ def _run_vision_chunk(cfg: Config, logger: logging.Logger, name: str, path: Path
     pages = [p.number for p in chunk]
     page_range = format_page_ranges(pages)
     started = time.perf_counter()
-    if cfg.llm_gateway == "openrouter":
-        # OpenRouter vision is not implemented yet (a later milestone) -
-        # fail clearly before rendering/spending anything, rather than
-        # silently falling back to direct and mixing billing gateways.
-        raise ConfigurationError(
-            "OpenRouter vision route is not implemented yet (text-only so far); "
-            "set LLM_GATEWAY=direct to process image pages"
-        )
     images = pdf_utils.render_pages_png(str(path), pages, dpi=cfg.render_dpi)
     try:
         inv = gemini_client.extract_from_images(
@@ -275,47 +325,66 @@ def process_file(
     routes: list[RouteResult] = []
     route_failures: list[tuple[str, Exception]] = []
 
+    # ONE FileBudget per PDF, shared across BOTH routes (M4): the per-file
+    # model-attempt cap and cost budget cover every text AND vision chunk of
+    # this file combined - they never reset between routes or chunks. The
+    # planned chunk split is also computed upfront so is_chunked (which
+    # relaxes only chunk-LEVEL hard-required validation and adds the
+    # partial-document prompt context) reflects the whole file: any file
+    # whose OpenRouter extraction spans >1 request - across routes - treats
+    # each request as a partial view. None/empty under the direct gateway.
+    file_budget: FileBudget | None = None
+    or_text_chunks: list[list[PageInfo]] = []
+    or_vision_chunks: list[list[PageInfo]] = []
+    if cfg.llm_gateway == "openrouter":
+        file_budget = FileBudget(
+            cfg.max_model_attempts_per_file, RunBudget(cfg.max_cost_usd_per_file)
+        )
+        or_text_chunks = _chunked(text_pages, cfg.max_text_pages) if text_pages else []
+        or_vision_chunks = _chunked(image_pages, cfg.max_vision_pages) if image_pages else []
+    or_is_chunked = (len(or_text_chunks) + len(or_vision_chunks)) > 1
+
+    def _budget_stop_reason() -> str | None:
+        # Checked BEFORE attempting each chunk (not just relying on the
+        # ladder's own internal per-model check): once either budget is
+        # exhausted, every remaining chunk is skipped with ONE compact
+        # reason and zero further provider calls (and, for vision, zero
+        # rendering work) - never one repeated failure per remaining chunk.
+        if run_budget is not None and run_budget.exceeded():
+            return f"run-wide OpenRouter cost budget (${run_budget.limit}) reached"
+        if file_budget is not None and file_budget.exceeded():
+            return file_budget.reason()
+        return None
+
+    def _skip_remaining_chunks(chunks, index, budget_reason, route_word):
+        remaining = [p.number for c in chunks[index - 1:] for p in c]
+        page_range = format_page_ranges(remaining)
+        route_failures.append((
+            f"{route_word} chunks pages {page_range}",
+            ExtractionError(f"{budget_reason} before these chunks could be attempted"),
+        ))
+        result.failed_pages.extend(remaining)
+        logger.warning(
+            "%s: %s; skipping remaining %s chunk(s) pages %s with no "
+            "further provider calls", path.name, budget_reason, route_word, page_range,
+        )
+
     if text_pages:
         if cfg.llm_gateway == "openrouter":
-            chunks = _chunked(text_pages, cfg.max_text_pages)
+            chunks = or_text_chunks
             result.text_chunk_count = len(chunks)
             if len(chunks) > 1:
                 logger.info("%s: %d text page(s) split into %d chunk(s) of <= %d",
                             path.name, len(text_pages), len(chunks), cfg.max_text_pages)
-            file_budget = FileBudget(
-                cfg.max_model_attempts_per_file, RunBudget(cfg.max_cost_usd_per_file)
-            )
             for index, chunk in enumerate(chunks, start=1):
-                # Checked BEFORE attempting each chunk (not just relying on
-                # extract_from_text_ladder's own internal per-model check):
-                # once either budget is exhausted, every remaining chunk is
-                # skipped with ONE compact reason and zero further provider
-                # calls, instead of one repeated "skipped" failure per
-                # remaining chunk (each of which would otherwise still reach
-                # the ladder and immediately bounce with no calls made).
-                budget_reason = None
-                if run_budget is not None and run_budget.exceeded():
-                    budget_reason = f"run-wide OpenRouter cost budget (${run_budget.limit}) reached"
-                elif file_budget.exceeded():
-                    budget_reason = file_budget.reason()
+                budget_reason = _budget_stop_reason()
                 if budget_reason is not None:
-                    remaining = [p.number for c in chunks[index - 1:] for p in c]
-                    page_range = format_page_ranges(remaining)
-                    label = f"text chunks pages {page_range}"
-                    route_failures.append((
-                        label,
-                        ExtractionError(f"{budget_reason} before these chunks could be attempted"),
-                    ))
-                    result.failed_pages.extend(remaining)
-                    logger.warning(
-                        "%s: %s; skipping remaining text chunk(s) pages %s with no "
-                        "further provider calls", path.name, budget_reason, page_range,
-                    )
+                    _skip_remaining_chunks(chunks, index, budget_reason, "text")
                     break
                 try:
                     routes.append(_run_openrouter_text_chunk(
                         cfg, logger, path.name, chunk, index, len(chunks), run_id,
-                        run_budget, file_budget,
+                        run_budget, file_budget, or_is_chunked,
                     ))
                 except Exception as exc:
                     nums = [p.number for p in chunk]
@@ -335,7 +404,52 @@ def process_file(
                 route_failures.append((label, exc))
                 result.failed_pages.extend(result.text_pages)
 
-    if image_pages:
+    if image_pages and cfg.llm_gateway == "openrouter":
+        chunks = or_vision_chunks
+        result.vision_chunk_count = len(chunks)
+        if len(chunks) > 1:
+            logger.info("%s: %d image page(s) split into %d vision chunk(s) of <= %d",
+                        path.name, len(image_pages), len(chunks), cfg.max_vision_pages)
+        # Vision-model configuration is validated ONCE, before any chunk and
+        # before any rendering: a missing/malformed OPENROUTER_VISION_MODELS
+        # yields ONE compact review reason covering all image pages, zero
+        # rendering work, zero HTTP calls - and never a silent fallback to
+        # the direct Gemini/Claude vision route (provider boundaries stay
+        # explicit under LLM_GATEWAY=openrouter).
+        try:
+            validate_openrouter_config(cfg, require_vision=True, require_text=False)
+        except ConfigurationError as exc:
+            nums = [p.number for p in image_pages]
+            page_range = format_page_ranges(nums)
+            route_failures.append((f"vision chunks pages {page_range}", exc))
+            result.failed_pages.extend(nums)
+            logger.warning(
+                "%s: OpenRouter vision configuration invalid (%s); skipping "
+                "vision pages %s with no rendering and no provider calls",
+                path.name, exc_summary(exc), page_range,
+            )
+        else:
+            for index, chunk in enumerate(chunks, start=1):
+                budget_reason = _budget_stop_reason()
+                if budget_reason is not None:
+                    _skip_remaining_chunks(chunks, index, budget_reason, "vision")
+                    break
+                try:
+                    routes.append(_run_openrouter_vision_chunk(
+                        cfg, logger, path.name, path, chunk, index, len(chunks),
+                        run_id, run_budget, file_budget, or_is_chunked,
+                    ))
+                except Exception as exc:
+                    nums = [p.number for p in chunk]
+                    page_range = format_page_ranges(nums)
+                    label = f"vision chunk {index}/{len(chunks)} (pages {page_range})"
+                    route_failures.append((label, exc))
+                    result.failed_pages.extend(nums)
+                    logger.warning("%s: vision chunk %d/%d (pages %s) FAILED on all "
+                                   "configured models (%s); continuing with remaining "
+                                   "chunks", path.name, index, len(chunks), page_range,
+                                   exc_summary(exc))
+    elif image_pages:
         chunks = _chunked(image_pages, cfg.max_vision_pages)
         result.vision_chunk_count = len(chunks)
         if len(chunks) > 1:

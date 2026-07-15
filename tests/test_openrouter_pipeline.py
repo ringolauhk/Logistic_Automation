@@ -436,12 +436,16 @@ class TestBatchContinuationAndWorkbookContract:
         assert wb.sheetnames == ["Invoices", "LineItems", "NeedsReview"]
 
 
-# --- R: vision under openrouter is explicit and rejected ----------------------
+# --- R: vision under openrouter requires OPENROUTER_VISION_MODELS (M4) --------
 
-class TestOpenRouterVisionRejected:
-    def test_r_vision_page_under_openrouter_fails_clearly_before_rendering(
+class TestOpenRouterVisionNeedsModels:
+    def test_r_no_vision_models_fails_clearly_before_rendering(
         self, logger, scan_pdf, monkeypatch
     ):
+        # openrouter_cfg() configures TEXT models only - a required vision
+        # route with no OPENROUTER_VISION_MODELS must fail safely BEFORE any
+        # rendering or HTTP work, with a clean review row and never a silent
+        # fallback to direct Gemini/Claude.
         cfg = openrouter_cfg()
         rendered = []
         from invoice_extractor import pdf_utils
@@ -459,13 +463,12 @@ class TestOpenRouterVisionRejected:
         result = process_file(scan_pdf, cfg, logger)
 
         assert rendered == []  # never rendered - fails before spending anything
-        assert or_calls == []  # OpenRouter never called for vision in M2
+        assert or_calls == []  # OpenRouter never called without a vision ladder
         assert result.error is True
         assert result.needs_review is True
-        assert "not implemented" in result.review_reason
-        assert "LLM_GATEWAY=direct" in result.review_reason
+        assert "OPENROUTER_VISION_MODELS" in result.review_reason
 
-    def test_r_vision_rejection_is_a_configuration_error_not_a_crash(
+    def test_r_missing_vision_models_is_a_configuration_error_not_a_crash(
         self, logger, scan_pdf
     ):
         cfg = openrouter_cfg()

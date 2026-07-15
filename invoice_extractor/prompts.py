@@ -92,6 +92,40 @@ def vision_extraction_prompt(page_count: int) -> str:
     )
 
 
+def vision_chunk_context(page_range: str) -> str:
+    """Vision twin of text_chunk_context: extra guidance appended ONLY when
+    the attached images are one bounded chunk of a document whose OpenRouter
+    extraction spans multiple requests (M4) - never for a whole-document
+    single-request call, so chunk-level hard-required relaxation and this
+    prompt addition always travel together (see openrouter_client)."""
+    return (
+        f"\n\nIMPORTANT - PARTIAL DOCUMENT: the attached image(s) are only pages "
+        f"{page_range} of a LARGER invoice PDF - other pages exist before and/or "
+        "after this chunk and are sent as separate requests. Extract ONLY what is "
+        "visible in these specific page images. Do not invent header fields "
+        "(invoice number, dates, seller/buyer, totals) that are not shown here - "
+        "leave them null if these pages do not contain them; a later or earlier "
+        "chunk may supply them instead. List only the line items printed on these "
+        "specific pages - do not repeat line items that would belong to a "
+        "different chunk."
+    )
+
+
+def openrouter_vision_prompt(page_count: int, page_range: str, *, is_chunked: bool) -> str:
+    """The OpenRouter vision route's prompt (M4): the shared direct-gateway
+    vision prompt (unchanged, so direct Gemini/Claude prompts stay
+    byte-identical), plus an explicit page-range note, plus the partial-
+    document chunk context when this chunk is one of several requests.
+    Never includes the source filename (privacy: file names stay out of
+    provider prompts; only log labels carry them)."""
+    prompt = vision_extraction_prompt(page_count) + (
+        f"\n\nThe attached image(s) show page(s) {page_range} of the source document."
+    )
+    if is_chunked:
+        prompt += vision_chunk_context(page_range)
+    return prompt
+
+
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 
 

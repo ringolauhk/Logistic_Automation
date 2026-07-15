@@ -550,12 +550,15 @@ class TestBatchContinuation:
         assert len(results) == 2
 
 
-# --- X: vision remains unsupported under openrouter in M3 --------------------
+# --- X: vision under openrouter requires its own model list (M4) -------------
 
-class TestVisionStillUnsupported:
-    def test_x_vision_under_openrouter_still_explicitly_rejected(
+class TestVisionNeedsOwnModelList:
+    def test_x_vision_without_vision_models_rejected_cleanly_no_calls(
         self, logger, pdf_factory, monkeypatch
     ):
+        # ladder_cfg configures TEXT models only; a vision route without
+        # OPENROUTER_VISION_MODELS fails safely with zero HTTP calls and
+        # never falls back to the text ladder or the direct gateway.
         cfg = ladder_cfg(2)
         scan_pdf = Path(pdf_factory([("image",)], name="scan.pdf"))
         or_calls = []
@@ -566,7 +569,7 @@ class TestVisionStillUnsupported:
 
         assert or_calls == []
         assert result.error is True
-        assert "not implemented" in result.review_reason
+        assert "OPENROUTER_VISION_MODELS" in result.review_reason
 
 
 # --- Y: empty/malformed model list fails clearly ------------------------------
