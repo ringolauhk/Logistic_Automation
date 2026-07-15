@@ -161,11 +161,11 @@ def _run_openrouter_text_chunk(
     (the final aggregated invoice's hard-required check, still enforced
     unchanged in process_file's Stage 6).
 
-    validate_openrouter_config runs here (immediately before the live call),
-    not at config-load time, so import/--help/classify/render/offline doctor
-    stay key-free even when LLM_GATEWAY=openrouter is configured.
+    Text-model configuration is validated by the CALLER, once per file
+    before its chunk loop starts (M5, same pattern as the vision route) -
+    still at live-call time only, so import/--help/classify/render/offline
+    doctor stay key-free even when LLM_GATEWAY=openrouter is configured.
     """
-    validate_openrouter_config(cfg, require_vision=False)
     pages = [p.number for p in chunk]
     combined = "\n\n".join(f"--- PAGE {p.number} ---\n{p.text}" for p in chunk)
     page_range = format_page_ranges(pages)
@@ -376,26 +376,49 @@ def process_file(
             if len(chunks) > 1:
                 logger.info("%s: %d text page(s) split into %d chunk(s) of <= %d",
                             path.name, len(text_pages), len(chunks), cfg.max_text_pages)
-            for index, chunk in enumerate(chunks, start=1):
-                budget_reason = _budget_stop_reason()
-                if budget_reason is not None:
-                    _skip_remaining_chunks(chunks, index, budget_reason, "text")
-                    break
-                try:
-                    routes.append(_run_openrouter_text_chunk(
-                        cfg, logger, path.name, chunk, index, len(chunks), run_id,
-                        run_budget, file_budget, or_is_chunked,
-                    ))
-                except Exception as exc:
-                    nums = [p.number for p in chunk]
-                    page_range = format_page_ranges(nums)
-                    label = f"text chunk {index}/{len(chunks)} (pages {page_range})"
-                    route_failures.append((label, exc))
-                    result.failed_pages.extend(nums)
-                    logger.warning("%s: text chunk %d/%d (pages %s) FAILED on all "
-                                   "configured models (%s); continuing with remaining "
-                                   "chunks", path.name, index, len(chunks), page_range,
-                                   exc_summary(exc))
+            # Text-model configuration is validated ONCE, before any chunk
+            # (M5, mirroring the vision route below): a missing key or
+            # missing/malformed OPENROUTER_TEXT_MODELS yields ONE compact
+            # review reason covering all text pages and zero HTTP calls -
+            # then execution CONTINUES to the vision route, which may still
+            # succeed on its own models. Never a silent fallback to the
+            # direct Gemini/Claude text route.
+            try:
+                validate_openrouter_config(cfg, require_vision=False)
+            except ConfigurationError as exc:
+                nums = [p.number for p in text_pages]
+                page_range = format_page_ranges(nums)
+                route_failures.append((f"text chunks pages {page_range}", exc))
+                result.failed_pages.extend(nums)
+                logger.warning(
+                    "%s: OpenRouter text configuration invalid (%s); skipping "
+                    "text pages %s with no provider calls",
+                    path.name, exc_summary(exc), page_range,
+                )
+            else:
+                for index, chunk in enumerate(chunks, start=1):
+                    budget_reason = _budget_stop_reason()
+                    if budget_reason is not None:
+                        _skip_remaining_chunks(chunks, index, budget_reason, "text")
+                        break
+                    try:
+                        route = _run_openrouter_text_chunk(
+                            cfg, logger, path.name, chunk, index, len(chunks), run_id,
+                            run_budget, file_budget, or_is_chunked,
+                        )
+                        routes.append(route)
+                        result.usage_records.extend(route.usage_records)
+                    except Exception as exc:
+                        nums = [p.number for p in chunk]
+                        page_range = format_page_ranges(nums)
+                        label = f"text chunk {index}/{len(chunks)} (pages {page_range})"
+                        route_failures.append((label, exc))
+                        result.failed_pages.extend(nums)
+                        result.usage_records.extend(getattr(exc, "usage_records", None) or [])
+                        logger.warning("%s: text chunk %d/%d (pages %s) FAILED on all "
+                                       "configured models (%s); continuing with remaining "
+                                       "chunks", path.name, index, len(chunks), page_range,
+                                       exc_summary(exc))
         else:
             try:
                 routes.append(_run_text_route(cfg, logger, path.name, text_pages, run_id))
@@ -435,16 +458,19 @@ def process_file(
                     _skip_remaining_chunks(chunks, index, budget_reason, "vision")
                     break
                 try:
-                    routes.append(_run_openrouter_vision_chunk(
+                    route = _run_openrouter_vision_chunk(
                         cfg, logger, path.name, path, chunk, index, len(chunks),
                         run_id, run_budget, file_budget, or_is_chunked,
-                    ))
+                    )
+                    routes.append(route)
+                    result.usage_records.extend(route.usage_records)
                 except Exception as exc:
                     nums = [p.number for p in chunk]
                     page_range = format_page_ranges(nums)
                     label = f"vision chunk {index}/{len(chunks)} (pages {page_range})"
                     route_failures.append((label, exc))
                     result.failed_pages.extend(nums)
+                    result.usage_records.extend(getattr(exc, "usage_records", None) or [])
                     logger.warning("%s: vision chunk %d/%d (pages %s) FAILED on all "
                                    "configured models (%s); continuing with remaining "
                                    "chunks", path.name, index, len(chunks), page_range,
@@ -470,16 +496,15 @@ def process_file(
                                path.name, index, len(chunks), page_range,
                                exc_summary(exc))
 
-    # OpenRouter usage records survive regardless of outcome: successful
-    # routes carry every attempt made (accepted + rejected) on RouteResult;
-    # a fully-exhausted ladder attaches its own accumulated records to the
-    # raised exception (see usage.LadderExhaustedError) - recovered here via
-    # getattr so direct-gateway exceptions (which never have this attribute)
-    # are unaffected.
-    for route in routes:
-        result.usage_records.extend(route.usage_records)
-    for _, exc in route_failures:
-        result.usage_records.extend(getattr(exc, "usage_records", None) or [])
+    # OpenRouter usage records are collected INLINE at each chunk's success
+    # (from RouteResult.usage_records) or failure (from the exception's
+    # usage_records - LadderExhaustedError carries them; direct-gateway
+    # exceptions never have the attribute), in the loops above (M5). That
+    # keeps result.usage_records - and therefore the usage CSV - in true
+    # execution order: text chunks then vision chunks, each chunk's attempts
+    # (primary, repair, escalation, repair) contiguous, whether the chunk
+    # ultimately succeeded or not. Config-invalid and budget-skipped chunks
+    # made no HTTP call and contribute NO rows - usage is never fabricated.
 
     if not routes:
         # No structured result at all: emit a reviewable null row, never crash.
