@@ -411,7 +411,9 @@ class TestRunCommand:
         def broken_export(results, output_path):
             raise OSError("disk full (synthetic)")
 
-        monkeypatch.setattr(cli_module, "export_workbook", broken_export)
+        # M9: workbook export runs inside the shared service, not the CLI.
+        from invoice_extractor import service as service_module
+        monkeypatch.setattr(service_module, "export_workbook", broken_export)
         output = tmp_path / "out" / "results.xlsx"
 
         result = CliRunner().invoke(

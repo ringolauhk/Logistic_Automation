@@ -32,6 +32,9 @@ dependencies = [
 [project.optional-dependencies]
 # Development/test extras - never installed into the production image.
 dev = ["pytest>=8.0"]
+# Pilot web UI (M9) - only the `web` Docker stage / UI operators need this;
+# the CLI stays installable without it. Exact lock: requirements-web.txt.
+web = ["streamlit==1.59.2"]
 
 [project.scripts]
 invoice-extractor = "invoice_extractor.cli:cli"

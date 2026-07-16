@@ -106,12 +106,6 @@ def run(input_dir: Path, output_path: Path, log_file: Path | None,
            unwritable output location, the batch could not complete, or an
            output could not be written (fatal tool-level failures)
     """
-    import json
-    from datetime import datetime, timezone
-
-    from invoice_extractor.atomic import StagedArtifacts
-    from invoice_extractor.pipeline import BatchInterrupted
-
     try:
         cfg = load_config()
     except Exception as exc:
@@ -186,53 +180,30 @@ def run(input_dir: Path, output_path: Path, log_file: Path | None,
             "Re-run with --overwrite to replace, or choose a different --output."
         )
 
-    started_at = datetime.now(timezone.utc).isoformat()
-    interrupted = False
+    # Core batch + atomic artifact set: the SHARED application service (M9),
+    # also used by the web UI worker - one orchestration, two front-ends.
+    from invoice_extractor.service import OutputWriteError, run_extraction
     try:
-        results = process_directory(input_dir, cfg, logger, run_id=run_id)
-    except BatchInterrupted as bi:
-        results = bi.results
-        interrupted = True
+        outcome = run_extraction(
+            input_dir, output_path, cfg, logger, run_id=run_id,
+            run_metadata_path=run_metadata_path,
+        )
+    except OutputWriteError as exc:
+        raise SystemExit(
+            f"FATAL: outputs could not be written ({exc}); "
+            "any existing outputs were left unchanged"
+        )
     except Exception as exc:
         logger.error("batch did not complete: %s", exc_summary(exc))
         raise SystemExit(f"FATAL: batch did not complete: {exc_summary(exc)}")
-    finished_at = datetime.now(timezone.utc).isoformat()
 
-    # Interrupted with zero recorded files: per policy, write no output.
-    if interrupted and not results:
+    # Interrupted with zero recorded files: per policy, no output was written.
+    if outcome.interrupted and not outcome.wrote_output:
         click.echo("Interrupted before any file completed - no output written.")
         raise SystemExit(130)
 
-    usage_records = [r for res in results for r in res.usage_records]
-
-    def _write_metadata(dst: Path):
-        meta = {
-            "run_id": run_id, "started_at": started_at, "finished_at": finished_at,
-            "interrupted": interrupted, "exit_code": 130 if interrupted else 0,
-            "input_dir": str(input_dir),
-            "output_artifacts": sorted(p.name for p in planned),
-            "files": [_safe_run_metadata_row(r) for r in results],
-        }
-        dst.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
-
-    # Stage ALL temp artifacts, then replace finals together (atomic per file;
-    # temps are all written before any final is touched - a failure at any
-    # stage leaves every existing final untouched). See atomic.StagedArtifacts.
-    try:
-        with StagedArtifacts() as stage:
-            stage.stage(output_path, lambda p: export_workbook(results, p))
-            if usage_path is not None:
-                stage.stage(usage_path, lambda p: write_usage_csv(usage_records, p))
-            if run_metadata_path is not None:
-                stage.stage(run_metadata_path, _write_metadata)
-            stage.commit()
-    except Exception as exc:
-        logger.error("outputs could not be written: %s", exc_summary(exc))
-        raise SystemExit(
-            f"FATAL: outputs could not be written ({exc_summary(exc)}); "
-            "any existing outputs were left unchanged"
-        )
-
+    results = outcome.results
+    usage_records = outcome.usage_records
     if usage_path is not None:
         logger.info("Wrote %s", usage_path)
         click.echo(format_usage_summary(usage_records, len(results)))
@@ -242,31 +213,10 @@ def run(input_dir: Path, output_path: Path, log_file: Path | None,
                 f" (log: {log_file})" if log_file else "")
 
     print_summary(results, output_path, usage_records=usage_records,
-                  interrupted=interrupted)
-    if interrupted:
+                  interrupted=outcome.interrupted)
+    if outcome.interrupted:
         click.echo("Interrupted (Ctrl+C): wrote partial output for completed files.")
         raise SystemExit(130)
-
-
-def _safe_run_metadata_row(r) -> dict:
-    """One run-metadata file row: SAFE fields only - never review reasons,
-    invoice values, text, prompts, responses, stack traces, or image data."""
-    reqs = sum(1 for _ in r.usage_records)
-    unknown = sum(1 for u in r.usage_records if u.cost_usd is None)
-    from decimal import Decimal
-    cost = sum((u.cost_usd or Decimal("0") for u in r.usage_records), Decimal("0"))
-    completed = not r.error and "interrupted by operator" not in (r.review_reason or "")
-    return {
-        "source_file": r.source_file,
-        "elapsed_seconds": round(r.elapsed_seconds, 3),
-        "extraction_method": r.extraction_method,
-        "provider": r.provider, "model": r.model,
-        "needs_review": r.needs_review, "error": r.error,
-        "completed": completed,
-        "interrupted": "interrupted by operator" in (r.review_reason or ""),
-        "request_count": reqs, "reported_cost": str(cost),
-        "unknown_cost_count": unknown,
-    }
 
 
 # --- benchmark (M6): offline ground-truth scoring; makes NO provider calls ----

@@ -84,7 +84,7 @@ _REPAIR_INSTRUCTION = (
 
 def _ensure_parsed_json(
     cfg: Config, model: str, raw_text: str, label: str,
-    image_parts: list | None = None,
+    image_parts: list | None = None, notifier=None,
 ) -> tuple[dict, str]:
     """Parse a Gemini response, tolerating markdown fences / surrounding
     prose via parse_json_response's own local cleanup. If that still fails,
@@ -110,6 +110,8 @@ def _ensure_parsed_json(
                        "attempting one repair retry", label, model, exc)
         repair_text = f"Your previous response was:\n\n{raw_text}\n\n{_REPAIR_INSTRUCTION}"
         repair_contents: list = [repair_text, *(image_parts or [])]
+        if notifier is not None:
+            notifier.started("repair")
         try:
             repaired, attempts = call_with_retry(
                 lambda: _generate(cfg, model, repair_contents),
@@ -118,10 +120,14 @@ def _ensure_parsed_json(
             logger.debug("%s_repair: model=%s attempts=%d", label, model, attempts)
             data = parse_json_response(repaired)
         except Exception as repair_exc:
+            if notifier is not None:
+                notifier.completed("repair", accepted=False)
             logger.warning("%s: JSON repair retry did not produce valid JSON; "
                            "continuing with existing failure/fallback behavior", label)
             save_debug_artifact(cfg, label, model=model, reason=str(exc), raw_text=raw_text)
             raise exc from repair_exc
+        if notifier is not None:
+            notifier.completed("repair", accepted=True)
         logger.info("%s: JSON repair retry recovered valid JSON", label)
         return data, repaired
 
@@ -140,29 +146,57 @@ def _finalize(cfg: Config, data: dict, raw_text: str, label: str, model: str) ->
     return inv
 
 
-def extract_from_text(cfg: Config, invoice_text: str, label: str = "gemini_text") -> Invoice:
-    """Normalize already-extracted invoice text via a TEXT-ONLY Gemini call."""
-    raw, attempts = call_with_retry(
-        lambda: _generate(cfg, cfg.gemini_text_model, [text_extraction_prompt(invoice_text)]),
-        is_transient, cfg.max_retries, label,
-    )
+def extract_from_text(cfg: Config, invoice_text: str, label: str = "gemini_text",
+                      notifier=None) -> Invoice:
+    """Normalize already-extracted invoice text via a TEXT-ONLY Gemini call.
+
+    `notifier` (optional, M9): an events.RequestNotifier that reports
+    provider-request start/completion for UI progress. None (the default,
+    used by the CLI) changes nothing.
+    """
+    if notifier is not None:
+        notifier.started("primary")
+    try:
+        raw, attempts = call_with_retry(
+            lambda: _generate(cfg, cfg.gemini_text_model, [text_extraction_prompt(invoice_text)]),
+            is_transient, cfg.max_retries, label,
+        )
+    except Exception:
+        if notifier is not None:
+            notifier.completed("primary", accepted=False)
+        raise
+    if notifier is not None:
+        notifier.completed("primary", accepted=True)
     logger.debug("%s: model=%s attempts=%d", label, cfg.gemini_text_model, attempts)
-    data, raw_used = _ensure_parsed_json(cfg, cfg.gemini_text_model, raw, label)
+    data, raw_used = _ensure_parsed_json(cfg, cfg.gemini_text_model, raw, label,
+                                         notifier=notifier)
     return _finalize(cfg, data, raw_used, label, cfg.gemini_text_model)
 
 
-def extract_from_images(cfg: Config, images: list[bytes], label: str = "gemini_vision") -> Invoice:
-    """Extract from rendered page PNGs via Gemini vision."""
+def extract_from_images(cfg: Config, images: list[bytes], label: str = "gemini_vision",
+                        notifier=None) -> Invoice:
+    """Extract from rendered page PNGs via Gemini vision. `notifier` as in
+    extract_from_text (optional M9 progress hook; None changes nothing)."""
     image_parts = [
         genai_types.Part.from_bytes(data=png, mime_type="image/png") for png in images
     ]
     contents: list = [vision_extraction_prompt(len(images)), *image_parts]
-    raw, attempts = call_with_retry(
-        lambda: _generate(cfg, cfg.gemini_vision_model, contents),
-        is_transient, cfg.max_retries, label,
-    )
+    if notifier is not None:
+        notifier.started("primary")
+    try:
+        raw, attempts = call_with_retry(
+            lambda: _generate(cfg, cfg.gemini_vision_model, contents),
+            is_transient, cfg.max_retries, label,
+        )
+    except Exception:
+        if notifier is not None:
+            notifier.completed("primary", accepted=False)
+        raise
+    if notifier is not None:
+        notifier.completed("primary", accepted=True)
     logger.debug("%s: model=%s attempts=%d", label, cfg.gemini_vision_model, attempts)
     data, raw_used = _ensure_parsed_json(
         cfg, cfg.gemini_vision_model, raw, label, image_parts=image_parts,
+        notifier=notifier,
     )
     return _finalize(cfg, data, raw_used, label, cfg.gemini_vision_model)

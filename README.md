@@ -4,9 +4,10 @@ Batch-extracts structured data from invoice PDFs — any vendor, any layout, no
 per-vendor templates — and writes an Excel workbook with full extraction
 provenance.
 
-> **Scope**: single-user CLI PoC. No web UI, auth, or multi-tenancy (explicit
-> later phase). **Assumes one invoice per PDF** — likely multi-invoice files
-> are detected and flagged for review, not segmented.
+> **Scope**: single-user PoC — a CLI plus an optional single-user pilot web
+> UI (see below). No auth or multi-tenancy (explicit later phase). **Assumes
+> one invoice per PDF** — likely multi-invoice files are detected and flagged
+> for review, not segmented.
 
 ## Quick start
 
@@ -49,6 +50,23 @@ Press **Ctrl+C** to stop safely (partial output for completed files, exit 130).
 **Operators:** see [`docs/OPERATIONS.md`](docs/OPERATIONS.md) (progress logs,
 overwrite, interruption, cost & chunk-size guidance, benchmark scoring) and
 [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md).
+
+## Pilot web UI (optional)
+
+A **single-user** browser UI (Streamlit) for pilot users: upload PDFs, start
+an extraction, watch safe progress, download the results. It runs as a
+separate Docker service — the CLI image is unchanged and never gains
+Streamlit:
+
+```bash
+docker compose build invoice-extractor-web
+docker compose up invoice-extractor-web        # http://localhost:8501
+```
+
+There is **no login** — keep it bound to localhost (the compose default) or
+share it privately via Tailscale; public internet exposure is unsupported.
+Uploads and results are stored temporarily per job and deleted after 24 hours.
+Full guide: [`docs/WEB_UI.md`](docs/WEB_UI.md).
 
 ## Architecture and routing
 

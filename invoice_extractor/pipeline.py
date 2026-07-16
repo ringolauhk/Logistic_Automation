@@ -38,6 +38,18 @@ from invoice_extractor.config import (
     describe_models,
     validate_openrouter_config,
 )
+from invoice_extractor.events import (
+    CHUNK_STARTED,
+    CLASSIFICATION_COMPLETE,
+    FILE_COMPLETED,
+    FILE_FAILED,
+    FILE_NEEDS_REVIEW,
+    FILE_STARTED,
+    OnEvent,
+    ProgressEvent,
+    RequestNotifier,
+    emit,
+)
 from invoice_extractor.logging_setup import exc_summary, new_run_id
 from invoice_extractor.pdf_utils import (
     DOC_ERROR,
@@ -107,7 +119,8 @@ def _chunked(items: list, size: int) -> list[list]:
 
 
 def _run_text_route(cfg: Config, logger: logging.Logger, name: str,
-                    text_pages: list[PageInfo], run_id: str) -> RouteResult:
+                    text_pages: list[PageInfo], run_id: str,
+                    on_event: OnEvent = None) -> RouteResult:
     """Gemini text normalization; Claude TEXT fallback only when enabled.
 
     Direct gateway ONLY (LLM_GATEWAY=openrouter never reaches this function -
@@ -120,9 +133,17 @@ def _run_text_route(cfg: Config, logger: logging.Logger, name: str,
     """
     pages = [p.number for p in text_pages]
     combined = "\n\n".join(f"--- PAGE {p.number} ---\n{p.text}" for p in text_pages)
+    page_range = format_page_ranges(pages)
     started = time.perf_counter()
+    emit(on_event, ProgressEvent(event=CHUNK_STARTED, source_file=name,
+                                 route="text", page_range=page_range,
+                                 chunk_index=1, chunk_total=1))
+    gem_notifier = RequestNotifier(on_event, source_file=name, route="text",
+                                   page_range=page_range, provider="gemini",
+                                   requested_model=cfg.gemini_text_model)
     try:
-        inv = gemini_client.extract_from_text(cfg, combined, label=f"{name}_gemini_text")
+        inv = gemini_client.extract_from_text(cfg, combined, label=f"{name}_gemini_text",
+                                              notifier=gem_notifier)
         provider, model = "gemini", cfg.gemini_text_model
     except Exception as gemini_exc:
         if not cfg.enable_claude_text_fallback:
@@ -131,8 +152,12 @@ def _run_text_route(cfg: Config, logger: logging.Logger, name: str,
             raise
         logger.warning("%s: Gemini text failed (%s); trying Claude text fallback",
                        name, exc_summary(gemini_exc))
+        claude_notifier = RequestNotifier(on_event, source_file=name, route="text",
+                                          page_range=page_range, provider="claude",
+                                          requested_model=cfg.claude_text_model)
         try:
-            inv = claude_client.extract_from_text(cfg, combined, label=f"{name}_claude_text")
+            inv = claude_client.extract_from_text(cfg, combined, label=f"{name}_claude_text",
+                                                  notifier=claude_notifier)
         except Exception as claude_exc:
             # Both providers' sanitized reasons are preserved here - without
             # this, Claude's exception alone would propagate and Gemini's
@@ -153,6 +178,7 @@ def _run_openrouter_text_chunk(
     cfg: Config, logger: logging.Logger, name: str,
     chunk: list[PageInfo], index: int, total: int, run_id: str,
     run_budget: RunBudget | None, file_budget: FileBudget, is_chunked: bool,
+    on_event: OnEvent = None,
 ) -> RouteResult:
     """One OpenRouter text chunk (LLM_GATEWAY=openrouter, M3.1): runs the
     full model ladder independently for just this chunk's pages, escalating
@@ -190,6 +216,7 @@ def _run_openrouter_text_chunk(
         cfg, combined, run_id=run_id, source_file=name, page_range=page_range,
         label=label, run_budget=run_budget, file_budget=file_budget,
         is_chunked=is_chunked, progress=f"text chunk {index}/{total}",
+        on_event=on_event,
     )
     model = provider_result.actual_model or provider_result.requested_model
     logger.info(
@@ -206,6 +233,7 @@ def _run_openrouter_vision_chunk(
     cfg: Config, logger: logging.Logger, name: str, path: Path,
     chunk: list[PageInfo], index: int, total: int, run_id: str,
     run_budget: RunBudget | None, file_budget: FileBudget, is_chunked: bool,
+    on_event: OnEvent = None,
 ) -> RouteResult:
     """One OpenRouter vision chunk (LLM_GATEWAY=openrouter, M4): renders just
     this chunk's pages to PNG and runs the full VISION model ladder
@@ -235,6 +263,7 @@ def _run_openrouter_vision_chunk(
         cfg, images, run_id=run_id, source_file=name, page_range=page_range,
         label=label, run_budget=run_budget, file_budget=file_budget,
         is_chunked=is_chunked, progress=f"vision chunk {index}/{total}",
+        on_event=on_event,
     )
     model = provider_result.actual_model or provider_result.requested_model
     logger.info(
@@ -248,7 +277,8 @@ def _run_openrouter_vision_chunk(
 
 
 def _run_vision_chunk(cfg: Config, logger: logging.Logger, name: str, path: Path,
-                      chunk: list[PageInfo], index: int, total: int) -> RouteResult:
+                      chunk: list[PageInfo], index: int, total: int,
+                      on_event: OnEvent = None) -> RouteResult:
     """One DIRECT-gateway vision request for one chunk: Gemini first, Claude
     on any failure. LLM_GATEWAY=openrouter never reaches this function -
     process_file routes its image pages to _run_openrouter_vision_chunk
@@ -261,17 +291,27 @@ def _run_vision_chunk(cfg: Config, logger: logging.Logger, name: str, path: Path
     page_range = format_page_ranges(pages)
     started = time.perf_counter()
     images = pdf_utils.render_pages_png(str(path), pages, dpi=cfg.render_dpi)
+    gem_notifier = RequestNotifier(on_event, source_file=name, route="vision",
+                                   page_range=page_range, provider="gemini",
+                                   requested_model=cfg.gemini_vision_model,
+                                   chunk_index=index, chunk_total=total)
     try:
         inv = gemini_client.extract_from_images(
-            cfg, images, label=f"{name}_gemini_vision_c{index}")
+            cfg, images, label=f"{name}_gemini_vision_c{index}",
+            notifier=gem_notifier)
         provider, model = "gemini", cfg.gemini_vision_model
     except Exception as gemini_exc:
         logger.warning("%s: vision chunk %d/%d (pages %s): Gemini failed (%s); "
                        "falling back to Claude vision",
                        name, index, total, page_range, exc_summary(gemini_exc))
+        claude_notifier = RequestNotifier(on_event, source_file=name, route="vision",
+                                          page_range=page_range, provider="claude",
+                                          requested_model=cfg.claude_vision_model,
+                                          chunk_index=index, chunk_total=total)
         try:
             inv = claude_client.extract_from_images(
-                cfg, images, label=f"{name}_claude_vision_c{index}")
+                cfg, images, label=f"{name}_claude_vision_c{index}",
+                notifier=claude_notifier)
         except Exception as claude_exc:
             # Both providers' sanitized reasons are preserved here - without
             # this, Claude's exception alone would propagate and Gemini's
@@ -301,7 +341,7 @@ def _reason_categories(result: InvoiceResult) -> str:
 
 def process_file(
     path: Path, cfg: Config, logger: logging.Logger, run_id: str | None = None,
-    run_budget: RunBudget | None = None,
+    run_budget: RunBudget | None = None, on_event: OnEvent = None,
 ) -> InvoiceResult:
     started = time.perf_counter()
     run_id = run_id or new_run_id()
@@ -335,6 +375,9 @@ def process_file(
                 format_page_ranges(result.text_pages) or "-",
                 format_page_ranges(result.image_pages) or "-",
                 format_page_ranges(result.blank_pages) or "-")
+    emit(on_event, ProgressEvent(
+        event=CLASSIFICATION_COMPLETE, source_file=path.name,
+        classification=result.document_classification))
 
     # Stage 3-4: per-route extraction with provider fallback
     routes: list[RouteResult] = []
@@ -416,10 +459,15 @@ def process_file(
                     if budget_reason is not None:
                         _skip_remaining_chunks(chunks, index, budget_reason, "text")
                         break
+                    emit(on_event, ProgressEvent(
+                        event=CHUNK_STARTED, source_file=path.name, route="text",
+                        page_range=format_page_ranges([p.number for p in chunk]),
+                        chunk_index=index, chunk_total=len(chunks)))
                     try:
                         route = _run_openrouter_text_chunk(
                             cfg, logger, path.name, chunk, index, len(chunks), run_id,
                             run_budget, file_budget, or_is_chunked,
+                            on_event=on_event,
                         )
                         routes.append(route)
                         result.usage_records.extend(route.usage_records)
@@ -436,7 +484,8 @@ def process_file(
                                        exc_summary(exc))
         else:
             try:
-                routes.append(_run_text_route(cfg, logger, path.name, text_pages, run_id))
+                routes.append(_run_text_route(cfg, logger, path.name, text_pages,
+                                              run_id, on_event=on_event))
             except Exception as exc:
                 label = f"text route (pages {format_page_ranges(result.text_pages)})"
                 route_failures.append((label, exc))
@@ -472,10 +521,15 @@ def process_file(
                 if budget_reason is not None:
                     _skip_remaining_chunks(chunks, index, budget_reason, "vision")
                     break
+                emit(on_event, ProgressEvent(
+                    event=CHUNK_STARTED, source_file=path.name, route="vision",
+                    page_range=format_page_ranges([p.number for p in chunk]),
+                    chunk_index=index, chunk_total=len(chunks)))
                 try:
                     route = _run_openrouter_vision_chunk(
                         cfg, logger, path.name, path, chunk, index, len(chunks),
                         run_id, run_budget, file_budget, or_is_chunked,
+                        on_event=on_event,
                     )
                     routes.append(route)
                     result.usage_records.extend(route.usage_records)
@@ -497,9 +551,14 @@ def process_file(
             logger.info("%s: %d image page(s) split into %d vision chunk(s) of <= %d",
                         path.name, len(image_pages), len(chunks), cfg.max_vision_pages)
         for index, chunk in enumerate(chunks, start=1):
+            emit(on_event, ProgressEvent(
+                event=CHUNK_STARTED, source_file=path.name, route="vision",
+                page_range=format_page_ranges([p.number for p in chunk]),
+                chunk_index=index, chunk_total=len(chunks)))
             try:
                 routes.append(_run_vision_chunk(cfg, logger, path.name, path,
-                                                chunk, index, len(chunks)))
+                                                chunk, index, len(chunks),
+                                                on_event=on_event))
             except Exception as exc:
                 nums = [p.number for p in chunk]
                 page_range = format_page_ranges(nums)
@@ -630,8 +689,49 @@ def find_pdfs(input_dir: Path) -> list[Path]:
                   if p.is_file() and p.suffix.lower() == ".pdf")
 
 
+def safe_review_categories(result: "InvoiceResult") -> tuple[str, ...]:
+    """Stable, safe review-category labels for a result (M9 events/UI).
+
+    Uses the benchmark categorizer (the project's one stable category
+    vocabulary) over the SAFE review_reason string; never returns raw
+    reasons. Falls back to ("unknown",) if categorization itself fails."""
+    if not result.review_reason:
+        return ()
+    try:
+        from invoice_extractor.benchmark.scoring import parse_review_categories
+        cats, unknown = parse_review_categories(result.review_reason)
+        if unknown:
+            cats = [*cats, "unknown"]
+        return tuple(cats) or ("unknown",)
+    except Exception:  # categorization must never break the pipeline
+        return ("unknown",)
+
+
+def _emit_file_result(on_event: OnEvent, result: "InvoiceResult",
+                      file_index: int, file_total: int) -> None:
+    counts = _attempt_counts(result.usage_records)
+    if result.error:
+        event_type = FILE_FAILED
+    elif result.needs_review:
+        event_type = FILE_NEEDS_REVIEW
+    else:
+        event_type = FILE_COMPLETED
+    emit(on_event, ProgressEvent(
+        event=event_type, source_file=result.source_file,
+        file_index=file_index, file_total=file_total,
+        classification=result.document_classification,
+        extraction_method=result.extraction_method,
+        provider=result.provider, model=result.model,
+        elapsed_seconds=round(result.elapsed_seconds, 3),
+        request_count=counts["total"], repair_count=counts["repair"],
+        escalation_count=counts["escalation"],
+        needs_review=result.needs_review, error=result.error,
+        review_categories=safe_review_categories(result)))
+
+
 def process_directory(
     input_dir: Path, cfg: Config, logger: logging.Logger, run_id: str | None = None,
+    on_event: OnEvent = None,
 ) -> list[InvoiceResult]:
     pdfs = find_pdfs(input_dir)
     if not pdfs:
@@ -655,8 +755,11 @@ def process_directory(
     run_budget = RunBudget(cfg.max_cost_usd_per_run)
     in_flight: Path | None = None
     try:
-        for path in pdfs:
+        for file_index, path in enumerate(pdfs, start=1):
             in_flight = path
+            emit(on_event, ProgressEvent(
+                event=FILE_STARTED, source_file=path.name,
+                file_index=file_index, file_total=len(pdfs)))
             if cfg.llm_gateway == "openrouter" and run_budget.exceeded():
                 logger.warning(
                     "%s: run-wide OpenRouter cost budget ($%s) already reached; "
@@ -670,10 +773,12 @@ def process_directory(
                         "reached before this file could be processed"
                     ),
                 ))
+                _emit_file_result(on_event, results[-1], file_index, len(pdfs))
                 in_flight = None
                 continue
             try:
-                result = process_file(path, cfg, logger, run_id=run_id, run_budget=run_budget)
+                result = process_file(path, cfg, logger, run_id=run_id,
+                                      run_budget=run_budget, on_event=on_event)
             except Exception as exc:  # belt and braces: one file must never stop the batch
                 # NOTE: `except Exception` deliberately does NOT catch
                 # KeyboardInterrupt (a BaseException), so Ctrl+C propagates to
@@ -682,6 +787,7 @@ def process_directory(
                 result = InvoiceResult(source_file=path.name, needs_review=True, error=True,
                                        review_reason=f"unexpected pipeline error: {exc_summary(exc)}")
             results.append(result)
+            _emit_file_result(on_event, result, file_index, len(pdfs))
             in_flight = None
     except KeyboardInterrupt:
         # Stop immediately: no new provider calls, no retries. The in-flight

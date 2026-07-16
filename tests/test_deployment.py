@@ -106,7 +106,11 @@ def test_c_dockerignore_keeps_env_example_visible():
 def test_d_compose_no_ports_db_privileged_or_inline_secrets():
     code = _code_lines("compose.yaml")   # comments stripped
     low = code.lower()
-    assert "ports:" not in low
+    # The CLI service must expose NO ports; the M9 web service has exactly
+    # one localhost-bound mapping (checked separately in TestWebPackaging).
+    cli_block = code.split("invoice-extractor:", 1)[1].split(
+        "invoice-extractor-web:", 1)[0]
+    assert "ports:" not in cli_block
     assert "privileged" not in low
     assert "image: postgres" not in low and "image: mysql" not in low
     assert "env_file" in code
@@ -223,6 +227,74 @@ def test_r_s_run_launcher_forwards_flags_without_silent_overwrite():
     assert '"$@"' in body
     # --overwrite is never injected by the script (comments stripped).
     assert "--overwrite" not in re.sub(r"#.*", "", body)
+
+
+# --- M9: web UI packaging (AQ-AT static) ----------------------------------------
+
+class TestWebPackaging:
+    def test_cli_stage_is_final_default(self):
+        # `docker build .` with no --target must keep producing the CLI image
+        # (M9 adjustment 1): the LAST stage must be the cli alias.
+        stages = re.findall(r"^FROM\s+\S+(?:\s+AS\s+(\S+))?", _read("Dockerfile"),
+                            re.MULTILINE)
+        assert stages[-1] == "cli"
+        assert "web" in stages and "runtime-base" in stages and "builder" in stages
+
+    def test_aq_web_stage_ends_non_root(self):
+        df = _read("Dockerfile")
+        web_stage = df.split("AS web", 1)[1].split("FROM ", 1)[0]
+        users = re.findall(r"^USER\s+(\S+)", web_stage, re.MULTILINE)
+        assert users and users[-1] == "appuser"   # root only transiently for pip
+
+    def test_web_stage_installs_pinned_streamlit_only_there(self):
+        df = _read("Dockerfile")
+        web_stage = df.split("AS web", 1)[1].split("FROM ", 1)[0]
+        assert "requirements-web.txt" in web_stage
+        # CLI stages (code lines only - section comments may mention the
+        # web UI) must not install streamlit.
+        before_web = "\n".join(
+            ln for ln in df.split("AS web", 1)[0].splitlines()
+            if ln.strip() and not ln.strip().startswith("#"))
+        assert "streamlit" not in before_web.lower()
+        reqs = [ln for ln in _read("requirements-web.txt").splitlines()
+                if ln.strip() and not ln.startswith("#")]
+        assert "streamlit==1.59.2" in reqs
+        for line in reqs:
+            assert "==" in line, f"unpinned web dep: {line}"
+
+    def test_ar_at_compose_web_binds_localhost_only(self):
+        code = _code_lines("compose.yaml")
+        assert '"127.0.0.1:8501:8501"' in code          # host binding localhost
+        assert re.search(r'-\s*"0\.0\.0\.0', code) is None
+        assert re.search(r'-\s*"8501:8501"', code) is None  # no all-interfaces map
+        assert "target: cli" in code and "target: web" in code
+        assert "invoice-extractor-web:0.1.0" in code
+        assert "./web-data:/data/jobs" in code
+
+    def test_as_no_telemetry_in_streamlit_config(self):
+        conf = _read(".streamlit/config.toml")
+        assert "gatherUsageStats = false" in conf
+        assert "enableXsrfProtection = true" in conf
+        assert 'address = "localhost"' in conf
+
+    def test_web_data_ignored_by_git_and_docker(self):
+        assert "web-data/" in _read(".gitignore")
+        assert "web-data/" in _read(".dockerignore")
+
+    def test_apps_package_importable_as_module(self):
+        # `python -m apps.web.worker` needs apps/__init__.py (adjustment 1).
+        assert (ROOT / "apps" / "__init__.py").exists()
+        assert (ROOT / "apps" / "web" / "__init__.py").exists()
+
+    def test_web_ui_doc_exists(self):
+        doc = _read("docs/WEB_UI.md").lower()
+        for topic in ("single-user", "tailscale", "retention", "cancel",
+                      "localhost", "no login"):
+            assert topic in doc, f"WEB_UI.md missing topic: {topic}"
+
+    def test_streamlit_app_imports(self):
+        pytest.importorskip("streamlit")
+        import apps.web.app  # noqa: F401 - import-only smoke (bare mode)
 
 
 # --- release archive ----------------------------------------------------------

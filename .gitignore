@@ -46,6 +46,10 @@ release/
 # invoice PDFs; never commit it. Mounted read-only into the container.
 input/
 
+# Web UI job data (M9): per-job uploaded PDFs and outputs under a 24h
+# retention window - never commit.
+web-data/
+
 # macOS Finder metadata
 .DS_Store
 

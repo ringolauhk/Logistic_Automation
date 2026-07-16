@@ -219,3 +219,11 @@ thresholds template. Real-data benchmark directories are git-ignored.
 Real invoice PDFs, `.env`, `output/`, `*.usage.csv`, and real benchmark
 ground-truth/manifests/reports are git-ignored. Only synthetic fixtures and
 templates are committed. Double-check `git status` before committing.
+
+## 19. Pilot web UI
+
+A single-user browser front-end to the same engine (uploads, progress,
+cancellation, downloads) runs as the separate `invoice-extractor-web` compose
+service on `http://localhost:8501`. Same providers, budgets, outputs, and
+privacy rules as the CLI; one extraction at a time; job files are temporary
+(24 h retention). See `docs/WEB_UI.md`.

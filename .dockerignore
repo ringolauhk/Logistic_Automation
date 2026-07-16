@@ -56,6 +56,9 @@ benchmark_report.*
 # image; they remain in the source tree / release archive).
 benchmark/
 
+# Web job data (uploads/outputs) must never enter an image
+web-data/
+
 # Dev/deployment tooling not needed inside the image
 requirements-dev.txt
 scripts/

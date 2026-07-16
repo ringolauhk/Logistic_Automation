@@ -78,3 +78,15 @@ Under `LLM_GATEWAY=openrouter` the message says **"all configured models"**
 - Pass `--log-file PATH` for a persistent log.
 - Controlled errors never print a Python traceback; a traceback indicates an
   unexpected internal fault worth reporting.
+
+## Pilot web UI
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| "Another extraction is currently running" with no job visible | A previous worker died; its lock is reclaimed automatically once the PID is gone or the heartbeat expires (~2 min) | Wait briefly and reload the page |
+| Start button shows a configuration error | Missing provider key/model in the server's `.env` | Fix `.env` where the web service runs, restart it |
+| Cancel shows "Could not verify the worker process" | Fail-closed identity check: the recorded PID no longer matches a live worker | The job ends on its own; reload — no signal was sent to an unrelated process |
+| Job or downloads disappeared | Retention cleanup (`WEB_JOB_RETENTION_HOURS`, default 24 h) | Download results promptly after a run |
+| Page unreachable from another machine | Host binding is localhost-only by design | Use `tailscale serve 8501`, or (trusted LAN only) change the compose port mapping |
+
+More detail: `docs/WEB_UI.md`.

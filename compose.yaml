@@ -1,5 +1,5 @@
-# Docker Compose for the invoice extractor (M8). One service, no ports, no
-# database, no privileged mode, no secrets baked in.
+# Docker Compose for the invoice extractor (M8) + pilot web UI (M9).
+# No database, no privileged mode, no secrets baked in.
 #
 # Setup once:
 #   cp .env.example .env          # fill in your key(s)
@@ -7,9 +7,13 @@
 #   docker compose build
 #   docker compose run --rm invoice-extractor doctor
 #
-# Extract:
+# CLI extract:
 #   docker compose run --rm invoice-extractor run \
 #     --input /data/input --output /data/output/results.xlsx
+#
+# Web UI (single-user pilot, localhost-only by default):
+#   docker compose up invoice-extractor-web
+#   open http://localhost:8501
 #
 # Linux hosts: to make generated files owned by your user, export HOST_UID /
 # HOST_GID before running (see docs/DEPLOYMENT.md):
@@ -19,6 +23,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      target: cli               # the CLI image - never gains Streamlit
     image: invoice-extractor:0.1.0
     # Non-root by default (1000:1000, matching the image's appuser). Override
     # to the host user on Linux so mounted-output files are host-owned; on
@@ -37,3 +42,23 @@ services:
     stop_grace_period: 30s
     # Harmless default (image CMD is --help); operators pass a real subcommand:
     #   docker compose run --rm invoice-extractor run --input /data/input ...
+
+  # Single-user pilot web UI (M9). NO login: anyone who can reach the port can
+  # upload invoices and trigger paid provider calls, so the HOST binding stays
+  # on 127.0.0.1 by default. For remote pilot access prefer Tailscale Serve /
+  # an authenticated private proxy over widening this binding - see
+  # docs/WEB_UI.md. Public internet exposure is unsupported.
+  invoice-extractor-web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: web
+    image: invoice-extractor-web:0.1.0
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8501:8501"   # localhost-only on the HOST by default
+    volumes:
+      - ./web-data:/data/jobs   # per-job uploads/outputs (24h retention)
+    stop_grace_period: 45s      # let a running extraction finish its SIGINT path

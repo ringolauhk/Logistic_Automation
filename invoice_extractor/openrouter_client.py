@@ -50,6 +50,13 @@ from invoice_extractor.provider import (
     coerce_cost,
     is_truncated,
 )
+from invoice_extractor.events import (
+    PROVIDER_REQUEST_COMPLETED,
+    PROVIDER_REQUEST_STARTED,
+    OnEvent,
+    ProgressEvent,
+    emit,
+)
 from invoice_extractor.retry import call_with_retry
 from invoice_extractor.schema import (
     ExtractionError,
@@ -466,6 +473,7 @@ def _attempt_model(
     ladder_index: int, run_id: str, source_file: str, page_range: str, label: str,
     run_budget: RunBudget | None = None, file_budget: FileBudget | None = None,
     require_hard_fields: bool = True, progress: str = "", model_count: int = 1,
+    on_event: OnEvent = None,
 ) -> _AttemptOutcome:
     """Try exactly one model: primary request, local cleanup, at most one
     repair, then schema + (usually) hard-required validation. Never raises -
@@ -506,6 +514,7 @@ def _attempt_model(
             run_budget.add(None)  # failed attempts never carry a cost
         if file_budget is not None:
             file_budget.cost.add(None)
+        _request_event(PROVIDER_REQUEST_COMPLETED, attempt_type_, accepted=False)
 
     def outcome_record(result, *, accepted, category=None):
         usage_records.append(usage_record_from_result(
@@ -516,6 +525,14 @@ def _attempt_model(
             run_budget.add(result.cost_usd)
         if file_budget is not None:
             file_budget.cost.add(result.cost_usd)
+        _request_event(PROVIDER_REQUEST_COMPLETED, result.attempt_type, accepted=accepted)
+
+    def _request_event(event_type, attempt_type_, accepted=None):
+        emit(on_event, ProgressEvent(
+            event=event_type, source_file=source_file, route=route,
+            page_range=page_range, attempt_type=attempt_type_,
+            ladder_index=ladder_index, model_count=model_count,
+            requested_model=model, provider="openrouter", accepted=accepted))
 
     def budget_exhausted_reason(context: str) -> str | None:
         # Note: both branches already end in "reached" - context must NOT
@@ -538,6 +555,7 @@ def _attempt_model(
     # --- primary request ---
     _log_progress(source_file, progress, route, page_range, attempt_type,
                   ladder_index, model_count, model, cfg.request_timeout_seconds)
+    _request_event(PROVIDER_REQUEST_STARTED, attempt_type)
     try:
         result = _run_attempt(cfg, model, messages, response_format, mode,
                               attempt_type, 0, label, route)
@@ -575,6 +593,7 @@ def _attempt_model(
                        "attempting one repair retry", label, model, parse_exc)
         _log_progress(source_file, progress, route, page_range, ATTEMPT_REPAIR,
                       ladder_index, model_count, model, cfg.request_timeout_seconds)
+        _request_event(PROVIDER_REQUEST_STARTED, ATTEMPT_REPAIR)
         try:
             repair = _run_attempt(
                 cfg, model, _repair_messages(repair_prompt, result.text),
@@ -643,7 +662,7 @@ def _run_ladder(
     cfg: Config, models: tuple, *, messages: list, repair_prompt: str, route: str,
     run_id: str, source_file: str, page_range: str, label: str,
     run_budget: RunBudget | None, file_budget: FileBudget | None,
-    require_hard_fields: bool, progress: str = "",
+    require_hard_fields: bool, progress: str = "", on_event: OnEvent = None,
 ) -> tuple[Invoice, ProviderResult, list]:
     """Shared ladder driver for BOTH routes (M4): try each model in `models`
     in order; the first accepted extraction stops the ladder. Escalates on
@@ -696,7 +715,7 @@ def _run_ladder(
             page_range=page_range, label=f"{label}_m{ladder_index}",
             run_budget=run_budget, file_budget=file_budget,
             require_hard_fields=require_hard_fields,
-            progress=progress, model_count=len(models),
+            progress=progress, model_count=len(models), on_event=on_event,
         )
         usage_records.extend(outcome.usage_records)
 
@@ -716,7 +735,7 @@ def extract_from_text_ladder(
     cfg: Config, invoice_text: str, *, run_id: str, source_file: str,
     page_range: str, label: str = "openrouter_text",
     run_budget: RunBudget | None = None, file_budget: FileBudget | None = None,
-    is_chunked: bool = False, progress: str = "",
+    is_chunked: bool = False, progress: str = "", on_event: OnEvent = None,
 ) -> tuple[Invoice, ProviderResult, list]:
     """OPENROUTER_TEXT_MODELS ladder over one text chunk (or a whole
     text-native document when it fits in a single request). Thin wrapper:
@@ -732,7 +751,7 @@ def extract_from_text_ladder(
         repair_prompt=prompt, route=ROUTE_TEXT, run_id=run_id,
         source_file=source_file, page_range=page_range, label=label,
         run_budget=run_budget, file_budget=file_budget,
-        require_hard_fields=not is_chunked, progress=progress,
+        require_hard_fields=not is_chunked, progress=progress, on_event=on_event,
     )
 
 
@@ -740,7 +759,7 @@ def extract_from_vision_ladder(
     cfg: Config, images: list[bytes], *, run_id: str, source_file: str,
     page_range: str, label: str = "openrouter_vision",
     run_budget: RunBudget | None = None, file_budget: FileBudget | None = None,
-    is_chunked: bool = False, progress: str = "",
+    is_chunked: bool = False, progress: str = "", on_event: OnEvent = None,
 ) -> tuple[Invoice, ProviderResult, list]:
     """OPENROUTER_VISION_MODELS ladder over one vision chunk's rendered PNG
     page images (M4). Builds ONE multimodal message (base64 PNG data-URL
@@ -764,5 +783,5 @@ def extract_from_vision_ladder(
         repair_prompt=prompt, route=ROUTE_VISION, run_id=run_id,
         source_file=source_file, page_range=page_range, label=label,
         run_budget=run_budget, file_budget=file_budget,
-        require_hard_fields=not is_chunked, progress=progress,
+        require_hard_fields=not is_chunked, progress=progress, on_event=on_event,
     )

@@ -33,7 +33,7 @@ COPY invoice_extractor ./invoice_extractor
 RUN pip wheel --no-deps --wheel-dir /wheels .
 
 # --- Runtime: minimal, non-root, no build residue ----------------------------
-FROM python:3.13.14-slim-bookworm
+FROM python:3.13.14-slim-bookworm AS runtime-base
 
 # Runtime-only OS packages: TLS roots for provider HTTPS, and tini as PID 1 so
 # SIGINT/SIGTERM reach Python (Ctrl+C -> exit 130 partial-output handling).
@@ -63,7 +63,7 @@ RUN pip install --only-binary=:all: -r /tmp/requirements.txt \
 # write to /data/output even before a host bind mount is attached.
 RUN groupadd --gid 1000 appuser \
     && useradd --uid 1000 --gid 1000 --create-home appuser \
-    && mkdir -p /data/input /data/output /data/benchmark \
+    && mkdir -p /data/input /data/output /data/benchmark /data/jobs \
     && chown -R appuser:appuser /data
 USER appuser
 
@@ -76,3 +76,33 @@ LABEL org.opencontainers.image.title="invoice-extractor" \
 ENTRYPOINT ["tini", "--", "invoice-extractor"]
 # Harmless default: print help, make no provider calls.
 CMD ["--help"]
+
+# --- Web: pilot single-user Streamlit UI (M9) ---------------------------------
+# Separate image (invoice-extractor-web) built with `--target web`; the CLI
+# image never gains Streamlit. Compose maps the HOST port to 127.0.0.1 by
+# default - the in-container 0.0.0.0 binding is required for that mapping to
+# work and is not itself an exposure.
+FROM runtime-base AS web
+
+USER root
+COPY requirements-web.txt /tmp/requirements-web.txt
+RUN pip install --only-binary=:all: -r /tmp/requirements-web.txt \
+    && rm -f /tmp/requirements-web.txt
+COPY apps /app/apps
+COPY .streamlit /app/.streamlit
+USER appuser
+
+ENV WEB_JOBS_DIR=/data/jobs \
+    STREAMLIT_SERVER_ADDRESS=0.0.0.0 \
+    STREAMLIT_SERVER_PORT=8501 \
+    STREAMLIT_BROWSER_GATHERUSAGESTATS=false
+
+EXPOSE 8501
+LABEL org.opencontainers.image.title="invoice-extractor-web"
+ENTRYPOINT ["tini", "--", "streamlit", "run", "/app/apps/web/app.py"]
+CMD []
+
+# --- CLI: the FINAL/DEFAULT stage ----------------------------------------------
+# `docker build -t invoice-extractor .` (no --target) must keep producing the
+# CLI image (approved M9 adjustment 1), so this alias stage comes LAST.
+FROM runtime-base AS cli

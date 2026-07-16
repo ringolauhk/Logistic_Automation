@@ -5,6 +5,11 @@ Two supported delivery modes:
 1. **Docker / Docker Compose** — recommended for pilot users.
 2. **Native Python virtual environment** — for developers/technical users.
 
+There is also an optional **single-user pilot web UI** delivered as a separate
+Docker service (`invoice-extractor-web`, built from the `web` stage of the same
+Dockerfile). The default `docker build` and the `invoice-extractor` CLI image
+are unchanged and never gain Streamlit. See §21 and `docs/WEB_UI.md`.
+
 > **Privacy disclosure.** Extraction sends invoice page content (text and, for
 > scanned pages, rendered page images) to the **configured external model
 > provider** (OpenRouter, or Gemini/Claude under the direct gateway). Data is
@@ -203,3 +208,25 @@ More at `docs/TROUBLESHOOTING.md`.
 and logs out of Git. `.dockerignore` keeps all of those **plus** tests and
 `.git` out of the image. Verify with `git status` before committing and inspect
 the image with `docker run --rm --entrypoint sh invoice-extractor:0.1.0 -c 'ls -a /app'`.
+
+## 21. Pilot web UI service
+
+```bash
+docker compose build invoice-extractor-web     # image invoice-extractor-web:0.1.0
+docker compose up invoice-extractor-web        # http://localhost:8501
+```
+
+- Separate image built from the `web` stage (`--target web`); the CLI stage is
+  the Dockerfile's final/default stage, so plain `docker build .` still
+  produces the CLI image.
+- The container binds the host port as `127.0.0.1:8501` only — never exposed
+  beyond the machine by default. For remote pilot users prefer
+  `tailscale serve 8501` (authenticated, private) over LAN binding.
+- Job storage is `./web-data` on the host (`/data/jobs` in the container),
+  git-ignored and excluded from build contexts; jobs are deleted after
+  `WEB_JOB_RETENTION_HOURS` (default 24).
+- Runs as the same non-root user with `user: "${HOST_UID:-1000}:${HOST_GID:-1000}"`.
+- No login, no telemetry (`gatherUsageStats = false`), single active job.
+
+Full usage, limits, cancellation, retention, and remote-access guidance:
+`docs/WEB_UI.md`.

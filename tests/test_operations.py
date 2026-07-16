@@ -176,7 +176,8 @@ class TestInterruption:
 
         def interrupt_batch(*a, **k):
             raise pipeline.BatchInterrupted([])
-        monkeypatch.setattr(cli_module, "process_directory", interrupt_batch)
+        from invoice_extractor import service as service_module
+        monkeypatch.setattr(service_module, "process_directory", interrupt_batch)
         out = tmp_path / "out" / "r.xlsx"
         result = _run(["run", "--input", str(s), "--output", str(out)])
         assert result.exit_code == 130
@@ -223,7 +224,8 @@ class TestAtomicWrites:
 
         def broken_export(results, path):
             raise OSError("disk full (synthetic)")
-        monkeypatch.setattr(cli_module, "export_workbook", broken_export)
+        from invoice_extractor import service as service_module
+        monkeypatch.setattr(service_module, "export_workbook", broken_export)
 
         result = _run(["run", "--input", str(s), "--output", str(out), "--overwrite"])
         assert result.exit_code != 0
@@ -245,7 +247,8 @@ class TestAtomicWrites:
 
         def broken_usage(records, path):
             raise OSError("usage write failed (synthetic)")
-        monkeypatch.setattr(cli_module, "write_usage_csv", broken_usage)
+        from invoice_extractor import service as service_module
+        monkeypatch.setattr(service_module, "write_usage_csv", broken_usage)
 
         result = _run(["run", "--input", str(s), "--output", str(out), "--overwrite"])
         assert result.exit_code != 0
@@ -343,7 +346,8 @@ class TestOverwriteProtection:
         out.write_text("OLD-KEEP")
         rec = Recorder([_envelope(invoice_json())])
         monkeypatch.setattr(openrouter_client, "_chat_completion", rec)
-        monkeypatch.setattr(cli_module, "export_workbook",
+        from invoice_extractor import service as service_module
+        monkeypatch.setattr(service_module, "export_workbook",
                             lambda r, p: (_ for _ in ()).throw(OSError("fail")))
         result = _run(["run", "--input", str(s), "--output", str(out), "--overwrite"])
         assert result.exit_code != 0

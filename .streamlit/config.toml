@@ -1,0 +1,16 @@
+# Streamlit configuration for the pilot web UI (M9). Safe defaults:
+# no telemetry, headless, localhost binding for native runs (the Docker
+# service overrides the address via STREAMLIT_SERVER_ADDRESS because the
+# HOST-side compose port mapping is what stays on 127.0.0.1).
+
+[browser]
+gatherUsageStats = false
+
+[server]
+headless = true
+port = 8501
+address = "localhost"
+# Matches the app-level WEB_MAX_TOTAL_MB default (200 MB).
+maxUploadSize = 200
+enableXsrfProtection = true
+enableCORS = false

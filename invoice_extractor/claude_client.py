@@ -103,6 +103,7 @@ def _repair_text(raw_text: str) -> str:
 
 def _ensure_parsed_json(
     cfg: Config, model: str, raw_text: str, label: str, repair_content,
+    notifier=None,
 ) -> tuple[dict, str]:
     """Parse a Claude response, tolerating markdown fences / surrounding prose
     via parse_json_response's own local cleanup. If that still fails, make
@@ -121,6 +122,8 @@ def _ensure_parsed_json(
     except ExtractionError as exc:
         logger.warning("%s: response from %s was not valid JSON (%s); "
                        "attempting one repair retry", label, model, exc)
+        if notifier is not None:
+            notifier.started("repair")
         try:
             repaired, attempts = call_with_retry(
                 lambda: _request(cfg, model, repair_content),
@@ -129,10 +132,14 @@ def _ensure_parsed_json(
             logger.debug("%s_repair: model=%s attempts=%d", label, model, attempts)
             data = parse_json_response(repaired)
         except Exception as repair_exc:
+            if notifier is not None:
+                notifier.completed("repair", accepted=False)
             logger.warning("%s: JSON repair retry did not produce valid JSON; "
                            "surfacing failure for review", label)
             save_debug_artifact(cfg, label, model=model, reason=str(exc), raw_text=raw_text)
             raise exc from repair_exc
+        if notifier is not None:
+            notifier.completed("repair", accepted=True)
         logger.info("%s: JSON repair retry recovered valid JSON", label)
         return data, repaired
 
@@ -151,21 +158,37 @@ def _finalize(cfg: Config, data: dict, raw_text: str, label: str, model: str) ->
     return inv
 
 
-def extract_from_text(cfg: Config, invoice_text: str, label: str = "claude_text") -> Invoice:
-    """Text-only fallback (used only when ENABLE_CLAUDE_TEXT_FALLBACK=true)."""
-    raw, attempts = call_with_retry(
-        lambda: _request(cfg, cfg.claude_text_model, text_extraction_prompt(invoice_text)),
-        is_transient, cfg.max_retries, label,
-    )
+def extract_from_text(cfg: Config, invoice_text: str, label: str = "claude_text",
+                      notifier=None) -> Invoice:
+    """Text-only fallback (used only when ENABLE_CLAUDE_TEXT_FALLBACK=true).
+
+    `notifier` (optional, M9): an events.RequestNotifier for UI progress;
+    None (the default, used by the CLI) changes nothing.
+    """
+    if notifier is not None:
+        notifier.started("primary")
+    try:
+        raw, attempts = call_with_retry(
+            lambda: _request(cfg, cfg.claude_text_model, text_extraction_prompt(invoice_text)),
+            is_transient, cfg.max_retries, label,
+        )
+    except Exception:
+        if notifier is not None:
+            notifier.completed("primary", accepted=False)
+        raise
+    if notifier is not None:
+        notifier.completed("primary", accepted=True)
     logger.debug("%s: model=%s attempts=%d", label, cfg.claude_text_model, attempts)
     data, raw_used = _ensure_parsed_json(
-        cfg, cfg.claude_text_model, raw, label, _repair_text(raw),
+        cfg, cfg.claude_text_model, raw, label, _repair_text(raw), notifier=notifier,
     )
     return _finalize(cfg, data, raw_used, label, cfg.claude_text_model)
 
 
-def extract_from_images(cfg: Config, images: list[bytes], label: str = "claude_vision") -> Invoice:
-    """Vision fallback when Gemini vision fails or returns unusable output."""
+def extract_from_images(cfg: Config, images: list[bytes], label: str = "claude_vision",
+                        notifier=None) -> Invoice:
+    """Vision fallback when Gemini vision fails or returns unusable output.
+    `notifier` as in extract_from_text (optional M9 progress hook)."""
     image_blocks = [
         {
             "type": "image",
@@ -178,15 +201,24 @@ def extract_from_images(cfg: Config, images: list[bytes], label: str = "claude_v
         for png in images
     ]
     content: list = [*image_blocks, {"type": "text", "text": vision_extraction_prompt(len(images))}]
-    raw, attempts = call_with_retry(
-        lambda: _request(cfg, cfg.claude_vision_model, content),
-        is_transient, cfg.max_retries, label,
-    )
+    if notifier is not None:
+        notifier.started("primary")
+    try:
+        raw, attempts = call_with_retry(
+            lambda: _request(cfg, cfg.claude_vision_model, content),
+            is_transient, cfg.max_retries, label,
+        )
+    except Exception:
+        if notifier is not None:
+            notifier.completed("primary", accepted=False)
+        raise
+    if notifier is not None:
+        notifier.completed("primary", accepted=True)
     logger.debug("%s: model=%s attempts=%d", label, cfg.claude_vision_model, attempts)
     # Repair keeps the same list shape (images + repair text) so the vision
     # route stays classified as vision, matching gemini's image-resending repair.
     repair_content: list = [*image_blocks, {"type": "text", "text": _repair_text(raw)}]
     data, raw_used = _ensure_parsed_json(
-        cfg, cfg.claude_vision_model, raw, label, repair_content,
+        cfg, cfg.claude_vision_model, raw, label, repair_content, notifier=notifier,
     )
     return _finalize(cfg, data, raw_used, label, cfg.claude_vision_model)
