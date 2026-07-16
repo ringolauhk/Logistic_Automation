@@ -20,7 +20,7 @@ if _PROJECT_ROOT not in sys.path:
 
 import streamlit as st
 
-from apps.web import cleanup, job_manager, ui_models
+from apps.web import cleanup, job_manager, new_batch, ui_models
 from apps.web.estimate import FilePlan, estimate_max_attempts
 from apps.web.progress import (
     STATE_CANCELLED,
@@ -29,9 +29,11 @@ from apps.web.progress import (
     read_events,
     read_status,
 )
+from apps.web.style import COMPACT_CSS
 
 st.set_page_config(page_title="Invoice Extractor Pilot", page_icon="🧾",
-                   layout="centered")
+                   layout="wide")
+st.markdown(COMPACT_CSS, unsafe_allow_html=True)
 
 
 # --- one-time-per-server startup cleanup --------------------------------------
@@ -93,9 +95,10 @@ st.info(
     "rendered page images) is sent to the configured external model provider. "
     "Uploads and outputs are stored **temporarily** on the machine running this "
     "app and are deleted after the retention window "
-    f"({cleanup.retention_hours():.0f}h) or via *Delete job files now*. This app "
-    "provides no permanent storage - download your results. Do not upload "
-    "unrelated confidential files. Debug artifacts are disabled by default."
+    f"({cleanup.retention_hours():.0f}h) or when you start a new batch with "
+    "*Delete previous job files* selected. This app provides no permanent "
+    "storage - download your results. Do not upload unrelated confidential "
+    "files. Debug artifacts are disabled by default."
 )
 
 active = job_manager.active_job()
@@ -121,16 +124,27 @@ if active is not None and active.job_id:
     session_job = active.job_id
 
 # --- 1. Upload invoices ---------------------------------------------------------
+if st.session_state.get("new_batch_msg"):
+    st.success(st.session_state.pop("new_batch_msg"))
+
 st.header("1. Upload invoices")
 limits = job_manager.upload_limits()
-st.caption(f"Limits: {limits['max_files']} files, {limits['max_file_mb']} MB each, "
-           f"{limits['max_total_mb']} MB combined. PDF only.")
-uploaded = st.file_uploader("Invoice PDFs", type=["pdf"],
-                            accept_multiple_files=True,
-                            disabled=active is not None)
-if uploaded:
-    total_mb = sum(len(f.getvalue()) for f in uploaded) / 1e6
-    st.caption(f"Selected: {len(uploaded)} file(s), {total_mb:.1f} MB total")
+up_col, info_col = st.columns([3, 2])
+with up_col:
+    # The widget key carries the uploader generation: Start New Batch bumps
+    # it, which makes Streamlit rebuild the uploader and visibly drop the
+    # previous file selection.
+    uploaded = st.file_uploader("Invoice PDFs", type=["pdf"],
+                                accept_multiple_files=True,
+                                key=new_batch.uploader_key(st.session_state),
+                                disabled=active is not None)
+with info_col:
+    st.caption(f"Limits: {limits['max_files']} files, "
+               f"{limits['max_file_mb']} MB each, "
+               f"{limits['max_total_mb']} MB combined. PDF only.")
+    if uploaded:
+        total_mb = sum(len(f.getvalue()) for f in uploaded) / 1e6
+        st.caption(f"Selected: {len(uploaded)} file(s), {total_mb:.1f} MB total")
 
 if st.button("Validate & prepare", disabled=not uploaded or active is not None):
     try:
@@ -216,7 +230,10 @@ if job_id:
         status = read_status(job_manager.job_dir_for(job_id))
     except job_manager.JobError:
         status = None
-if status is None and active is None:
+# Adopt the newest finished job only for a session with NO job history at
+# all (e.g. right after a browser refresh). After Start New Batch the
+# session keeps job_id=None, so a reset never re-adopts the old job.
+if status is None and active is None and "job_id" not in st.session_state:
     newest = _newest_terminal_job()
     if newest:
         job_id = newest
@@ -227,23 +244,26 @@ state = (status or {}).get("state")
 if state == "prepared" and active is None:
     plans = st.session_state.get("plans") or _classify_job(job_id)
     st.subheader("Prepared files")
-    st.table([{"File": p.display_name, "Classification": p.classification,
-               "Text pages": p.text_pages, "Image pages": p.image_pages}
-              for p in plans])
-    if all(v == "" for v in (adv_attempts.strip(), adv_cost_file.strip(),
-                             adv_cost_run.strip())):
-        st.warning("No safety limits are configured (attempt cap / file cost / "
-                   "run cost). Paid requests are bounded only by chunks x "
-                   "models x retries.")
-    try:
-        est = estimate_max_attempts(plans, cfg)
-        st.markdown(f"**Maximum potential provider attempts under current "
-                    f"settings: {est.max_attempts}**")
-        st.caption("Actual requests may be lower because successful models, "
-                   "validation, and budgets stop escalation. Assumptions: "
-                   + " ".join(est.assumptions))
-    except Exception:
-        st.caption("Estimate unavailable.")
+    table_col, est_col = st.columns([2, 3])
+    with table_col:
+        st.table([{"File": p.display_name, "Classification": p.classification,
+                   "Text pages": p.text_pages, "Image pages": p.image_pages}
+                  for p in plans])
+    with est_col:
+        if all(v == "" for v in (adv_attempts.strip(), adv_cost_file.strip(),
+                                 adv_cost_run.strip())):
+            st.warning("No safety limits are configured (attempt cap / file "
+                       "cost / run cost). Paid requests are bounded only by "
+                       "chunks x models x retries.")
+        try:
+            est = estimate_max_attempts(plans, cfg)
+            st.markdown(f"**Maximum potential provider attempts under current "
+                        f"settings: {est.max_attempts}**")
+            st.caption("Actual requests may be lower because successful "
+                       "models, validation, and budgets stop escalation. "
+                       "Assumptions: " + " ".join(est.assumptions))
+        except Exception:
+            st.caption("Estimate unavailable.")
 
     problems = _provider_preflight(cfg)
     for p in problems:
@@ -319,26 +339,29 @@ if status and state in TERMINAL_STATES:
         st.warning("Cancelled by operator - partial results below.")
     summary = status.get("summary") or {}
     if summary:
+        costs = ui_models.cost_summary(status)
+        row1 = st.columns(6)
+        row1[0].metric("Submitted", summary.get("files_processed", 0))
+        row1[1].metric("Extracted", summary.get("extracted", 0))
+        row1[2].metric("Needs review", summary.get("needs_review", 0))
+        row1[3].metric("Failed", summary.get("failed", 0))
+        row1[4].metric("Reported cost (USD)", costs.total_display)
+        row1[5].metric("Elapsed", costs.elapsed_display)
+        row2 = st.columns(6)
+        row2[0].metric("Provider requests", costs.requests)
+        row2[1].metric("Unknown-cost requests", costs.unknown_cost_requests)
+        row2[2].metric("Avg reported cost/PDF (USD)", costs.average_display)
         by_class = summary.get("by_classification") or {}
-        st.table([{
-            "Files submitted": summary.get("files_processed", 0),
-            "Extracted": summary.get("extracted", 0),
-            "Needs review": summary.get("needs_review", 0),
-            "Failed/problem": summary.get("failed", 0),
-        }])
-        st.table([{
-            "Text-native": by_class.get("text-native", 0),
-            "Image-only": by_class.get("image-only", 0),
-            "Mixed": by_class.get("mixed", 0),
-            "Provider requests": summary.get("requests", 0),
-            "Repairs": summary.get("repairs", 0),
-            "Escalations": summary.get("escalations", 0),
-        }])
-        cost_line = f"Reported cost (USD): {summary.get('reported_cost', '0')}"
-        if summary.get("unknown_cost_requests"):
-            cost_line += (f" (incomplete: {summary['unknown_cost_requests']} "
-                          "unknown-cost request(s))")
-        st.caption(cost_line + f" - elapsed {summary.get('elapsed_seconds', 0)}s")
+        row2[3].metric("Text-native", by_class.get("text-native", 0))
+        row2[4].metric("Image-only", by_class.get("image-only", 0))
+        row2[5].metric("Repairs / escalations",
+                       f"{summary.get('repairs', 0)} / "
+                       f"{summary.get('escalations', 0)}")
+        if not costs.available:
+            st.caption("Reported cost unavailable - no provider request "
+                       "reported a cost for this run.")
+        elif costs.incomplete:
+            st.warning(ui_models.INCOMPLETE_COST_NOTE)
 
     review_rows = ui_models.needs_review_rows(status)
     if review_rows:
@@ -350,17 +373,19 @@ if status and state in TERMINAL_STATES:
     artifacts = ui_models.downloadable_artifacts(job_id)
     if not artifacts:
         st.caption("No downloadable artifacts (nothing was written).")
-    for name, content, mime in artifacts:
-        st.download_button(f"Download {name}", data=content, file_name=name,
-                           mime=mime, key=f"dl-{name}")
+    else:
+        dl_cols = st.columns(max(len(artifacts), 1))
+        for col, (name, content, mime) in zip(dl_cols, artifacts):
+            col.download_button(f"Download {name}", data=content,
+                                file_name=name, mime=mime, key=f"dl-{name}")
     st.caption("Uploaded source PDFs are not downloadable and are deleted "
                "with the job.")
 
-    if st.button("Delete job files now"):
-        if cleanup.delete_job(job_id):
-            st.session_state.pop("job_id", None)
-            st.session_state.pop("plans", None)
-            st.success("Job files deleted.")
+    # --- Start New Batch (only for a terminal job with no active worker) ---
+    if new_batch.can_start_new_batch(state, active):
+        st.divider()
+        delete_prev = st.checkbox("Delete previous job files", value=True)
+        if st.button("Start New Batch", type="primary"):
+            st.session_state["new_batch_msg"] = new_batch.start_new_batch(
+                st.session_state, job_id, delete_files=delete_prev)
             st.rerun()
-        else:
-            st.error("Could not delete this job right now.")

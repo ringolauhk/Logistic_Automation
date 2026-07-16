@@ -6,8 +6,13 @@ provider bodies, or paths.
 """
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 
 from apps.web.job_manager import ARTIFACT_ALLOWLIST, JobError, job_dir_for
+
+INCOMPLETE_COST_NOTE = ("Some provider requests did not report cost; the "
+                        "displayed total may be incomplete.")
+COST_UNAVAILABLE = "unavailable"
 
 
 @dataclass(frozen=True)
@@ -82,6 +87,55 @@ def compact_event_lines(events: list[dict], limit: int = 12) -> list[str]:
         elif kind == "job_cancelled":
             lines.append("Cancelled by operator")
     return lines[-limit:]
+
+
+@dataclass(frozen=True)
+class CostSummary:
+    """Display-ready cost figures for a finished (or partially finished)
+    batch. Derived ONLY from the run summary that the engine's single
+    cost-accounting path (usage records) already produced - no second
+    implementation, no estimation of missing dollar costs."""
+    available: bool
+    total_display: str            # reported USD total, or COST_UNAVAILABLE
+    average_display: str          # reported USD per submitted PDF, or "-"
+    requests: int
+    unknown_cost_requests: int
+    incomplete: bool              # some requests reported no cost
+    files_submitted: int
+    elapsed_display: str
+
+
+def cost_summary(status: dict) -> CostSummary:
+    """Safe cost roll-up from status.json's summary block. Cost counts as
+    available only when at least one provider request actually reported a
+    cost; otherwise the UI must say 'unavailable', never imply $0."""
+    summary = (status or {}).get("summary") or {}
+    requests = int(summary.get("requests") or 0)
+    unknown = int(summary.get("unknown_cost_requests") or 0)
+    files = int(summary.get("files_processed") or 0)
+    elapsed = summary.get("elapsed_seconds", 0)
+    try:
+        total = Decimal(str(summary.get("reported_cost")))
+    except (InvalidOperation, TypeError, ValueError):
+        total = None
+    available = total is not None and requests > 0 and unknown < requests
+    if available:
+        total_display = str(total)
+        average_display = (str((total / files).quantize(Decimal("0.000001")))
+                           if files > 0 else "-")
+    else:
+        total_display = COST_UNAVAILABLE
+        average_display = "-"
+    return CostSummary(
+        available=available,
+        total_display=total_display,
+        average_display=average_display,
+        requests=requests,
+        unknown_cost_requests=unknown,
+        incomplete=available and unknown > 0,
+        files_submitted=files,
+        elapsed_display=f"{elapsed}s",
+    )
 
 
 def needs_review_rows(status: dict) -> list[dict]:
