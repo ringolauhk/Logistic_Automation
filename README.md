@@ -63,8 +63,9 @@ docker compose build invoice-extractor-web
 docker compose up invoice-extractor-web        # http://localhost:8501
 ```
 
-There is **no login** — keep it bound to localhost (the compose default) or
-share it privately via Tailscale; public internet exposure is unsupported.
+There is **no login** — the compose default publishes port 8501 to the local
+network (LAN) for pilot users; keep that network trusted, or use Tailscale for
+remote access. Public internet exposure is unsupported.
 Uploads and results are stored temporarily per job and deleted after 24 hours.
 Full guide: [`docs/WEB_UI.md`](docs/WEB_UI.md).
 

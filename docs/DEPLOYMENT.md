@@ -219,14 +219,19 @@ docker compose up invoice-extractor-web        # http://localhost:8501
 - Separate image built from the `web` stage (`--target web`); the CLI stage is
   the Dockerfile's final/default stage, so plain `docker build .` still
   produces the CLI image.
-- The container binds the host port as `127.0.0.1:8501` only — never exposed
-  beyond the machine by default. For remote pilot users prefer
-  `tailscale serve 8501` (authenticated, private) over LAN binding.
+- The web service publishes host port `8501:8501` (all interfaces) so pilot
+  users on the trusted LAN reach it at `http://<host>:8501`. For off-LAN
+  pilots prefer `tailscale serve 8501` (authenticated, private); for
+  single-machine use rebind to `127.0.0.1:8501:8501`. Never expose it to the
+  public internet.
 - Job storage is `./web-data` on the host (`/data/jobs` in the container),
   git-ignored and excluded from build contexts; jobs are deleted after
   `WEB_JOB_RETENTION_HOURS` (default 24).
 - Runs as the same non-root user with `user: "${HOST_UID:-1000}:${HOST_GID:-1000}"`.
 - No login, no telemetry (`gatherUsageStats = false`), single active job.
+- Optional feature flag `TRANSFER_WORKFLOW_ENABLED=true` (in `.env`) adds the
+  Transfer Note Packing List workflow selector (Build 1: upload shell only —
+  see `docs/transfer_packing/FUNCTIONAL_SPEC.md`). Default off.
 
 Full usage, limits, cancellation, retention, and remote-access guidance:
 `docs/WEB_UI.md`.

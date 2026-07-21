@@ -262,11 +262,16 @@ class TestWebPackaging:
         for line in reqs:
             assert "==" in line, f"unpinned web dep: {line}"
 
-    def test_ar_at_compose_web_binds_localhost_only(self):
+    def test_ar_at_compose_web_publishes_8501_for_lan_access(self):
+        # Deliberate operator decision: the pilot web UI must be reachable
+        # from other machines on the LAN, so the web service publishes
+        # container port 8501 as host port 8501 (all interfaces) - and that
+        # is the compose file's ONLY published port.
         code = _code_lines("compose.yaml")
-        assert '"127.0.0.1:8501:8501"' in code          # host binding localhost
-        assert re.search(r'-\s*"0\.0\.0\.0', code) is None
-        assert re.search(r'-\s*"8501:8501"', code) is None  # no all-interfaces map
+        web_block = code.split("invoice-extractor-web:", 1)[1]
+        assert re.search(r'-\s*"8501:8501"', web_block)      # LAN binding
+        assert '"127.0.0.1:8501:8501"' not in code           # not localhost-only
+        assert len(re.findall(r'-\s*"[^"]*8501[^"]*"', code)) == 1  # only mapping
         assert "target: cli" in code and "target: web" in code
         assert "invoice-extractor-web:0.1.0" in code
         assert "./web-data:/data/jobs" in code

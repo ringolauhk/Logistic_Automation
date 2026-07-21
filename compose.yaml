@@ -11,7 +11,7 @@
 #   docker compose run --rm invoice-extractor run \
 #     --input /data/input --output /data/output/results.xlsx
 #
-# Web UI (single-user pilot, localhost-only by default):
+# Web UI (single-user pilot, published on host port 8501 for LAN access):
 #   docker compose up invoice-extractor-web
 #   open http://localhost:8501
 #
@@ -58,7 +58,7 @@ services:
     env_file:
       - .env
     ports:
-      - "8501:8501"   # localhost-only on the HOST by default
+      - "8501:8501"   # published on all host interfaces: LAN pilots reach it directly
     volumes:
       - ./web-data:/data/jobs   # per-job uploads/outputs (24h retention)
     stop_grace_period: 45s      # let a running extraction finish its SIGINT path

@@ -5,8 +5,8 @@ run, watch safe progress, download the results. It is a limited pilot tool,
 not a production platform.
 
 > **No login.** Anyone who can reach the port can upload invoices and trigger
-> **paid provider calls**. Keep it on localhost or Tailscale. Public internet
-> exposure is **unsupported**.
+> **paid provider calls**. Keep it on a trusted LAN, localhost, or Tailscale.
+> Public internet exposure is **unsupported**.
 
 > **Privacy.** During extraction, uploaded invoice content (text and rendered
 > page images) is sent to the configured external model provider. Uploads and
@@ -81,18 +81,32 @@ The active job is never deleted.
 
 ## Remote pilot access
 
-Keep the host binding on `127.0.0.1:8501` (the compose default) and prefer an
-**authenticated private proxy**:
+The compose default publishes host port `8501:8501` on all interfaces so
+pilot users on the **trusted LAN** can reach the app directly
+(`http://<host>:8501`) - anyone on that network can upload and spend, so keep
+the network trusted. For remote (off-LAN) pilots prefer an **authenticated
+private proxy**:
 
 ```bash
 # Tailscale Serve: private, authenticated, no port changes needed
 tailscale serve 8501
 ```
 
-Explicit LAN alternative (trusted networks only — understand that anyone on
-the LAN can then upload and spend): change the compose mapping to
-`"8501:8501"`. Do **not** expose the port to the public internet; that is
-unsupported (no login, no rate limiting, no HTTPS termination).
+Localhost-only alternative (single-machine use): change the compose mapping
+to `"127.0.0.1:8501:8501"`. Whatever the binding, do **not** expose the port
+to the public internet; that is unsupported (no login, no rate limiting, no
+HTTPS termination). Native `streamlit run` (without Docker) still binds
+localhost only.
+
+## Transfer Note Packing List (feature-flagged)
+
+A second, independent workflow — upload Transfer Delivery Note PDFs in
+carton order and create a Transfer Packing job (Build 1: upload + validation
+only; extraction and per-destination packing lists come in later builds).
+Hidden unless `TRANSFER_WORKFLOW_ENABLED=true`; the invoice workflow stays
+the default and is unchanged. Transfer jobs are stored separately under
+`web-data/transfer-jobs/` and are not auto-deleted in Build 1. Full details:
+`docs/transfer_packing/FUNCTIONAL_SPEC.md`.
 
 ## Troubleshooting
 
