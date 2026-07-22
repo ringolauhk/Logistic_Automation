@@ -34,6 +34,79 @@ Excel packing list per destination.
 `pluLabel-get` calls, access-token handling, carton resequencing, Excel
 generation, retention cleanup for transfer jobs, drag-and-drop reordering.
 
+## Build 2 scope (implemented)
+
+Deterministic extraction of the uploaded Transfer Delivery Notes - no LLM,
+no cloud calls, no internal API:
+
+- **Page classification per page** (never per PDF): usable embedded text ->
+  `embedded_text`; otherwise **local OCR** (`ocr`); failures -> `unreadable`
+  with a per-page issue. One bad page never discards the others.
+- **OCR fallback**: optional local engine (RapidOCR/onnxruntime - install
+  `requirements-ocr.txt` or the `transfer-ocr` extra). Pages are rendered in
+  memory only; no image is ever written to disk. Without the dependency,
+  scanned pages get `OCR_UNAVAILABLE` issues and text-native extraction
+  still works. Single-letter cells (Size S/M) that OCR page detection
+  misses are rescued by a recognition-only pass on the exact cell crop.
+- **Recognition**: weighted marker scoring (`TRANSFER DELIVERY NOTE`,
+  `IMAGINEX`, `D/N#`, `To Loc.`, `Pick Ref`, `EAN Code`, `Carton`,
+  `Batch`); OCR may miss markers - no single one is required. Unrecognized
+  PDFs are marked `UNRECOGNIZED_DOCUMENT`, never silently accepted.
+- **Header parsing** (per page, label-anchored geometry): Batch, From,
+  To Loc., Pick Ref, Carton, D/N#, Date, Page. Location values split into
+  UPPERCASED code + name with source casing preserved
+  (`ZZOHK101 Multi Brand(Outlet)-...` -> `ZZOHK101` + name). Dates
+  normalize day-first (`DD/MM/YYYY`) to ISO with the raw string kept.
+  Destinations are NEVER inferred from filenames; a page missing To Loc.
+  inherits only a document-unique destination (`destination_inherited`
+  recorded); conflicts raise `AMBIGUOUS_DESTINATION`.
+- **Carton parsing**: carton identity is the PRINTED carton number (leading
+  zeros preserved, never invented, never resequenced); a carton may span
+  consecutive pages; upload order then page order is retained everywhere.
+- **Item lines**: Seq/Item/EAN/Description/Retail Price/Color/Size/Quantity
+  with raw + normalized values per field. EAN stays a string (leading
+  zeros); quantities (`1 PCS`, `35 UNIT`) normalize to positive integers;
+  prices to decimals; malformed rows are retained with issues, never
+  dropped; rows keep source order; no merging/deduplication in this build.
+- **Total validation** (exact, quantities never adjusted): per-carton
+  `Carton Total` and per-document `Grand Total` compared against calculated
+  sums; missing printed totals are not errors; unreadable ones warn.
+- **Persistence**: `extraction/result.json` (schema_version 1) written
+  atomically inside the job directory; browser refresh recovers it; retry
+  replaces it atomically (never duplicates); one failed document never
+  erases another's results.
+- **Job states**: `READY_FOR_EXTRACTION -> EXTRACTING -> EXTRACTED |
+  EXTRACTED_WITH_ISSUES | FAILED` (validated transitions; a job stranded in
+  `EXTRACTING` by a restart can retry safely). Extraction runs
+  synchronously in the page - the pilot architecture - and is refresh-safe
+  after completion.
+
+### Issue codes (Build 2)
+
+`UNRECOGNIZED_DOCUMENT`, `UNREADABLE_PAGE`, `OCR_UNAVAILABLE`,
+`MISSING_DESTINATION`, `AMBIGUOUS_DESTINATION`, `MISSING_DELIVERY_NOTE_NO`,
+`MISSING_CARTON_NO`, `NO_ITEM_LINES`, `MISSING_ITEM_IDENTIFIER`,
+`INVALID_EAN`, `MISSING_COLOR`, `MISSING_SIZE`, `INVALID_QUANTITY`,
+`INVALID_RETAIL_PRICE`, `MALFORMED_ITEM_ROW`, `CARTON_TOTAL_MISMATCH`,
+`DOCUMENT_TOTAL_MISMATCH`, `PRINTED_TOTAL_UNREADABLE`,
+`DOCUMENT_EXTRACTION_FAILED`. Severity is `error` (blocks clean acceptance)
+or `warning` (kept for review).
+
+### Manual sample validation procedure
+
+With a real Transfer Delivery Note PDF available locally (never committed):
+install `requirements-ocr.txt`, enable the workflow, upload the PDF, create
+the job, press **Extract Transfer Notes**, and compare the extraction
+summary against the printed document: per-carton `Carton Total`, the
+`Grand Total`, carton numbers, D/N#, and To Loc. The reference sample
+(13 scanned pages, 12 cartons, 277 units) extracts with every carton total
+and the grand total matching exactly.
+
+**Not in Build 2** (explicitly): access-token retrieval, API-Gateway
+authentication, `pluLabel-get`, product enrichment, line consolidation,
+carton reassignment, delivery-invoice-number generation, Excel packing-list
+generation, editable correction UI (Build 3+).
+
 ## Upload order is a business rule
 
 Cartons follow **user upload order, then PDF page order**. The uploader's

@@ -14,13 +14,15 @@ workflow untouched and ships with offline tests.
   sequence; refresh recovery.
 - No OCR, AI, API-Gateway, or Excel logic.
 
-## Build 2 — Transfer Note extraction (planned)
+## Build 2 — Transfer Note extraction (this build)
 
-- Extract product/carton rows from stored PDFs (page order within each
-  file, file order across the job).
-- Progress/status protocol and worker reuse patterned on the invoice
-  pipeline's safe-events design; cancellation wired to the existing
-  framework.
+- Per-page classification (embedded text first; local OCR fallback via the
+  optional RapidOCR dependency; per-page failures isolated).
+- Deterministic recognition + header/carton/line parsing with raw values
+  preserved beside normalized ones; exact carton/document total validation.
+- Atomic, schema-versioned `extraction/result.json`; validated job-state
+  machine; safe synchronous retry; refresh recovery.
+- No API Gateway, no `pluLabel-get`, no carton resequencing, no Excel.
 
 ## Build 3 — product enrichment via API Gateway (planned)
 

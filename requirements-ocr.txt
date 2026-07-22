@@ -1,0 +1,14 @@
+# Optional local OCR for scanned Transfer Delivery Notes (Build 2).
+# Fully offline: RapidOCR runs ONNX models locally - no cloud provider is
+# involved. Install into the environment that runs the web UI:
+#   pip install -r requirements-ocr.txt
+# Exact pins captured from the validated development environment.
+rapidocr-onnxruntime==1.2.3
+onnxruntime==1.27.0
+opencv-python==5.0.0.93
+pyclipper==1.4.0
+shapely==2.1.2
+PyYAML==6.0.3
+six==1.17.0
+numpy==2.5.1
+pillow==12.3.0

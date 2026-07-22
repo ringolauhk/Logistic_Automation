@@ -230,6 +230,22 @@ def create_transfer_job(files: list[tuple[str, bytes]],
     return job_id
 
 
+def update_job_status(job_id: str, new_status: str) -> TransferPackingJob:
+    """Validated, atomic job-status transition (Build 2 state machine)."""
+    from apps.web.transfer.models import JOB_STATUSES, JOB_TRANSITIONS
+    job = load_transfer_job(job_id)
+    if job is None:
+        raise JobError("Unknown transfer job id.")
+    if new_status not in JOB_STATUSES:
+        raise JobError(f"Unknown transfer job status '{new_status}'.")
+    if new_status not in JOB_TRANSITIONS.get(job.status, ()):
+        raise JobError(
+            f"Invalid transfer job transition {job.status} -> {new_status}.")
+    job.status = new_status
+    _write_metadata(transfer_job_dir_for(job_id), job)
+    return job
+
+
 def load_transfer_job(job_id: str) -> TransferPackingJob | None:
     """Load a transfer job by id; None when absent/unreadable. Refuses
     metadata whose job_type is not transfer_packing (a foreign or tampered

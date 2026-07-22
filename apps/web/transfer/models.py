@@ -21,10 +21,32 @@ FILE_VALIDATED = "VALIDATED"
 FILE_INVALID = "INVALID"
 
 JOB_READY_FOR_EXTRACTION = "READY_FOR_EXTRACTION"
+JOB_EXTRACTING = "EXTRACTING"
+JOB_EXTRACTED = "EXTRACTED"
+JOB_EXTRACTED_WITH_ISSUES = "EXTRACTED_WITH_ISSUES"
 JOB_CANCELLED = "CANCELLED"
 JOB_FAILED = "FAILED"
 
-JOB_STATUSES = (JOB_READY_FOR_EXTRACTION, JOB_CANCELLED, JOB_FAILED)
+JOB_STATUSES = (JOB_READY_FOR_EXTRACTION, JOB_EXTRACTING, JOB_EXTRACTED,
+                JOB_EXTRACTED_WITH_ISSUES, JOB_CANCELLED, JOB_FAILED)
+
+# Validated transitions (Build 2). EXTRACTING -> EXTRACTING is allowed so a
+# retry can recover a job stranded mid-extraction by a server restart
+# (extraction is synchronous; results are only persisted atomically at the
+# end, so re-entry never duplicates anything).
+JOB_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    JOB_READY_FOR_EXTRACTION: (JOB_EXTRACTING, JOB_CANCELLED),
+    JOB_EXTRACTING: (JOB_EXTRACTING, JOB_EXTRACTED,
+                     JOB_EXTRACTED_WITH_ISSUES, JOB_FAILED, JOB_CANCELLED),
+    JOB_EXTRACTED: (JOB_EXTRACTING, JOB_CANCELLED),
+    JOB_EXTRACTED_WITH_ISSUES: (JOB_EXTRACTING, JOB_CANCELLED),
+    JOB_FAILED: (JOB_EXTRACTING, JOB_CANCELLED),
+    JOB_CANCELLED: (),
+}
+
+# Statuses from which the user may start (or retry) extraction.
+EXTRACTABLE_STATUSES = (JOB_READY_FOR_EXTRACTION, JOB_EXTRACTED,
+                        JOB_EXTRACTED_WITH_ISSUES, JOB_FAILED, JOB_EXTRACTING)
 
 # --- machine-readable validation codes --------------------------------------------
 

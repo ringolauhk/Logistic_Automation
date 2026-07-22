@@ -101,8 +101,12 @@ localhost only.
 ## Transfer Note Packing List (feature-flagged)
 
 A second, independent workflow — upload Transfer Delivery Note PDFs in
-carton order and create a Transfer Packing job (Build 1: upload + validation
-only; extraction and per-destination packing lists come in later builds).
+carton order, create a Transfer Packing job, and (Build 2) run local
+deterministic extraction: embedded text first, optional local OCR for
+scanned pages (`pip install -r requirements-ocr.txt` — no cloud calls),
+carton/item parsing with exact printed-total validation, and a read-only
+review summary that survives browser refresh. Per-destination packing lists
+come in later builds.
 Hidden unless `TRANSFER_WORKFLOW_ENABLED=true`; the invoice workflow stays
 the default and is unchanged. Transfer jobs are stored separately under
 `web-data/transfer-jobs/` and are not auto-deleted in Build 1. Full details:
