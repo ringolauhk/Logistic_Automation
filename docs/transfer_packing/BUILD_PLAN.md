@@ -35,14 +35,26 @@ workflow untouched and ships with offline tests.
 - No API Gateway, no `pluLabel-get`, no resequencing, no consolidation,
   no Excel.
 
-## Build 4 — product enrichment via API Gateway (planned)
+## Build 4 — API Gateway authentication client (this build)
 
-- Access-token acquisition, then `pluLabel-get` lookups: EAN primary,
-  Item + Color + Size fallback.
+- Reusable backend-only auth layer per the confirmed v0.851 contract:
+  login (`client`/`userId`/`password`/`locale`), refresh (`rt`), envelope
+  `code == 100000` validation on top of HTTP status, `expire_in` expiry
+  with skew, spec-compliant refresh-token rotation.
+- Process-local thread-safe in-memory token cache (no persistence, no
+  browser exposure); narrow transport-only retries; one re-login fallback
+  after a rejected refresh; typed redacted errors; config-only readiness
+  status in the UI. No `pluLabel-get` call exists.
+
+## Build 5 — product enrichment via API Gateway (planned)
+
+- `pluLabel-get` lookups using the Build 4 auth client: EAN primary,
+  Item + Color + Size fallback; one batch retry after 401 via
+  `handle_unauthorized()`.
 - Analysis Code 01–15 and Composition #1–4 captured per item.
 - Offline tests against a loopback mock gateway only.
 
-## Build 5 — grouping, carton renumbering, packing lists (planned)
+## Build 6 — grouping, carton renumbering, packing lists (planned)
 
 - Group by To Loc.; carton numbers restart at 001 per destination.
 - Identical item/color/size rows combine only within a carton; identical

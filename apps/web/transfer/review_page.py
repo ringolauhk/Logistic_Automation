@@ -33,6 +33,27 @@ def _fmt(value) -> str:
     return "" if value is None else str(value)
 
 
+def _render_auth_readiness() -> None:
+    """Backend-only configuration status for the future product lookup.
+    Config check only - NO network request happens on render, and no
+    credential value is ever displayed."""
+    from apps.web.transfer.gateway_auth import readiness
+    state = readiness()
+    label = {"configured": "Configured",
+             "not_configured": "Not configured",
+             "configuration_error": "Configuration error"}[state["status"]]
+    st.markdown("**Product API authentication:** " + label)
+    if state["status"] == "configured":
+        st.caption("Product lookup will be added in Build 5. Credentials "
+                   "stay on the server; nothing is shown here.")
+    else:
+        # problem strings contain variable NAMES only - never values
+        st.caption("Set the API_GATEWAY_* variables in the server's "
+                   "environment (see docs/DEPLOYMENT.md): "
+                   + " ".join(state["problems"])
+                   + " Product lookup will be added in Build 5.")
+
+
 def render_review_section(job, result: TransferExtractionResult) -> None:
     st.header("Review & correct")
     st.caption("Original extracted values stay stored unchanged; your "
@@ -67,6 +88,7 @@ def render_review_section(job, result: TransferExtractionResult) -> None:
     elif job.status == JOB_READY_FOR_PRODUCT_LOOKUP:
         st.success("Approved - ready for product lookup (a later build). "
                    "Editing below reopens the review.")
+        _render_auth_readiness()
 
     # --- G. validation summary ----------------------------------------------------
     r1 = st.columns(6)

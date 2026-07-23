@@ -198,6 +198,73 @@ refresh (`/auth/login`, `/auth/refresh`), `pluLabel-get`, product
 enrichment, Analysis Code / Composition values, carton resequencing, line
 consolidation, delivery-invoice numbering, Excel output.
 
+## Build 4 scope (implemented): API Gateway authentication client
+
+A reusable, backend-only authentication layer for the future product
+lookup. **No product endpoint is called in Build 4.**
+
+### Confirmed contract (ImagineX API Gateway spec v0.851-CorpTools +
+### working label-print integration)
+
+- `POST {base}/auth/login` with
+  `{"client": "<id>", "userId": "<user>", "password": "<pass>",
+  "locale": "en-US"}`; `POST {base}/auth/refresh` with `{"rt": "<refresh>"}`.
+- Envelope: `{status, code, reason (fallback message/msg), note, data}`.
+  **Success = HTTP 2xx AND `code == 100000`** (HTTP 200 alone is not
+  success). Failed login example: `code = 100001`.
+- Token data: `data.accessToken` (JWT), `data.refreshToken`,
+  `data.expire_in` (access-token lifetime in seconds; number or numeric
+  string). Refresh may rotate the refresh token near its end of life; a
+  stored refresh token is **never overwritten by an empty/null**
+  replacement (spec rule). Expired refresh token -> HTTP 401 -> re-login.
+
+### Architecture (`apps/web/transfer/gateway_auth.py`)
+
+`ApiGatewayAuthConfig` + env loader; `ApiGatewayCredentials`
+(repr-suppressed); `ApiGatewayTokenSet` (obtained_at/expires_at with
+configurable expiry skew; no expiry info -> valid until invalidated);
+`TokenCache` - **process-local, thread-safe, in-memory only** (each app
+process/container maintains its own cache; nothing is persisted to disk,
+Streamlit session state, job JSON, review JSON, or the browser);
+`AuthTransport` protocol with an httpx production implementation and fake
+transports in tests; `ApiGatewayAuthClient` with `login()`, `refresh()`,
+`ensure_access_token()` (cached -> refresh -> login; a definitively
+rejected refresh clears stale state and falls back to exactly ONE fresh
+login; concurrent callers serialize on the cache lock and reuse the first
+result), `invalidate_access_token()`, `clear_tokens()`, and the Build 5
+hooks `get_authorization_header()` / `handle_unauthorized()` (invalidate +
+re-acquire; Build 5 will retry a failed product batch once).
+
+### Retry policy
+
+Only transport timeouts/failures and HTTP 5xx are retried, capped by
+`API_GATEWAY_MAX_AUTH_RETRIES` with short injected backoff. HTTP 4xx and
+gateway-level rejections are never retried. No recursion, no loops.
+
+### Typed errors + redaction
+
+Stable error codes: `AUTH_CONFIGURATION_ERROR`, `AUTH_TRANSPORT_ERROR`,
+`AUTH_TIMEOUT`, `AUTH_RESPONSE_INVALID`, `AUTH_GATEWAY_REJECTED`,
+`AUTH_LOGIN_FAILED`, `AUTH_REFRESH_FAILED`, `AUTH_TOKEN_MISSING`,
+`AUTH_TOKEN_EXPIRED`, `AUTH_ACCESS_DENIED`, `AUTH_RETRY_EXHAUSTED` - each
+carrying operation, HTTP status, gateway code, and a retryable flag.
+Central `redact()` removes values under sensitive keys (case-insensitive:
+password, access_token/accessToken, refresh_token/refreshToken,
+authorization, token, secret, and the refresh body key `rt`). Errors and
+logs never contain credentials or token values, even partially.
+
+### Readiness
+
+`readiness()` validates configuration WITHOUT any network call and powers
+the UI status on `READY_FOR_PRODUCT_LOOKUP` jobs: Configured /
+Not configured / Configuration error (variable names only - never values).
+Job states are unchanged; authentication stays internal until Build 5.
+
+**Not in Build 4** (explicitly): `pluLabel-get`, EAN or Item+Color+Size
+lookup, product enrichment, Analysis Code 01-15, Composition #1-4,
+source/API comparison, line consolidation, carton resequencing,
+delivery-invoice numbering, packing-list Excel output.
+
 ## Upload order is a business rule
 
 Cartons follow **user upload order, then PDF page order**. The uploader's

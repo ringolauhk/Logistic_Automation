@@ -230,8 +230,13 @@ docker compose up invoice-extractor-web        # http://localhost:8501
 - Runs as the same non-root user with `user: "${HOST_UID:-1000}:${HOST_GID:-1000}"`.
 - No login, no telemetry (`gatherUsageStats = false`), single active job.
 - Optional feature flag `TRANSFER_WORKFLOW_ENABLED=true` (in `.env`) adds the
-  Transfer Note Packing List workflow selector (Build 1: upload shell only —
-  see `docs/transfer_packing/FUNCTIONAL_SPEC.md`). Default off.
+  Transfer Note Packing List workflow selector (see
+  `docs/transfer_packing/FUNCTIONAL_SPEC.md`). Default off.
+- The Transfer workflow's future product lookup uses BACKEND-ONLY
+  `API_GATEWAY_*` variables (see `.env.example`): keep credentials in the
+  server's `.env` only — never in Docker image layers, never in the browser.
+  Gateway tokens are held in process memory per container and are never
+  persisted; restarting a container simply re-authenticates.
 
 Full usage, limits, cancellation, retention, and remote-access guidance:
 `docs/WEB_UI.md`.
