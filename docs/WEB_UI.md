@@ -111,8 +111,12 @@ to `READY_FOR_PRODUCT_LOOKUP`, then (Build 5) run **Product lookup**:
 deduplicated, batched `pluLabel-get` calls through the server-side API
 Gateway client (EAN first, Item+Color+Size fallback), with a reviewable
 enrichment table (Analysis Codes, Compositions, source-vs-API comparison,
-issues) that survives refresh. Tokens and credentials never reach the
-browser. Per-destination packing lists come in later builds.
+issues) that survives refresh, then (Build 6) **Prepare Packing Groups**:
+destination grouping by To Loc., carton renumbering from 001 per
+destination (originals kept), same-carton consolidation, and one delivery
+invoice number per destination - all local and deterministic. Tokens and
+credentials never reach the browser. Excel workbook generation comes in a
+later build.
 Hidden unless `TRANSFER_WORKFLOW_ENABLED=true`; the invoice workflow stays
 the default and is unchanged. Transfer jobs are stored separately under
 `web-data/transfer-jobs/` and are not auto-deleted in Build 1. Full details:

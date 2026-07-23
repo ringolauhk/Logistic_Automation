@@ -53,6 +53,10 @@ from apps.web.transfer.extraction_models import (
 from apps.web.transfer.models import (
     JOB_EXTRACTED,
     JOB_EXTRACTED_WITH_ISSUES,
+    JOB_PACKING_PREPARATION_COMPLETE,
+    JOB_PACKING_PREPARATION_FAILED,
+    JOB_PACKING_PREPARATION_IN_PROGRESS,
+    JOB_PACKING_PREPARATION_WITH_ISSUES,
     JOB_PRODUCT_LOOKUP_COMPLETE,
     JOB_PRODUCT_LOOKUP_FAILED,
     JOB_PRODUCT_LOOKUP_IN_PROGRESS,
@@ -87,7 +91,11 @@ REVIEWABLE_JOB_STATUSES = (JOB_EXTRACTED, JOB_EXTRACTED_WITH_ISSUES,
                            JOB_PRODUCT_LOOKUP_IN_PROGRESS,
                            JOB_PRODUCT_LOOKUP_COMPLETE,
                            JOB_PRODUCT_LOOKUP_WITH_ISSUES,
-                           JOB_PRODUCT_LOOKUP_FAILED)
+                           JOB_PRODUCT_LOOKUP_FAILED,
+                           JOB_PACKING_PREPARATION_IN_PROGRESS,
+                           JOB_PACKING_PREPARATION_COMPLETE,
+                           JOB_PACKING_PREPARATION_WITH_ISSUES,
+                           JOB_PACKING_PREPARATION_FAILED)
 
 # Conservative EAN rule (matches the source documents observed so far):
 # digits only after trimming, 8-14 digits, leading zeros preserved.

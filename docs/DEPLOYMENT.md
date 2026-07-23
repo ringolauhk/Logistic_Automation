@@ -237,7 +237,9 @@ docker compose up invoice-extractor-web        # http://localhost:8501
   keep credentials in the server's `.env` only — never in Docker image
   layers, never in the browser. Gateway tokens are held in process memory
   per container and are never persisted; restarting a container simply
-  re-authenticates on the next lookup.
+  re-authenticates on the next lookup. Packing preparation (Build 6) is
+  fully local and configured by the optional `PACKING_*` variables (see
+  `.env.example`).
 
 Full usage, limits, cancellation, retention, and remote-access guidance:
 `docs/WEB_UI.md`.

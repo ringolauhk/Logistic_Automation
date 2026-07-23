@@ -58,12 +58,20 @@ workflow untouched and ships with offline tests.
   `product_lookup/result.json` guarded by the review checksum.
 - No grouping, renumbering, consolidation, invoice numbering, or Excel.
 
-## Build 6 — grouping, carton renumbering, packing lists (planned)
+## Build 6 — packing preparation (this build)
 
-- Group by To Loc.; carton numbers restart at 001 per destination.
-- Identical item/color/size rows combine only within a carton; identical
-  products stay separate across cartons.
-- One Excel workbook and one delivery invoice number per destination;
-  configurable customer mappings.
-- Download surface via the existing artifact-allowlist pattern; retention
-  cleanup for transfer jobs.
+- Destination grouping by effective To Loc. (first-appearance order);
+  carton order = upload then page order; renumbering restarts at 001 per
+  destination with originals kept auditable.
+- Same-carton consolidation on authoritative API identity (quantities
+  summed, source line IDs traceable); cross-carton/destination merging
+  structurally impossible.
+- One deterministic delivery invoice number per destination
+  (job-scoped uniqueness only in the pilot); atomic, checksum-guarded
+  `packing/result.json` with stale archival; no API/Excel/ZIP.
+
+## Build 7 — workbook generation and delivery (planned)
+
+- One Excel workbook per destination from the packing preparation;
+  customer Analysis Code / Composition mapping; download surface via the
+  artifact-allowlist pattern; retention cleanup for transfer jobs.

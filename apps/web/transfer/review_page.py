@@ -34,17 +34,32 @@ def _fmt(value) -> str:
 
 
 from apps.web.transfer.models import (          # noqa: E402
+    JOB_PACKING_PREPARATION_COMPLETE,
+    JOB_PACKING_PREPARATION_FAILED,
+    JOB_PACKING_PREPARATION_IN_PROGRESS,
+    JOB_PACKING_PREPARATION_WITH_ISSUES,
     JOB_PRODUCT_LOOKUP_COMPLETE,
     JOB_PRODUCT_LOOKUP_FAILED,
     JOB_PRODUCT_LOOKUP_IN_PROGRESS,
     JOB_PRODUCT_LOOKUP_WITH_ISSUES,
 )
 
+_PACKING_STATES = (JOB_PRODUCT_LOOKUP_COMPLETE,
+                   JOB_PRODUCT_LOOKUP_WITH_ISSUES,
+                   JOB_PACKING_PREPARATION_IN_PROGRESS,
+                   JOB_PACKING_PREPARATION_COMPLETE,
+                   JOB_PACKING_PREPARATION_WITH_ISSUES,
+                   JOB_PACKING_PREPARATION_FAILED)
+
 _PRODUCT_STATES = (JOB_READY_FOR_PRODUCT_LOOKUP,
                    JOB_PRODUCT_LOOKUP_IN_PROGRESS,
                    JOB_PRODUCT_LOOKUP_COMPLETE,
                    JOB_PRODUCT_LOOKUP_WITH_ISSUES,
-                   JOB_PRODUCT_LOOKUP_FAILED)
+                   JOB_PRODUCT_LOOKUP_FAILED) + (
+                       JOB_PACKING_PREPARATION_IN_PROGRESS,
+                       JOB_PACKING_PREPARATION_COMPLETE,
+                       JOB_PACKING_PREPARATION_WITH_ISSUES,
+                       JOB_PACKING_PREPARATION_FAILED)
 
 
 def _render_product_lookup_section(job, result, review) -> None:
@@ -235,6 +250,8 @@ def render_review_section(job, result: TransferExtractionResult) -> None:
                    "reopens the review and makes any enrichment stale.")
     if job.status in _PRODUCT_STATES:
         _render_product_lookup_section(job, result, review)
+    if job.status in _PACKING_STATES:
+        _render_packing_section(job)
 
     # --- G. validation summary ----------------------------------------------------
     r1 = st.columns(6)
@@ -426,3 +443,137 @@ def render_review_section(job, result: TransferExtractionResult) -> None:
                        + (" ..." if len(ev.approval_problems) > 3 else ""))
     if st.session_state.get("transfer_review_msg"):
         st.success(st.session_state.pop("transfer_review_msg"))
+
+
+def _render_packing_section(job) -> None:
+    """Build 6: prepare and review packing groups. Everything is local and
+    deterministic - no API call, no Excel/ZIP output (later builds)."""
+    from apps.web.transfer import packing as pk
+
+    st.header("Prepare packing groups")
+    prepared = pk.load_preparation(job.job_id)
+
+    stats = None
+    problems: list[str] = []
+    try:
+        config = pk.load_packing_config()
+        stats = pk.preview(job.job_id)
+    except Exception as exc:
+        problems = [str(exc)]
+
+    if stats is not None:
+        row = st.columns(6)
+        row[0].metric("Destinations", len(stats["destinations"]))
+        row[1].metric("Source cartons", stats["source_cartons"])
+        row[2].metric("Eligible lines", stats["eligible_lines"])
+        row[3].metric("Blocked lines", stats["blocked_lines"])
+        row[4].metric("Total units", stats["total_units"])
+        row[5].metric("Carton start",
+                      pk.format_carton_number(config.carton_start, config))
+        st.caption("Destinations (first-appearance order): "
+                   + (", ".join(stats["destinations"]) or "-")
+                   + f" | Numbering restarts at "
+                     f"{pk.format_carton_number(config.carton_start, config)}"
+                     " per destination | Delivery invoice format: "
+                   + config.summary()["invoice_format"])
+    for problem in problems[:3]:
+        st.error(problem)
+
+    run_disabled = (stats is None or stats["eligible_lines"] == 0
+                    or bool(problems))
+    label = ("Rerun Packing Preparation" if prepared is not None
+             else "Prepare Packing Groups")
+    if job.status == "PACKING_PREPARATION_IN_PROGRESS":
+        st.warning("A previous preparation did not finish; rerunning is "
+                   "safe (results are written once, atomically).")
+    if st.button(label, type="primary", disabled=run_disabled):
+        try:
+            with st.spinner("Grouping, renumbering, and consolidating "
+                            "locally (no API calls)..."):
+                pk.prepare_packing(job.job_id)
+        except Exception as exc:
+            st.error(str(exc))
+        st.rerun()
+
+    if prepared is None:
+        st.caption("Preparation output: one destination package per future "
+                   "workbook - grouped by To Loc., cartons renumbered from "
+                   "001 per destination, same-carton duplicate lines "
+                   "combined. Excel generation arrives in a later build.")
+        return
+
+    if prepared.get("stale"):
+        st.warning("The review or product enrichment changed after this "
+                   "preparation ran - rerun preparation before any later "
+                   "packing-list step.")
+
+    summary = prepared.get("summary") or {}
+    st.subheader("Destination summary")
+    r1 = st.columns(6)
+    r1[0].metric("Destinations", summary.get("destinations", 0))
+    r1[1].metric("Cartons", summary.get("generated_cartons", 0))
+    r1[2].metric("Source lines", summary.get("source_lines", 0))
+    r1[3].metric("Prepared lines", summary.get("prepared_lines", 0))
+    r1[4].metric("Consolidated rows", summary.get("consolidated_rows", 0))
+    r1[5].metric("Total units", summary.get("total_units", 0))
+    st.caption(f"Status: {prepared.get('status')} | Blocking: "
+               f"{summary.get('blocking_issues', 0)} | Warnings: "
+               f"{summary.get('warning_issues', 0)}")
+
+    st.table([{
+        "Destination": g["destination_code"],
+        "Name": g.get("destination_name") or "-",
+        "Delivery invoice no.": g["delivery_invoice_number"],
+        "Cartons": g["generated_carton_count"],
+        "Prepared lines": g["prepared_line_count"],
+        "Units": g["total_units"],
+        "Blocked": "YES" if g.get("blocked") else "-",
+        "Future workbook": g["suggested_workbook_filename"],
+    } for g in prepared.get("destinations", [])])
+
+    with st.expander("Carton mapping (original -> generated)"):
+        st.table([{
+            "Destination": m["destination_code"],
+            "Generated carton": m["generated_carton_number"],
+            "Original carton": m["original_carton_number"] or "?",
+            "Upload seq": m["source_carton_key"]["upload_sequence"],
+            "Source file": m["source_carton_key"]["source_file"],
+            "First page": m["source_carton_key"]["first_source_page"],
+            "D/N": m["source_carton_key"]["delivery_note_number"] or "-",
+            "Lines": m["line_count"],
+        } for g in prepared.get("destinations", [])
+            for m in g.get("carton_mappings", [])])
+
+    with st.expander("Prepared lines (consolidated)"):
+        st.dataframe([{
+            "Destination": ln["destination_code"],
+            "Carton": ln["generated_carton_number"],
+            "Original carton": ln["original_carton_number"],
+            "API item": ln["product"].get("item_code"),
+            "API EAN": ln["product"].get("ean"),
+            "PLU": ln["product"].get("plu"),
+            "Description": ln["product"].get("item_desc"),
+            "Color": ln["product"].get("color_code"),
+            "Color desc": ln["product"].get("color_desc"),
+            "Size": ln["product"].get("size_code"),
+            "Qty": ln["quantity"],
+            "Source rows": ln["source_rows"],
+            "Source line IDs": ", ".join(ln["source_line_ids"]),
+        } for g in prepared.get("destinations", [])
+            for ln in g.get("prepared_lines", [])], height=360)
+
+    issues = prepared.get("issues", [])
+    if issues:
+        st.subheader(f"Packing preparation issues ({len(issues)})")
+        st.table([{
+            "Severity": i.get("severity"),
+            "Code": i.get("code"),
+            "Destination": i.get("destination") or "-",
+            "Line": i.get("line_id") or "-",
+            "File": i.get("source_file") or "-",
+            "Message": i.get("message"),
+        } for i in issues[:300]])
+    st.caption("Original carton numbers stay auditable above; API and "
+               "reviewed values remain stored separately. Workbook "
+               "generation arrives in a later build - no files are created "
+               "here.")

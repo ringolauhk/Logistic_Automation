@@ -368,6 +368,78 @@ resequencing, same-carton line consolidation, delivery-invoice numbering,
 customer attribute mapping (which Analysis Code means lc_style etc. is a
 later build), Excel generation, ZIP output.
 
+## Build 6 scope (implemented): packing preparation
+
+Deterministic, fully local transformation of the enriched data into one
+destination package per future workbook. **No API call, no Excel, no ZIP.**
+Artifact: `packing/result.json` (schema_version 1, atomic); upstream
+artifacts are never modified.
+
+### Input boundary
+
+Preparation requires: readable extraction; APPROVED review whose checksum
+matches the extraction; a current (non-stale, well-formed, non-failed)
+product enrichment; a preparable job state; and at least one eligible line.
+Stale/malformed/unapproved inputs are refused - there is no fallback to raw
+extraction values. **Blocking policy:** line-scoped blocking product issues
+(not found, multiple matches, identity mismatch) make those lines
+ineligible (`PACKING_LINE_BLOCKED_BY_PRODUCT_ISSUE`) and mark their
+destination `PACKING_DESTINATION_BLOCKED` (result `WITH_ISSUES`); warnings
+never block; nothing disappears silently.
+
+### Grouping, carton identity, ordering
+
+Groups form on the effective reviewed `To Loc.` code (trimmed, uppercased,
+never inferred from filenames); the destination name is the reviewed
+effective name. Destination order = first appearance in upload -> page ->
+line order (not alphabetical). Source-carton identity is the Build 3 carton
+entity (unique per document) plus a persisted source key (upload sequence,
+file, D/N, original number, first page) - original carton `001` reused
+across files stays distinct. Cartons order by (upload sequence, first
+source page, first line, original number as final tie-break); a carton
+spanning pages stays one carton.
+
+### Resequencing and consolidation
+
+Generated numbers restart at `PACKING_CARTON_START` (default 1) per
+destination, zero-padded to `PACKING_CARTON_PAD_WIDTH` (default 3, so
+`001`), growing past 999 (1000, 1001) without wrapping; the original
+number is stored beside the generated one and never overwritten.
+Identical lines combine ONLY within one generated carton, on the
+authoritative API identity (item + color + size + EAN/PLU, destination in
+the key for safety): quantities sum, contributing reviewed line IDs and
+full source references are retained in first-seen order. Never merged:
+across cartons, across destinations, by description alone, or when API
+identity fields are incomplete (`PACKING_PRODUCT_IDENTITY_INCOMPLETE`
+warning keeps the line separate); identical identity resolving to two
+different product records raises `PACKING_CONSOLIDATION_CONFLICT`.
+
+### Delivery invoice numbers
+
+One per destination: `<PACKING_INVOICE_PREFIX>-<DEST>-<YYYYMMDD>-<SEQ>`
+(default prefix `PL`; SEQ = first-appearance destination sequence, 3
+digits). Generated server-side at first successful preparation and carried
+forward VERBATIM on unchanged reruns and refreshes (checksum-matched
+against the prior artifact). **Pilot limitation: uniqueness is per job
+only** - there is no global counter. Suggested future filename:
+`Packing_List_<Destination>_<InvoiceNo>.xlsx` (name only; no file is
+created).
+
+### Staleness and states
+
+`packing/result.json` stores the extraction, review, and product-lookup
+checksums; any upstream change marks it stale, and the next run archives
+it as `result-stale-<ts>.json`. Job states:
+`PRODUCT_LOOKUP_COMPLETE | PRODUCT_LOOKUP_WITH_ISSUES ->
+PACKING_PREPARATION_IN_PROGRESS -> PACKING_PREPARATION_COMPLETE |
+PACKING_PREPARATION_WITH_ISSUES | PACKING_PREPARATION_FAILED`, with
+validated retries (including stranded IN_PROGRESS) and explicit rerun from
+COMPLETE until workbook generation exists.
+
+**Not in Build 6** (explicitly): final workbook generation, Excel
+formatting/styling, customer Analysis Code mapping, ZIP output, printing,
+production deployment changes.
+
 ## Upload order is a business rule
 
 Cartons follow **user upload order, then PDF page order**. The uploader's
