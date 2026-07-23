@@ -33,25 +33,170 @@ def _fmt(value) -> str:
     return "" if value is None else str(value)
 
 
-def _render_auth_readiness() -> None:
-    """Backend-only configuration status for the future product lookup.
-    Config check only - NO network request happens on render, and no
-    credential value is ever displayed."""
-    from apps.web.transfer.gateway_auth import readiness
-    state = readiness()
+from apps.web.transfer.models import (          # noqa: E402
+    JOB_PRODUCT_LOOKUP_COMPLETE,
+    JOB_PRODUCT_LOOKUP_FAILED,
+    JOB_PRODUCT_LOOKUP_IN_PROGRESS,
+    JOB_PRODUCT_LOOKUP_WITH_ISSUES,
+)
+
+_PRODUCT_STATES = (JOB_READY_FOR_PRODUCT_LOOKUP,
+                   JOB_PRODUCT_LOOKUP_IN_PROGRESS,
+                   JOB_PRODUCT_LOOKUP_COMPLETE,
+                   JOB_PRODUCT_LOOKUP_WITH_ISSUES,
+                   JOB_PRODUCT_LOOKUP_FAILED)
+
+
+def _render_product_lookup_section(job, result, review) -> None:
+    """Build 5: plan, run, and review product enrichment. Configuration
+    checks and planning are local; the API is called ONLY when the user
+    presses Run/Retry. No token or credential ever reaches this page."""
+    from apps.web.transfer import product_lookup as pl
+
+    st.header("Product lookup")
+    state = pl.readiness()
     label = {"configured": "Configured",
              "not_configured": "Not configured",
              "configuration_error": "Configuration error"}[state["status"]]
     st.markdown("**Product API authentication:** " + label)
-    if state["status"] == "configured":
-        st.caption("Product lookup will be added in Build 5. Credentials "
-                   "stay on the server; nothing is shown here.")
-    else:
+    if state["status"] != "configured":
         # problem strings contain variable NAMES only - never values
-        st.caption("Set the API_GATEWAY_* variables in the server's "
-                   "environment (see docs/DEPLOYMENT.md): "
-                   + " ".join(state["problems"])
-                   + " Product lookup will be added in Build 5.")
+        st.caption("Set the API_GATEWAY_* / PRODUCT_LOOKUP_* variables in "
+                   "the server's environment (see docs/DEPLOYMENT.md): "
+                   + " ".join(state["problems"]))
+
+    enrichment = pl.load_enrichment(job.job_id)
+
+    plan = None
+    plan_problems: list[str] = []
+    try:
+        config = pl.load_product_config()
+        plan = pl.build_plan(job.job_id, config)
+        plan_problems = list(plan.planning_problems)
+    except Exception as exc:                      # JobError / ProductError
+        plan_problems = [str(exc)]
+
+    if plan is not None:
+        row = st.columns(6)
+        row[0].metric("Reviewed lines", plan.line_count)
+        row[1].metric("Unique lookups", len(plan.lookups))
+        row[2].metric("EAN lines", plan.ean_lines)
+        row[3].metric("Fallback-ready", plan.fallback_ready_lines)
+        row[4].metric("No identifier", plan.no_identifier_lines)
+        row[5].metric("Batch size", config.batch_size)
+        st.caption("Location(s): " + (", ".join(plan.locations) or "-")
+                   + " | PriceDate(s): " + (", ".join(plan.price_dates) or "-")
+                   + " | Qty policy: 1 (lookup-only)")
+    for problem in plan_problems[:3]:
+        st.error(problem)
+
+    run_disabled = (state["status"] != "configured" or plan is None
+                    or bool(plan_problems) or plan.line_count == 0)
+    run_label = ("Retry Product Lookup"
+                 if job.status in (JOB_PRODUCT_LOOKUP_FAILED,
+                                   JOB_PRODUCT_LOOKUP_WITH_ISSUES,
+                                   JOB_PRODUCT_LOOKUP_IN_PROGRESS)
+                 or enrichment is not None
+                 else "Run Product Lookup")
+    if job.status == JOB_PRODUCT_LOOKUP_IN_PROGRESS:
+        st.warning("A previous product lookup did not finish; retrying is "
+                   "safe (results are written once, atomically).")
+    if st.button(run_label, type="primary", disabled=run_disabled):
+        progress = st.progress(0.0, text="Contacting the product API...")
+
+        def on_progress(stage, batch_number, total, count):
+            progress.progress(min(batch_number / max(total, 1), 1.0),
+                              text=f"{stage} batch {batch_number}/{total} "
+                                   f"({count} request(s))")
+
+        try:
+            with st.spinner("Looking up products via the internal API "
+                            "Gateway..."):
+                pl.run_product_lookup(job.job_id, on_progress=on_progress)
+        except Exception as exc:
+            st.error(str(exc))
+        st.rerun()
+
+    if enrichment is None:
+        st.caption("Lookup output: authoritative product attributes "
+                   "(including Analysis Codes and Compositions) per "
+                   "reviewed line. Destination grouping, carton "
+                   "renumbering, and Excel packing lists arrive in later "
+                   "builds.")
+        return
+
+    if enrichment.get("stale"):
+        st.warning("The review changed after this product lookup ran - the "
+                   "enrichment below is stale and packing-list generation "
+                   "will require a fresh lookup.")
+
+    summary = enrichment.get("summary") or {}
+    st.subheader("Lookup summary")
+    r1 = st.columns(6)
+    r1[0].metric("Lines", summary.get("lines", 0))
+    r1[1].metric("Matched", summary.get("matched_lines", 0))
+    r1[2].metric("Via fallback", summary.get("matched_via_fallback", 0))
+    r1[3].metric("Unmatched", summary.get("unmatched_lines", 0))
+    r1[4].metric("Blocking issues", summary.get("blocking_issues", 0))
+    r1[5].metric("Warnings", summary.get("warning_issues", 0))
+    st.caption(f"Unique products: {summary.get('unique_products', 0)} | "
+               f"Batches: {summary.get('batches', 0)} | Status: "
+               f"{enrichment.get('status')}")
+
+    products = enrichment.get("products", [])
+    rows = []
+    for line in enrichment.get("line_enrichments", []):
+        product = (products[line["product_ref"]]
+                   if line.get("product_ref") is not None else {})
+        source = line.get("source", {})
+        row = {
+            "Line": line["line_id"],
+            "Carton": line.get("original_carton_number"),
+            "Status": line.get("status"),
+            "Via": line.get("matched_via") or "-",
+            "Src EAN": source.get("ean"),
+            "API EAN": product.get("ean"),
+            "Src item": source.get("item_code"),
+            "API item": product.get("item_code"),
+            "API color": product.get("color_code"),
+            "API size": product.get("size_code"),
+            "API desc": (product.get("item_desc") or "")[:40],
+            "Orig price": product.get("original_retail_price"),
+            "Disc price": product.get("discount_price"),
+            "Issues": line.get("comparison_issue_count", 0),
+        }
+        for i in (1, 2, 3):                        # compact preview columns
+            row[f"AC{i:02d}"] = product.get(f"analysis_code_{i:02d}")
+        row["Comp01"] = product.get("composition_01")
+        rows.append(row)
+    if rows:
+        st.subheader("Per-line enrichment (source vs API)")
+        st.dataframe(rows, height=380)
+        with st.expander("Full Analysis Codes 01-15 and Compositions 1-4"):
+            st.dataframe([{
+                "Product": p.get("plu") or p.get("ean"),
+                **{f"AC{i:02d}": p.get(f"analysis_code_{i:02d}")
+                   for i in range(1, 16)},
+                **{f"Comp{i:02d}": p.get(f"composition_{i:02d}")
+                   for i in range(1, 5)},
+            } for p in products])
+
+    issues = enrichment.get("issues", [])
+    if issues:
+        st.subheader(f"Product lookup issues ({len(issues)})")
+        st.table([{
+            "Severity": i.get("severity"),
+            "Code": i.get("code"),
+            "Line": i.get("line_id") or "-",
+            "Field": i.get("field") or "-",
+            "Source": i.get("source_value"),
+            "API": i.get("api_value"),
+            "Message": i.get("message"),
+        } for i in issues[:300]])
+    st.caption("API values never overwrite reviewed source values. Next "
+               "stages (later builds): destination grouping, carton "
+               "renumbering, delivery invoice numbering, and Excel "
+               "packing lists.")
 
 
 def render_review_section(job, result: TransferExtractionResult) -> None:
@@ -86,9 +231,10 @@ def render_review_section(job, result: TransferExtractionResult) -> None:
         st.error(f"{len(ev.unresolved_blocking)} blocking issue(s) must be "
                  "corrected or excluded before approval.")
     elif job.status == JOB_READY_FOR_PRODUCT_LOOKUP:
-        st.success("Approved - ready for product lookup (a later build). "
-                   "Editing below reopens the review.")
-        _render_auth_readiness()
+        st.success("Approved - ready for product lookup. Editing below "
+                   "reopens the review and makes any enrichment stale.")
+    if job.status in _PRODUCT_STATES:
+        _render_product_lookup_section(job, result, review)
 
     # --- G. validation summary ----------------------------------------------------
     r1 = st.columns(6)

@@ -53,6 +53,10 @@ from apps.web.transfer.extraction_models import (
 from apps.web.transfer.models import (
     JOB_EXTRACTED,
     JOB_EXTRACTED_WITH_ISSUES,
+    JOB_PRODUCT_LOOKUP_COMPLETE,
+    JOB_PRODUCT_LOOKUP_FAILED,
+    JOB_PRODUCT_LOOKUP_IN_PROGRESS,
+    JOB_PRODUCT_LOOKUP_WITH_ISSUES,
     JOB_READY_FOR_PRODUCT_LOOKUP,
     JOB_REVIEW_IN_PROGRESS,
     JOB_REVIEW_REJECTED,
@@ -79,7 +83,11 @@ REVIEW_NAME = "review.json"
 # Statuses from which the review workflow is reachable in the UI.
 REVIEWABLE_JOB_STATUSES = (JOB_EXTRACTED, JOB_EXTRACTED_WITH_ISSUES,
                            JOB_REVIEW_IN_PROGRESS,
-                           JOB_READY_FOR_PRODUCT_LOOKUP, JOB_REVIEW_REJECTED)
+                           JOB_READY_FOR_PRODUCT_LOOKUP, JOB_REVIEW_REJECTED,
+                           JOB_PRODUCT_LOOKUP_IN_PROGRESS,
+                           JOB_PRODUCT_LOOKUP_COMPLETE,
+                           JOB_PRODUCT_LOOKUP_WITH_ISSUES,
+                           JOB_PRODUCT_LOOKUP_FAILED)
 
 # Conservative EAN rule (matches the source documents observed so far):
 # digits only after trimming, 8-14 digits, leading zeros preserved.
@@ -840,5 +848,6 @@ def approve_review(job_id: str) -> TransferReviewResult:
         original_value=None, previous_corrected=None,
         new_corrected=REVIEW_APPROVED, changed_at=utc_now()))
     save_review(job_id, review)
-    jobs.update_job_status(job_id, JOB_READY_FOR_PRODUCT_LOOKUP)
+    if job is not None and job.status != JOB_READY_FOR_PRODUCT_LOOKUP:
+        jobs.update_job_status(job_id, JOB_READY_FOR_PRODUCT_LOOKUP)
     return review

@@ -504,9 +504,14 @@ class TestBoundaries:
     SRC = (ROOT / "apps" / "web" / "transfer" / "gateway_auth.py").read_text(
         encoding="utf-8")
 
-    def test_no_product_endpoint_or_lookup_exists(self):
+    def test_product_endpoint_only_in_sanctioned_module(self):
+        # Build 4 shipped no product code; Build 5 added it in exactly one
+        # module (product_lookup.py). The auth layer itself stays free of
+        # product endpoints.
         transfer_dir = ROOT / "apps" / "web" / "transfer"
         for path in transfer_dir.glob("*.py"):
+            if path.name == "product_lookup.py":
+                continue
             src = path.read_text(encoding="utf-8")
             assert "pluLabel" not in src, path.name
             assert "corpTool" not in src, path.name

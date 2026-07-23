@@ -232,11 +232,12 @@ docker compose up invoice-extractor-web        # http://localhost:8501
 - Optional feature flag `TRANSFER_WORKFLOW_ENABLED=true` (in `.env`) adds the
   Transfer Note Packing List workflow selector (see
   `docs/transfer_packing/FUNCTIONAL_SPEC.md`). Default off.
-- The Transfer workflow's future product lookup uses BACKEND-ONLY
-  `API_GATEWAY_*` variables (see `.env.example`): keep credentials in the
-  server's `.env` only — never in Docker image layers, never in the browser.
-  Gateway tokens are held in process memory per container and are never
-  persisted; restarting a container simply re-authenticates.
+- The Transfer workflow's product lookup (Build 5) uses BACKEND-ONLY
+  `API_GATEWAY_*` and `PRODUCT_LOOKUP_*` variables (see `.env.example`):
+  keep credentials in the server's `.env` only — never in Docker image
+  layers, never in the browser. Gateway tokens are held in process memory
+  per container and are never persisted; restarting a container simply
+  re-authenticates on the next lookup.
 
 Full usage, limits, cancellation, retention, and remote-access guidance:
 `docs/WEB_UI.md`.

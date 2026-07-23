@@ -27,12 +27,18 @@ JOB_EXTRACTED_WITH_ISSUES = "EXTRACTED_WITH_ISSUES"
 JOB_REVIEW_IN_PROGRESS = "REVIEW_IN_PROGRESS"
 JOB_READY_FOR_PRODUCT_LOOKUP = "READY_FOR_PRODUCT_LOOKUP"
 JOB_REVIEW_REJECTED = "REVIEW_REJECTED"
+JOB_PRODUCT_LOOKUP_IN_PROGRESS = "PRODUCT_LOOKUP_IN_PROGRESS"
+JOB_PRODUCT_LOOKUP_COMPLETE = "PRODUCT_LOOKUP_COMPLETE"
+JOB_PRODUCT_LOOKUP_WITH_ISSUES = "PRODUCT_LOOKUP_WITH_ISSUES"
+JOB_PRODUCT_LOOKUP_FAILED = "PRODUCT_LOOKUP_FAILED"
 JOB_CANCELLED = "CANCELLED"
 JOB_FAILED = "FAILED"
 
 JOB_STATUSES = (JOB_READY_FOR_EXTRACTION, JOB_EXTRACTING, JOB_EXTRACTED,
                 JOB_EXTRACTED_WITH_ISSUES, JOB_REVIEW_IN_PROGRESS,
                 JOB_READY_FOR_PRODUCT_LOOKUP, JOB_REVIEW_REJECTED,
+                JOB_PRODUCT_LOOKUP_IN_PROGRESS, JOB_PRODUCT_LOOKUP_COMPLETE,
+                JOB_PRODUCT_LOOKUP_WITH_ISSUES, JOB_PRODUCT_LOOKUP_FAILED,
                 JOB_CANCELLED, JOB_FAILED)
 
 # Validated transitions. EXTRACTING -> EXTRACTING is allowed so a retry can
@@ -53,9 +59,33 @@ JOB_TRANSITIONS: dict[str, tuple[str, ...]] = {
                              JOB_REVIEW_REJECTED, JOB_EXTRACTING,
                              JOB_CANCELLED),
     JOB_READY_FOR_PRODUCT_LOOKUP: (JOB_REVIEW_IN_PROGRESS, JOB_EXTRACTING,
+                                   JOB_PRODUCT_LOOKUP_IN_PROGRESS,
                                    JOB_CANCELLED),
     JOB_REVIEW_REJECTED: (JOB_REVIEW_IN_PROGRESS, JOB_EXTRACTING,
                           JOB_CANCELLED),
+    # Build 5: product lookup. IN_PROGRESS -> IN_PROGRESS allows recovery
+    # of a run stranded by a restart (results persist atomically at the
+    # end, so re-entry never duplicates). COMPLETE may rerun explicitly
+    # until later packing stages exist. Reopening the review from any
+    # product state goes through REVIEW_IN_PROGRESS, which makes the
+    # enrichment stale via the review checksum.
+    JOB_PRODUCT_LOOKUP_IN_PROGRESS: (JOB_PRODUCT_LOOKUP_IN_PROGRESS,
+                                     JOB_PRODUCT_LOOKUP_COMPLETE,
+                                     JOB_PRODUCT_LOOKUP_WITH_ISSUES,
+                                     JOB_PRODUCT_LOOKUP_FAILED,
+                                     JOB_CANCELLED),
+    JOB_PRODUCT_LOOKUP_COMPLETE: (JOB_PRODUCT_LOOKUP_IN_PROGRESS,
+                                  JOB_REVIEW_IN_PROGRESS,
+                                  JOB_READY_FOR_PRODUCT_LOOKUP,
+                                  JOB_CANCELLED),
+    JOB_PRODUCT_LOOKUP_WITH_ISSUES: (JOB_PRODUCT_LOOKUP_IN_PROGRESS,
+                                     JOB_REVIEW_IN_PROGRESS,
+                                     JOB_READY_FOR_PRODUCT_LOOKUP,
+                                     JOB_CANCELLED),
+    JOB_PRODUCT_LOOKUP_FAILED: (JOB_PRODUCT_LOOKUP_IN_PROGRESS,
+                                JOB_REVIEW_IN_PROGRESS,
+                                JOB_READY_FOR_PRODUCT_LOOKUP,
+                                JOB_CANCELLED),
     JOB_FAILED: (JOB_EXTRACTING, JOB_CANCELLED),
     JOB_CANCELLED: (),
 }

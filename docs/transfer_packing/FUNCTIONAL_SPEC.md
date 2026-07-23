@@ -265,6 +265,109 @@ lookup, product enrichment, Analysis Code 01-15, Composition #1-4,
 source/API comparison, line consolidation, carton resequencing,
 delivery-invoice numbering, packing-list Excel output.
 
+## Build 5 scope (implemented): product lookup and enrichment
+
+Enriches every included reviewed line via `POST {base}/corpTool/pluLabel-get`
+using the Build 4 auth client. **Stops before grouping, renumbering,
+consolidation, and Excel.**
+
+### Confirmed product API contract (spec v0.851-CorpTools §3.3 + label-print)
+
+- Request: `{"RequestList": [{"LocationCode", "PLU", "PriceDate"
+  (YYYY-MM-DD), "Qty" (int)}]}` with `Content-Type: application/json` and
+  `Authorization: Bearer <accessToken>`. Multiple entries allowed,
+  including the same PLU at different locations; no documented batch
+  maximum (configurable, default 50).
+- Response: `{status, code, reason, note, data: [records]}`; success =
+  HTTP 2xx AND `code == 100000`. **The gateway silently OMITS non-existing
+  PLU-location combinations from `data` - absence IS the not-found
+  signal**, so partial batch results are normal and correlation uses the
+  echoed `(locationCode, plu)` (a requested EAN may also match the
+  record's authoritative `ean`), never array position. Uncorrelatable
+  records raise `PRODUCT_LOOKUP_RESPONSE_AMBIGUOUS`.
+- Record wire fields (camelCase; PascalCase tolerated): orgId,
+  locationCode, brand, brandName, currency, itemCode, colorCode,
+  colorDesc, sizeCode, plu, ean, itemDesc, longItemDesc, subcat, gender,
+  prodLine, supplierItemCode, xf_group5/12/16, originalRetailPrice,
+  discountPrice, qty (echo). Prices arrive as JSON numbers and are stored
+  as strings. **Analysis Code 01-15 / Composition #1-4 wire names appear in
+  NO local specification**; the normalizer captures any key matching
+  `analysisCode01`- / `composition01`-style patterns into
+  `analysis_code_01..15` / `composition_01..04`, keeps all `xf_group*`
+  fields, and stores the full token-free raw record - so live responses
+  are captured losslessly whatever the real names are (confirm on first
+  live call).
+
+### Identifier rules
+
+EAN first (string, leading zeros kept, 8-14 digits); fallback is the
+LITERAL concatenation `Item + Color + Size` (uppercased, no separator; a
+repeated color suffix inside the item code is never removed - the spec's
+own PLU `CM0010007804M5C2WAHM` is exactly itemCode+colorCode+sizeCode).
+Lines with neither identifier are never sent to the API and get
+`PRODUCT_LOOKUP_IDENTIFIER_MISSING`. Fallback runs only after a definitive
+not-found on the EAN stage - never after auth failures, malformed
+responses, or unexhausted transient errors - and is itself deduplicated;
+at most two identifier attempts per unique key.
+
+### Planning, deduplication, batching
+
+Input is ONLY the approved, checksum-current review (stale/unapproved/
+malformed data is refused; effective corrected values are used, excluded
+entities are skipped). Identical `(LocationCode, PriceDate, PLU)` requests
+are deduplicated with every source line mapped back to the shared result -
+source rows are NEVER merged and quantities never change. Deterministic
+order (upload -> page -> line; first-seen sequence recorded). Batches of
+`PRODUCT_LOOKUP_BATCH_SIZE` (default 50); only failed batches are retried.
+
+### Policies (isolated; confirm before live use)
+
+`resolve_lookup_location()` = effective destination To Loc. code (the
+destination's price list). `resolve_price_date()` = effective delivery-note
+date, else the explicit `PRODUCT_LOOKUP_PRICE_DATE` override, else a
+BLOCKING planning problem - today's date is never silently used.
+`resolve_lookup_qty()` = constant 1 (lookup-only): label-print sends line
+quantities and the spec example hints Qty may influence returned prices -
+**open business decision documented here**; a constant keeps deduplication,
+correlation, and unit-price comparison exact.
+
+### Authentication integration
+
+`ProductGatewayClient` composes the Build 4 client: `ensure_access_token()`
+per batch (cached token reused), Authorization header built internally, on
+HTTP 401 `handle_unauthorized()` (refresh -> one re-login) then ONE retry
+of that batch; a second 401 fails the run as
+`PRODUCT_LOOKUP_ACCESS_DENIED`. Transient timeouts/transport failures/5xx
+retry up to `PRODUCT_LOOKUP_MAX_RETRIES`; 4xx and gateway rejections are
+never retried. Tokens never appear in logs, the UI, or artifacts (tested).
+
+### Comparison and issue severity
+
+Source (reviewed effective) and API values are stored side by side; API
+values NEVER overwrite review data. Blocking: identifier missing, auth
+failure, access denied, uncorrelatable response, not found, multiple
+matches, item/color/size mismatch, and EAN mismatch on an EAN-keyed match.
+Warnings: description wording, retail-price difference, EAN difference
+when the CONSTRUCTED fallback matched (the API EAN is authoritative), and
+source gaps the API resolves.
+
+### Persistence and states
+
+`product_lookup/result.json` (schema_version 1, atomic) with the review
+checksum, config summary (no secrets), batches, lookups, normalized
+products, per-line enrichments, issues, and summary. Editing/re-approving
+the review changes the review checksum -> enrichment is marked STALE (and
+archived as `result-stale-*.json` on the next run); a stale enrichment can
+never feed packing-list generation. Job states:
+`READY_FOR_PRODUCT_LOOKUP -> PRODUCT_LOOKUP_IN_PROGRESS ->
+PRODUCT_LOOKUP_COMPLETE | PRODUCT_LOOKUP_WITH_ISSUES |
+PRODUCT_LOOKUP_FAILED`, with validated retries and re-approval routes.
+
+**Not in Build 5** (explicitly): destination workbook grouping, carton
+resequencing, same-carton line consolidation, delivery-invoice numbering,
+customer attribute mapping (which Analysis Code means lc_style etc. is a
+later build), Excel generation, ZIP output.
+
 ## Upload order is a business rule
 
 Cartons follow **user upload order, then PDF page order**. The uploader's

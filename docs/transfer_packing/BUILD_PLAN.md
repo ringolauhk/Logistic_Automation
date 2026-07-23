@@ -46,13 +46,17 @@ workflow untouched and ships with offline tests.
   after a rejected refresh; typed redacted errors; config-only readiness
   status in the UI. No `pluLabel-get` call exists.
 
-## Build 5 — product enrichment via API Gateway (planned)
+## Build 5 — product enrichment via API Gateway (this build)
 
 - `pluLabel-get` lookups using the Build 4 auth client: EAN primary,
-  Item + Color + Size fallback; one batch retry after 401 via
-  `handle_unauthorized()`.
-- Analysis Code 01–15 and Composition #1–4 captured per item.
-- Offline tests against a loopback mock gateway only.
+  Item+Color+Size literal-concatenation fallback (repeated color suffix
+  kept); deduplicated batched requests correlated by echoed
+  (locationCode, plu); one batch retry after 401.
+- Analysis Code 01–15 / Composition #1–4 slots with pattern-mapped wire
+  names (unconfirmed locally) + lossless token-free raw records;
+  source/API comparison with blocking identity mismatches; atomic
+  `product_lookup/result.json` guarded by the review checksum.
+- No grouping, renumbering, consolidation, invoice numbering, or Excel.
 
 ## Build 6 — grouping, carton renumbering, packing lists (planned)
 
