@@ -768,7 +768,7 @@ class TestUiWiring:
     def test_summary_and_issue_rendering_present(self):
         assert "Extraction summary" in self.PAGE
         assert "Blocking errors" in self.PAGE
-        assert "Issues" in self.PAGE
+        assert "Extraction issues - source record" in self.PAGE
 
     def test_no_product_api_or_packing_list_controls(self):
         low = self.PAGE.lower()

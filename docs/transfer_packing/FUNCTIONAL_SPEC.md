@@ -107,6 +107,97 @@ authentication, `pluLabel-get`, product enrichment, line consolidation,
 carton reassignment, delivery-invoice-number generation, Excel packing-list
 generation, editable correction UI (Build 3+).
 
+## Build 3 scope (implemented): review, correction, approval
+
+A controlled review screen over the Build 2 extraction. **The extraction
+artifact is immutable**; review data is a separate artifact:
+
+```
+<job>/review/review.json            # schema_version 1
+<job>/review/review-stale-*.json    # archived stale reviews (audit)
+```
+
+### Original / corrected / effective value model
+
+Every reviewed entity (document header, carton, line) stores a frozen
+`original` snapshot plus an explicit `corrections` map:
+
+| corrections state | meaning | effective value |
+|---|---|---|
+| field absent | unchanged | original |
+| `field: "value"` | corrected (trimmed; codes uppercased) | corrected value |
+| `field: null` | **deliberately cleared** | empty |
+
+Raw extracted values are never overwritten. In the editors, an EMPTY cell
+never clears a value - the literal token `<clear>` does. Correcting a field
+back to its original removes the correction. Every real change appends an
+audit entry (entity, field, original, previous corrected, new corrected,
+UTC timestamp); repeated identical saves add nothing.
+
+### Exclusion
+
+Documents, cartons, and lines can be excluded **only with a reason**.
+Exclusion cascades at evaluation time (document -> its cartons -> their
+lines), so re-including a parent restores children automatically. Excluded
+records keep their originals and corrections and stay listed.
+
+### Issue resolution (deterministic)
+
+Resolution is a pure function of effective values + exclusions - clicking
+Save never resolves anything. Blocking (Build 2 `error`) vs warning
+(`warning`) severity is kept. Key rules: structural document problems
+(`UNRECOGNIZED_DOCUMENT`, `UNREADABLE_PAGE`, `OCR_UNAVAILABLE`,
+`DOCUMENT_EXTRACTION_FAILED`) resolve only by excluding the document;
+`MISSING_DESTINATION`/`MISSING_DELIVERY_NOTE_NO`/`MISSING_CARTON_NO`
+resolve when the effective value exists; `MISSING_ITEM_IDENTIFIER` /
+`INVALID_EAN` / `MALFORMED_ITEM_ROW` resolve when the line becomes
+lookup-ready or is excluded; `INVALID_QUANTITY` only by a positive integer
+or exclusion; `CARTON_TOTAL_MISMATCH` / `DOCUMENT_TOTAL_MISMATCH`
+recalculate from effective INCLUDED quantities against the printed totals
+(unreadable printed totals downgrade to warnings). **Documented rule:** a
+valid EAN alone makes a line lookup-ready (EAN is the primary identifier);
+unresolved `MISSING_COLOR`/`MISSING_SIZE` remain visible warnings and never
+block approval. The fallback identifier is Item + Color + Size.
+
+### Lookup readiness and approval
+
+A line is lookup-ready when its effective EAN is valid (digits only after
+trimming, 8-14 digits, leading zeros preserved) OR effective Item, Color
+and Size are all present. **Approve for Product Lookup** requires: at least
+one included document/carton/line; every included document has a
+destination code and D/N#; every included carton has a carton number and
+destination; every included line has a positive integer quantity and is
+lookup-ready; zero unresolved blocking issues; the saved review matches the
+current extraction checksum. Approval sets review status `APPROVED` and job
+status `READY_FOR_PRODUCT_LOOKUP`. **No API is called.**
+
+### Stale-review protection
+
+`review.json` records the SHA-256 checksum of `extraction/result.json`.
+Re-running extraction changes the checksum; the saved review is then marked
+`STALE`, can never be approved, and rebuilding archives it as
+`review-stale-<UTC>.json` - corrections are never silently reused against
+changed source data and never silently discarded.
+
+### Job states (Build 3)
+
+`EXTRACTED | EXTRACTED_WITH_ISSUES -> REVIEW_IN_PROGRESS ->
+READY_FOR_PRODUCT_LOOKUP | REVIEW_REJECTED`;
+`READY_FOR_PRODUCT_LOOKUP -> REVIEW_IN_PROGRESS` (reopen before enrichment
+begins); review states may return to `EXTRACTING` (re-extract), which
+triggers the staleness protection. All transitions validated.
+
+### Audit limitation (single-user pilot)
+
+There is no login/user identity; every review records
+`reviewed_by: "local-user"` and UTC timestamps. Adding real identity would
+require the authentication phase that is explicitly out of pilot scope.
+
+**Not in Build 3** (explicitly): access-token retrieval, authentication
+refresh (`/auth/login`, `/auth/refresh`), `pluLabel-get`, product
+enrichment, Analysis Code / Composition values, carton resequencing, line
+consolidation, delivery-invoice numbering, Excel output.
+
 ## Upload order is a business rule
 
 Cartons follow **user upload order, then PDF page order**. The uploader's

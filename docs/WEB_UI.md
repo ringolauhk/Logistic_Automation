@@ -104,9 +104,11 @@ A second, independent workflow — upload Transfer Delivery Note PDFs in
 carton order, create a Transfer Packing job, and (Build 2) run local
 deterministic extraction: embedded text first, optional local OCR for
 scanned pages (`pip install -r requirements-ocr.txt` — no cloud calls),
-carton/item parsing with exact printed-total validation, and a read-only
-review summary that survives browser refresh. Per-destination packing lists
-come in later builds.
+carton/item parsing with exact printed-total validation, and (Build 3) a
+review screen: correct or exclude headers/cartons/lines with full audit of
+original vs corrected values, deterministic issue resolution, and approval
+to `READY_FOR_PRODUCT_LOOKUP`. Product enrichment and per-destination
+packing lists come in later builds.
 Hidden unless `TRANSFER_WORKFLOW_ENABLED=true`; the invoice workflow stays
 the default and is unchanged. Transfer jobs are stored separately under
 `web-data/transfer-jobs/` and are not auto-deleted in Build 1. Full details:

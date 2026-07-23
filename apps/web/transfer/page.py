@@ -8,7 +8,7 @@ the invoice workflow's keys (job_id, plans, uploader_gen, new_batch_msg).
 import streamlit as st
 
 from apps.web.job_manager import JobError
-from apps.web.transfer import extraction, jobs
+from apps.web.transfer import extraction, jobs, review_page
 from apps.web.transfer.models import (
     EXTRACTABLE_STATUSES,
     FILE_VALIDATED,
@@ -66,9 +66,8 @@ def _render_job_summary(job: TransferPackingJob) -> None:
 
 
 def _render_extraction_section(job: TransferPackingJob) -> None:
-    """Build 2: run extraction and show the reviewable result. Read-only -
-    correction/editing arrives in Build 3; there are no product-API or
-    packing-list controls."""
+    """Build 2 extraction + Build 3 review/correction/approval. There are
+    no product-API or packing-list controls - those are later builds."""
     result = extraction.load_result(job.job_id)
 
     if job.status in EXTRACTABLE_STATUSES:
@@ -159,21 +158,25 @@ def _render_extraction_section(job: TransferPackingJob) -> None:
 
     issues = result.all_issues()
     if issues:
-        st.subheader(f"Issues ({len(issues)})")
-        st.table([{
-            "Severity": i.severity,
-            "Code": i.code,
-            "File": i.source_file,
-            "Page": i.source_page if i.source_page is not None else "-",
-            "Carton": i.carton or "-",
-            "Line": i.line_ref if i.line_ref is not None else "-",
-            "Message": i.message,
-        } for i in issues[:200]])
-        if len(issues) > 200:
-            st.caption(f"Showing first 200 of {len(issues)} issues.")
-    st.caption("Next stage (later builds): review/correction, product "
-               "enrichment via the internal API, carton renumbering per "
-               "destination, and Excel packing lists.")
+        with st.expander(f"Extraction issues - source record ({len(issues)})"):
+            st.table([{
+                "Severity": i.severity,
+                "Code": i.code,
+                "File": i.source_file,
+                "Page": i.source_page if i.source_page is not None else "-",
+                "Carton": i.carton or "-",
+                "Line": i.line_ref if i.line_ref is not None else "-",
+                "Message": i.message,
+            } for i in issues[:200]])
+            if len(issues) > 200:
+                st.caption(f"Showing first 200 of {len(issues)} issues.")
+
+    # --- Build 3: review, correction, and approval --------------------------------
+    if job.status in review_page.review_mod.REVIEWABLE_JOB_STATUSES:
+        review_page.render_review_section(job, result)
+    st.caption("Later builds: product enrichment via the internal API, "
+               "carton renumbering per destination, and Excel packing "
+               "lists.")
 
 
 def render() -> None:
