@@ -42,14 +42,25 @@ from apps.web.transfer.models import (          # noqa: E402
     JOB_PRODUCT_LOOKUP_FAILED,
     JOB_PRODUCT_LOOKUP_IN_PROGRESS,
     JOB_PRODUCT_LOOKUP_WITH_ISSUES,
+    JOB_WORKBOOK_GENERATION_COMPLETE,
+    JOB_WORKBOOK_GENERATION_FAILED,
+    JOB_WORKBOOK_GENERATION_IN_PROGRESS,
+    JOB_WORKBOOK_GENERATION_WITH_ISSUES,
 )
+
+_WORKBOOK_STATES = (JOB_PACKING_PREPARATION_COMPLETE,
+                    JOB_PACKING_PREPARATION_WITH_ISSUES,
+                    JOB_WORKBOOK_GENERATION_IN_PROGRESS,
+                    JOB_WORKBOOK_GENERATION_COMPLETE,
+                    JOB_WORKBOOK_GENERATION_WITH_ISSUES,
+                    JOB_WORKBOOK_GENERATION_FAILED)
 
 _PACKING_STATES = (JOB_PRODUCT_LOOKUP_COMPLETE,
                    JOB_PRODUCT_LOOKUP_WITH_ISSUES,
                    JOB_PACKING_PREPARATION_IN_PROGRESS,
                    JOB_PACKING_PREPARATION_COMPLETE,
                    JOB_PACKING_PREPARATION_WITH_ISSUES,
-                   JOB_PACKING_PREPARATION_FAILED)
+                   JOB_PACKING_PREPARATION_FAILED) + _WORKBOOK_STATES
 
 _PRODUCT_STATES = (JOB_READY_FOR_PRODUCT_LOOKUP,
                    JOB_PRODUCT_LOOKUP_IN_PROGRESS,
@@ -59,7 +70,7 @@ _PRODUCT_STATES = (JOB_READY_FOR_PRODUCT_LOOKUP,
                        JOB_PACKING_PREPARATION_IN_PROGRESS,
                        JOB_PACKING_PREPARATION_COMPLETE,
                        JOB_PACKING_PREPARATION_WITH_ISSUES,
-                       JOB_PACKING_PREPARATION_FAILED)
+                       JOB_PACKING_PREPARATION_FAILED) + _WORKBOOK_STATES
 
 
 def _render_product_lookup_section(job, result, review) -> None:
@@ -252,6 +263,8 @@ def render_review_section(job, result: TransferExtractionResult) -> None:
         _render_product_lookup_section(job, result, review)
     if job.status in _PACKING_STATES:
         _render_packing_section(job)
+    if job.status in _WORKBOOK_STATES:
+        _render_workbook_section(job)
 
     # --- G. validation summary ----------------------------------------------------
     r1 = st.columns(6)
@@ -577,3 +590,127 @@ def _render_packing_section(job) -> None:
                "reviewed values remain stored separately. Workbook "
                "generation arrives in a later build - no files are created "
                "here.")
+
+
+def _render_workbook_section(job) -> None:
+    """Build 7: generate, validate, and download packing-list workbooks.
+    Local only - no API call, no printing, no email."""
+    from apps.web.transfer import packing as pk
+    from apps.web.transfer import workbook as wbmod
+
+    st.header("Packing list workbooks")
+    output = wbmod.load_output(job.job_id)
+
+    problems: list[str] = []
+    prepared = None
+    config = None
+    try:
+        config = wbmod.load_workbook_config()
+        job_obj, prepared = wbmod.load_generation_inputs(job.job_id)
+    except Exception as exc:
+        problems = [str(exc)]
+
+    if prepared is not None:
+        groups = prepared["destinations"]
+        row = st.columns(6)
+        row[0].metric("Destinations", len(groups))
+        row[1].metric("Workbooks to generate", len(groups))
+        row[2].metric("Cartons", prepared["summary"]["generated_cartons"])
+        row[3].metric("Prepared lines",
+                      prepared["summary"]["prepared_lines"])
+        row[4].metric("Total units", prepared["summary"]["total_units"])
+        row[5].metric("ZIP", "yes" if len(groups) > 1
+                      and config.create_zip_for_multiple else "no")
+        st.caption("Every workbook is reopened and validated before "
+                   "download. One workbook per destination; a ZIP bundles "
+                   "them when multiple destinations exist.")
+    for problem in problems[:3]:
+        st.error(problem)
+
+    label = ("Regenerate Workbooks" if output is not None
+             else "Generate Workbooks")
+    if job.status == "WORKBOOK_GENERATION_IN_PROGRESS":
+        st.warning("A previous generation did not finish; regenerating is "
+                   "safe (files are validated before being recorded).")
+    if st.button(label, type="primary", disabled=bool(problems)):
+        progress = st.progress(0.0, text="Generating workbooks...")
+
+        def on_progress(index, total, destination):
+            progress.progress(min(index / max(total, 1), 1.0),
+                              text=f"Workbook {index}/{total}: "
+                                   f"{destination}")
+
+        try:
+            with st.spinner("Generating and validating workbooks locally "
+                            "(no API calls)..."):
+                wbmod.generate_workbooks(job.job_id,
+                                         on_progress=on_progress)
+        except Exception as exc:
+            st.error(str(exc))
+        st.rerun()
+
+    if output is None:
+        st.caption("Output: Packing_List_<Destination>_<InvoiceNo>.xlsx "
+                   "with Packing List, Detail, Carton Mapping, Needs "
+                   "Review, and Source Documents sheets. Printing and "
+                   "email delivery are not part of this build.")
+        return
+
+    if output.get("stale"):
+        st.warning("The packing preparation changed after these workbooks "
+                   "were generated - downloads are disabled; regenerate "
+                   "first.")
+
+    summary = output.get("summary") or {}
+    st.caption(f"Status: {output.get('status')} | Files: "
+               f"{summary.get('total_files', 0)} | Total bytes: "
+               f"{summary.get('total_bytes', 0):,} | Generated: "
+               f"{output.get('updated_at')}")
+
+    directory = wbmod.output_dir(job.job_id)
+    for entry in output.get("destination_workbooks", []):
+        cols = st.columns([3, 2, 1, 1, 1, 2])
+        cols[0].markdown(f"**{entry['destination_code']}** - "
+                         f"{entry['delivery_invoice_number']}")
+        cols[1].caption(entry["filename"])
+        cols[2].caption(f"{entry['carton_count']} ctn")
+        cols[3].caption(f"{entry['prepared_line_count']} lines / "
+                        f"{entry['total_units']} units")
+        cols[4].caption(f"{entry['byte_size']:,} B | "
+                        f"{entry['validation_status']} | sha "
+                        + entry["sha256"][:10])
+        path = directory / entry["filename"]
+        if output.get("stale") or not path.is_file():
+            cols[5].caption("unavailable (stale)")
+        else:
+            cols[5].download_button(
+                "Download", data=path.read_bytes(),
+                file_name=entry["filename"],
+                mime=("application/vnd.openxmlformats-officedocument"
+                      ".spreadsheetml.sheet"),
+                key=f"transfer_wb_dl_{entry['filename']}")
+        for issue in entry.get("validation_issues", []):
+            st.caption(f"  {issue['severity']}: [{issue['code']}] "
+                       f"{issue['message']}")
+
+    zip_entry = output.get("zip")
+    if zip_entry:
+        zip_path = directory / zip_entry["filename"]
+        if not output.get("stale") and zip_path.is_file():
+            st.download_button(
+                f"Download all ({zip_entry['member_count']} workbooks as "
+                "ZIP)", data=zip_path.read_bytes(),
+                file_name=zip_entry["filename"],
+                mime="application/zip", key="transfer_wb_zip_dl")
+            st.caption(f"ZIP: {zip_entry['byte_size']:,} B | sha "
+                       + zip_entry["sha256"][:10])
+
+    issues = output.get("issues", [])
+    if issues:
+        with st.expander(f"Workbook issues ({len(issues)})"):
+            st.table([{"Severity": i.get("severity"),
+                       "Code": i.get("code"),
+                       "Destination": i.get("destination") or "-",
+                       "Message": i.get("message")} for i in issues[:100]])
+    st.caption("Printing, email delivery, and confirmed customer Analysis "
+               "Code mappings are outside this build.")

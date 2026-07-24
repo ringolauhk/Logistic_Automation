@@ -114,9 +114,13 @@ enrichment table (Analysis Codes, Compositions, source-vs-API comparison,
 issues) that survives refresh, then (Build 6) **Prepare Packing Groups**:
 destination grouping by To Loc., carton renumbering from 001 per
 destination (originals kept), same-carton consolidation, and one delivery
-invoice number per destination - all local and deterministic. Tokens and
-credentials never reach the browser. Excel workbook generation comes in a
-later build.
+invoice number per destination - all local and deterministic - and
+finally (Build 7) **Generate Workbooks**: one validated packing-list
+`.xlsx` per destination (Packing List, Detail, Carton Mapping, Needs
+Review, Source Documents sheets) with per-workbook downloads and a ZIP
+for multiple destinations; stale inputs disable downloads until
+regeneration. Tokens and credentials never reach the browser. Printing
+and email delivery are not included.
 Hidden unless `TRANSFER_WORKFLOW_ENABLED=true`; the invoice workflow stays
 the default and is unchanged. Transfer jobs are stored separately under
 `web-data/transfer-jobs/` and are not auto-deleted in Build 1. Full details:

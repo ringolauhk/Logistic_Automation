@@ -70,8 +70,11 @@ workflow untouched and ships with offline tests.
   (job-scoped uniqueness only in the pilot); atomic, checksum-guarded
   `packing/result.json` with stale archival; no API/Excel/ZIP.
 
-## Build 7 — workbook generation and delivery (planned)
+## Build 7 — packing-list workbook generation (this build)
 
-- One Excel workbook per destination from the packing preparation;
-  customer Analysis Code / Composition mapping; download surface via the
-  artifact-allowlist pattern; retention cleanup for transfer jobs.
+- One validated `.xlsx` per destination (five fixed sheets mirroring the
+  legacy layout; text-format identifiers; per-carton subtotals; print
+  setup) + a validated ZIP for multiple destinations; per-workbook and
+  ZIP downloads with stale-input protection and stable regeneration.
+- Customer Analysis Code mapping stays configuration-only placeholders;
+  printing/email and full transfer-job retention remain future work.

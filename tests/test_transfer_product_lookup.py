@@ -683,7 +683,10 @@ class TestUiAndBoundaries:
         assert "composition_" in self.RPAGE
 
     def test_no_excel_or_resequencing_controls(self):
-        low = (self.RPAGE + self.PL).lower()
+        # scope to the pre-Build-7 sections: the workbook section holds the
+        # sanctioned Excel downloads
+        page_part = self.RPAGE.split("def _render_workbook_section")[0]
+        low = (page_part + self.PL).lower()
         for forbidden in ("openpyxl", "xlsx", "resequenc", "zipfile",
                           "download_button"):
             assert forbidden not in low, forbidden

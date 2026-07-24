@@ -440,6 +440,86 @@ COMPLETE until workbook generation exists.
 formatting/styling, customer Analysis Code mapping, ZIP output, printing,
 production deployment changes.
 
+## Build 7 scope (implemented): packing-list workbooks
+
+One validated `.xlsx` per destination, generated ONLY from the current
+Build 6 packing artifact (never reconstructed from upstream data), plus
+`Packing_Lists_<JobId>.zip` when multiple destinations exist. Output lives
+under `<job>/output/` with metadata in `output/result.json` (schema v1).
+
+### Input boundary
+
+Generation requires a current (non-stale) `packing/result.json` with
+status complete and ZERO blocking issues, and every destination carrying a
+code, delivery invoice number, cartons, and prepared lines. Stale or
+malformed preparations, and jobs outside the generation states, are
+refused. Delivery invoice numbers and carton assignments come from Build 6
+verbatim.
+
+### Workbook structure (five fixed sheets)
+
+- **Packing List** - printable, mirroring the legacy IMAGINEX layout
+  (verified read-only against the local sample): company name
+  (`PACKING_COMPANY_NAME`), boxed title, To (blank - never invented),
+  Delivery Invoice No., Invoice Date, Destination, `TN#` remarks from the
+  source delivery notes, Deliver to / Contact / Tel left blank, Form Of
+  Delivery (`PACKING_FORM_OF_DELIVERY`). Columns: CTN. No., Description,
+  SKU Number / EAN, PLU, IMX Item Code, IMX Color Code, Color Description,
+  Size, Customer Style, Customer Color Code, Customer Color Description,
+  Qty - customer columns are BLANK unless a `PACKING_CUSTOMER_*_FIELD`
+  mapping names a normalized attribute (Analysis Code meanings are not
+  confirmed; nothing is hard-coded). Per-carton `NNN Total` subtotal rows
+  and final Total Cartons / Total Prepared Lines / Total Units, all as
+  fixed values (no formulas). Print: landscape, fit to one page wide,
+  repeated table-header row, print area, invoice+destination header and
+  `Page x of y` footer, gridlines hidden.
+- **Detail** - the full audit view: destination, generated + original
+  carton with source carton key, source references and reviewed line IDs,
+  reviewed source values, all confirmed API attributes, **Analysis Code
+  01-15 and Composition #1-4**, lookup identifier/status, consolidation
+  counts. Identifier cells use text format (leading zeros preserved);
+  freeze panes + autofilter.
+- **Carton Mapping** - one row per source carton in exact Build 6 order
+  (generated vs original number, upload sequence, file, first page, D/N,
+  line counts, units) + a total row.
+- **Needs Review** - packing issues and retained non-blocking product
+  warnings with full context, or the explicit note "No unresolved review
+  items."; never tokens or credentials.
+- **Source Documents** - one row per source PDF (upload sequence, file,
+  pages, D/N, date, from/to, carton/line/unit counts, extraction method
+  summary, issue count, in-this-workbook flag). PDFs are not embedded.
+
+### Validation (every workbook, before it is recorded)
+
+Reopened via openpyxl and checked: existence, size, ZIP structure, exact
+sheet set, destination/invoice presence, carton count + numbering equality
+with Build 6, original-carton retention, prepared-line count, unit totals,
+text-format leading-zero identifiers, no external links, no macros, no
+duplicate outputs. Blocking validation failure aborts generation safely
+(tmp files removed, job -> WORKBOOK_GENERATION_FAILED). Codes:
+`WORKBOOK_FILE_MISSING/FILE_EMPTY/OPEN_FAILED/SHEET_MISSING/
+SHEET_DUPLICATE/METADATA_MISMATCH/CARTON_COUNT_MISMATCH/
+LINE_COUNT_MISMATCH/TOTAL_MISMATCH/IDENTIFIER_FORMAT_ERROR/
+EXTERNAL_LINK_FOUND/VALIDATION_FAILED`.
+
+### Output metadata, staleness, downloads, retention
+
+`output/result.json` stores the packing checksum, per-workbook filename /
+relative path / SHA-256 / size / counts / validation results, and ZIP
+metadata. Any change to the packing artifact marks outputs stale:
+downloads are disabled until regeneration, prior metadata is archived
+(`result-stale-*.json`), and superseded binaries are replaced without
+accumulating duplicates; unchanged regeneration keeps invoice numbers and
+filenames stable. Downloads (per-workbook + ZIP) run through Streamlit
+within the job directory only. Minimal retention: this job's output files
+older than `PACKING_OUTPUT_RETENTION_HOURS` are removed (never while
+generation is in progress, never other jobs); full transfer-job retention
+remains the documented Build 1 deferral.
+
+**Not in Build 7** (explicitly): printing, email delivery, confirmed
+customer Analysis Code mappings, global invoice-number allocation,
+multi-user authentication, live deployment certification.
+
 ## Upload order is a business rule
 
 Cartons follow **user upload order, then PDF page order**. The uploader's

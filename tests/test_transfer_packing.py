@@ -489,6 +489,7 @@ class TestUiAndBoundaries:
 
     def test_no_download_controls_for_packing(self):
         packing_ui = self.RPAGE.split("_render_packing_section")[-1]
+        packing_ui = packing_ui.split("def _render_workbook_section")[0]
         assert "download_button" not in packing_ui
 
     def test_upstream_artifacts_never_written(self):
