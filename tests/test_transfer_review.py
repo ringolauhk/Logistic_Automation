@@ -647,7 +647,10 @@ class TestUiWiring:
         assert "disabled=approve_disabled" in self.RPAGE
 
     def test_no_api_or_excel_controls(self):
-        low = (self.PAGE + self.RPAGE).lower()
+        # Build 7 added a sanctioned workbook/download section; the review
+        # sections themselves must stay free of API/Excel controls.
+        review_part = self.RPAGE.split("def _render_workbook_section")[0]
+        low = (self.PAGE + review_part).lower()
         for forbidden in ("plulabel", "access_token", "auth/login",
                           "openpyxl", "download_button", "resequenc"):
             assert forbidden not in low, forbidden
