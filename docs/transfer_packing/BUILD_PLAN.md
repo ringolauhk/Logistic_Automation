@@ -70,7 +70,7 @@ workflow untouched and ships with offline tests.
   (job-scoped uniqueness only in the pilot); atomic, checksum-guarded
   `packing/result.json` with stale archival; no API/Excel/ZIP.
 
-## Build 7 — packing-list workbook generation (this build)
+## Build 7 — packing-list workbook generation (implemented)
 
 - One validated `.xlsx` per destination (five fixed sheets mirroring the
   legacy layout; text-format identifiers; per-carton subtotals; print
@@ -78,3 +78,23 @@ workflow untouched and ships with offline tests.
   ZIP downloads with stale-input protection and stable regeneration.
 - Customer Analysis Code mapping stays configuration-only placeholders;
   printing/email and full transfer-job retention remain future work.
+
+## Build 8 — pilot hardening and controlled live validation (this build)
+
+- Docker OCR packaging: the web image installs the pinned
+  `requirements-ocr.txt` stack (plus `libgl1`/`libglib2.0-0`) so scanned
+  Transfer Notes OCR inside the container; CLI image unchanged; models
+  ship inside the wheel (no runtime downloads).
+- `apps/web/transfer/pilot.py`: redaction-safe `doctor` diagnostics
+  (exit 0/1/2), transfer-root retention `cleanup` (dry-run default,
+  in-progress jobs and invoice jobs protected, symlink/containment safe),
+  the redacted `pilot/result.json` manifest, and doubly gated live
+  probes (`PILOT_ENABLE_LIVE_*` env flag AND `--yes`): one auth login,
+  one product batch of 1–3 approved identifiers, optional Qty comparison.
+- Pilot Readiness expander on the transfer page (names/statuses only).
+- Docs: `PILOT_CHECKLIST.md`, `PILOT_ROLLBACK.md`, `LIVE_VALIDATION.md`.
+- Analysis Code / Composition wire names and the Qty policy remain
+  UNCONFIRMED until the gated live probes are approved and executed;
+  customer mappings stay blank until business evidence confirms them.
+- Not in Build 8: global invoice numbering, print/email automation,
+  SSO/RBAC, background queues, merge to main.

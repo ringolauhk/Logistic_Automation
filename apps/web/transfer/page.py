@@ -179,11 +179,60 @@ def _render_extraction_section(job: TransferPackingJob) -> None:
                "lists.")
 
 
+def _render_pilot_readiness() -> None:
+    """Build 8: on-demand, fully redacted pilot readiness (doctor) report.
+    Never triggers a network call; shows names and statuses only."""
+    from apps.web.transfer import pilot
+    with st.expander("Pilot readiness (Build 8)"):
+        if st.button("Run readiness checks", key="transfer_pilot_doctor"):
+            report, code = pilot.doctor()
+            st.session_state["transfer_pilot_report"] = (report, code)
+        stored = st.session_state.get("transfer_pilot_report")
+        if not stored:
+            st.caption("Run the checks to see application, OCR, API, "
+                       "mapping, and retention status. No live API call is "
+                       "made and no secrets are shown.")
+            return
+        report, code = stored
+        badge = {0: "READY", 1: "WARNINGS", 2: "BLOCKED"}[code]
+        st.markdown(f"**Overall: {badge}** - commit `{report['app_commit']}`"
+                    f", Python {report['python']}, generated "
+                    f"{report['generated_at']}")
+        rows = [
+            ("Transfer workflow enabled", report["transfer_workflow_enabled"]),
+            ("Running in container", report["in_container"]),
+            ("Job root writable", report["job_root_writable"]),
+            ("OCR", f"{report['ocr']['status']} "
+                    f"({report['ocr']['detail']})"),
+            ("API configuration", report["api_status"]),
+            ("Live auth probe enabled", report["live_auth_enabled"]),
+            ("Live product probe enabled",
+             report["live_product_lookup_enabled"]),
+            ("Stranded jobs", report["stranded_jobs"]),
+            ("Free disk (GB)", report["free_disk_gb"]),
+            ("Cleanup candidates",
+             f"{report['cleanup_candidates']['files']} files / "
+             f"{report['cleanup_candidates']['bytes']} bytes"),
+        ]
+        st.table([{"Check": k, "Status": str(v)} for k, v in rows])
+        if report["job_state_counts"]:
+            st.caption("Jobs by state: " + ", ".join(
+                f"{k}: {v}" for k, v in
+                sorted(report["job_state_counts"].items())))
+        for message in report["api_problems"]:
+            st.warning(message)          # variable names only, never values
+        for message in report["warnings"]:
+            st.warning(message)
+        for message in report["blockers"]:
+            st.error(message)
+
+
 def render() -> None:
     """Render the whole Transfer Note workflow page, then stop."""
     st.title("Transfer Note Packing List")
     st.markdown("Upload one or more Transfer Delivery Note PDF files in the "
                 "order that cartons should be processed.")
+    _render_pilot_readiness()
     limits = jobs.transfer_limits()
 
     # Refresh recovery: a created job is redisplayed from its metadata -

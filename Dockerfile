@@ -85,9 +85,18 @@ CMD ["--help"]
 FROM runtime-base AS web
 
 USER root
-COPY requirements-web.txt /tmp/requirements-web.txt
+# Build 8: local OCR for scanned Transfer Delivery Notes. opencv-python (a
+# pinned rapidocr dependency) needs these two shared libraries on slim
+# images; no other desktop packages are installed. rapidocr-onnxruntime
+# bundles its ONNX models inside the wheel - nothing is downloaded at
+# runtime. Web image only; the CLI image is unchanged.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+COPY requirements-web.txt requirements-ocr.txt /tmp/
 RUN pip install --only-binary=:all: -r /tmp/requirements-web.txt \
-    && rm -f /tmp/requirements-web.txt
+    && pip install --only-binary=:all: -r /tmp/requirements-ocr.txt \
+    && rm -f /tmp/requirements-web.txt /tmp/requirements-ocr.txt
 COPY apps /app/apps
 COPY .streamlit /app/.streamlit
 USER appuser

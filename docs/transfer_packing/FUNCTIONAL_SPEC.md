@@ -520,6 +520,46 @@ remains the documented Build 1 deferral.
 customer Analysis Code mappings, global invoice-number allocation,
 multi-user authentication, live deployment certification.
 
+## Build 8 scope (implemented): pilot hardening and live-validation gates
+
+Operational hardening only — no Build 1–7 business logic changes.
+
+- **Docker OCR**: the web image now installs the pinned OCR stack
+  (`requirements-ocr.txt` + `libgl1`/`libglib2.0-0`), so image-only PDFs
+  extract inside Docker; RapidOCR models are bundled in the wheel — no
+  runtime downloads. The CLI image and invoice workflow are unchanged.
+- **`apps/web/transfer/pilot.py`** (CLI `python -m apps.web.transfer.pilot`):
+  - `doctor [--deep]` — redacted diagnostics (Python/commit, OCR,
+    directory writability, API config status by variable NAME only, job
+    counts by state, stranded jobs, disk space, cleanup candidates);
+    exit 0 = ready, 1 = warnings, 2 = blocking.
+  - `cleanup [--dry-run|--execute]` — transfer-root retention: expired
+    output workbooks/ZIPs, `*.tmp-*` files, archived `*-stale-*.json`
+    older than `PACKING_OUTPUT_RETENTION_HOURS`. Never touches
+    in-progress jobs, invoice jobs, symlinks, or paths outside the
+    transfer job root; reports counts/bytes only.
+  - `auth-check --yes` / `product-check --yes ...` — live probes, doubly
+    gated (`PILOT_ENABLE_LIVE_AUTH` / `PILOT_ENABLE_LIVE_PRODUCT_LOOKUP`
+    default false AND explicit `--yes`). Auth: one login, redacted
+    outcome, tokens cleared and never persisted. Product: ONE batch of
+    1–3 approved identifiers returning a schema observation (field
+    names/types/presence/correlation — values only with `--show-values`,
+    sensitive keys always stripped). See `LIVE_VALIDATION.md`.
+- **Pilot manifest** `pilot/result.json` per job: timestamps, commit, job
+  status, source hashes, counts, destination codes, output hashes,
+  validation statuses, safe issue codes, configured mapping names —
+  never credentials, tokens, raw responses, or source documents.
+- **Pilot Readiness UI**: on-demand doctor report on the transfer page
+  (statuses and variable names only).
+- **Unresolved (blocked on gated live validation)**: exact Analysis Code
+  01–15 / Composition #1–4 wire names, Qty pricing behavior
+  (`resolve_lookup_qty()` stays 1), and the customer column mapping —
+  mappings remain blank configuration placeholders until confirmed.
+
+**Not in Build 8** (explicitly): global invoice-number allocation, print
+automation, email automation, production SSO or RBAC, job queue /
+background worker, unrestricted live API testing, automatic merge to main.
+
 ## Upload order is a business rule
 
 Cartons follow **user upload order, then PDF page order**. The uploader's

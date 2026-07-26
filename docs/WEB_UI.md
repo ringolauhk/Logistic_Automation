@@ -120,7 +120,12 @@ finally (Build 7) **Generate Workbooks**: one validated packing-list
 Review, Source Documents sheets) with per-workbook downloads and a ZIP
 for multiple destinations; stale inputs disable downloads until
 regeneration. Tokens and credentials never reach the browser. Printing
-and email delivery are not included.
+and email delivery are not included. Build 8 adds a **Pilot readiness**
+expander (on-demand redacted diagnostics: OCR, API configuration status
+by variable name, job states, retention — never secrets) and Docker OCR
+support so scanned notes work in the container; live API probes are
+CLI-only, disabled by default, and doubly gated (see
+`docs/transfer_packing/LIVE_VALIDATION.md`).
 Hidden unless `TRANSFER_WORKFLOW_ENABLED=true`; the invoice workflow stays
 the default and is unchanged. Transfer jobs are stored separately under
 `web-data/transfer-jobs/` and are not auto-deleted in Build 1. Full details:

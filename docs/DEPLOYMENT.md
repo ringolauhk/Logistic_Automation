@@ -242,6 +242,21 @@ docker compose up invoice-extractor-web        # http://localhost:8501
   optional `PACKING_*` variables (see `.env.example`); generated workbooks
   live under each transfer job's `output/` folder and are subject to
   `PACKING_OUTPUT_RETENTION_HOURS`.
+- **Docker OCR (Build 8)**: the web image installs the pinned
+  `requirements-ocr.txt` stack plus `libgl1`/`libglib2.0-0`, so scanned
+  (image-only) Transfer Delivery Notes OCR inside the container with no
+  runtime model downloads (models ship in the wheel). This adds roughly
+  1 GB uncompressed to the web image (~1.5 GB total); the CLI image is
+  unchanged. Rebuild with `docker compose build invoice-extractor-web`.
+- **Pilot operations (Build 8)**: `python -m apps.web.transfer.pilot
+  doctor` gives a redacted readiness report (exit 0/1/2);
+  `... pilot cleanup --dry-run|--execute` reclaims expired transfer
+  outputs/tmp/archived metadata (in-progress and invoice jobs are never
+  touched). Live API probes are disabled by default and doubly gated —
+  see `docs/transfer_packing/LIVE_VALIDATION.md`; pilot procedure and
+  rollback: `docs/transfer_packing/PILOT_CHECKLIST.md` and
+  `PILOT_ROLLBACK.md`. Keep `.env` at mode 600; `PILOT_ENABLE_LIVE_*`
+  stay `false` outside an approved validation window.
 
 Full usage, limits, cancellation, retention, and remote-access guidance:
 `docs/WEB_UI.md`.
