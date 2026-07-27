@@ -646,6 +646,54 @@ class TestUiWiring:
         assert "Approve for Product Lookup" in self.RPAGE
         assert "disabled=approve_disabled" in self.RPAGE
 
+    def test_lookup_button_guarded_by_run_lock(self):
+        """One click = at most one outbound run: the button is disabled
+        while pl.lookup_running() reports a live run, and the rate-limit
+        warning surfaces the wait-and-retry guidance."""
+        assert "lookup_running" in self.RPAGE
+        assert "or running)" in self.RPAGE.replace("\n", " ") \
+            or "or running" in self.RPAGE
+        assert "PRODUCT_LOOKUP_RATE_LIMITED" in self.RPAGE
+        assert "will NOT be resent" in self.RPAGE
+
+    def test_enrichment_display_shows_only_populated_attribute_columns(self):
+        """Analysis/Composition columns appear on screen only when at least
+        one product carries a value; always-blank wire fields stay hidden
+        (with a caption naming them) instead of rendering empty columns."""
+        assert "populated_acs" in self.RPAGE
+        assert "populated_comps" in self.RPAGE
+        assert "Returned blank for every product (hidden)" in self.RPAGE
+        assert "All populated Analysis Codes and Compositions" in self.RPAGE
+        # the old fixed AC01-03/Comp01 preview must not come back
+        assert "for i in (1, 2, 3)" not in self.RPAGE
+        assert 'row["Comp01"]' not in self.RPAGE
+
+    def test_product_lookup_navigation_anchor_and_controls(self):
+        """Pilot UX fix: the tall Product lines grid captures scrolling, so
+        the page provides in-page anchor navigation to the Product lookup
+        section. Pure links only - no rerun, no state, no API."""
+        # stable anchor with toolbar-safe scroll margin
+        assert 'id="product-lookup-section"' in self.RPAGE
+        anchor_block = self.RPAGE.split('id="product-lookup-section"')[1]
+        assert "scroll-margin-top" in anchor_block.split(">")[0]
+        # both navigation controls exist and target the anchor
+        assert "Go to Product Lookup" in self.RPAGE
+        assert "Back to Product Lookup" in self.RPAGE
+        helper = self.RPAGE.split("def _goto_lookup_link")[1]
+        assert 'href="#product-lookup-section"' in helper
+        # plain <a> links: no button/rerun/API wiring in the helper
+        for forbidden in ("st.button", "st.rerun", "run_product_lookup",
+                          "http", "onclick"):
+            assert forbidden not in helper.split("def ", 1)[0], forbidden
+        # the anchor markup itself carries no script
+        assert "<script" not in self.RPAGE.lower()
+
+    def test_product_lines_grid_height_is_practical(self):
+        import re
+        heights = [int(h) for h in re.findall(r"height=(\d+)", self.RPAGE)]
+        assert heights, "expected explicit grid heights"
+        assert all(h <= 500 for h in heights), heights
+
     def test_no_api_or_excel_controls(self):
         # Build 7 added a sanctioned workbook/download section; the review
         # sections themselves must stay free of API/Excel controls.

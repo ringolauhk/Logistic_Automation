@@ -102,7 +102,8 @@ def enrich(job_id, extra_records=(), records=None):
          else ALL_RECORDS + ALL_RECORDS_B) + list(extra_records))),
         (200, envelope([]))]     # empty fallback stage when triggered
     pl.run_product_lookup(job_id, auth=FakeAuth(),
-                          transport=FakeTransport(responses))
+                          transport=FakeTransport(responses),
+                          allow_full_rerun=True)   # fixtures re-enrich freely
 
 
 def prepared_job(tmp_path):
@@ -202,6 +203,50 @@ class TestDestinations:
         group = prepared["destinations"][0]
         assert group["source_carton_count"] == 2    # one carton per file
         assert len(group["source_delivery_notes"]) == 2
+
+    def test_header_dn_correction_reaches_packing_outputs(self, tmp_path):
+        """Build 9 pilot-proven defect: a page with NO printed D/N leaves
+        line/carton D/N empty; the reviewed HEADER correction must reach
+        source_delivery_notes, carton source keys, and line sources."""
+        pdf = note_pdf(tmp_path / "nodn.pdf", [
+            {"page_no": 1, "carton": "026", "rows": (ROW_1, ROW_2),
+             "carton_total": "3 UNIT", "header": {"dn": ""}}])
+        uploads = [("nodn.pdf", Path(pdf).read_bytes())]
+        validated, _ = tjobs.validate_transfer_uploads(uploads)
+        job_id = tjobs.create_transfer_job(uploads, validated)
+        extraction.run_extraction(job_id, use_default_adapter=False)
+        review = rv.get_or_create_review(job_id)
+        header = review.headers[0]
+        assert header.original.get("delivery_note_number") in (None, "")
+        rv.apply_correction(review, "document", header.entity_id,
+                            "delivery_note_number",
+                            "ZZWHKD11-OZSO202606040284")
+        rv.save_review(job_id, review)
+        rv.approve_review(job_id)
+        enrich(job_id, records=ALL_RECORDS)
+        prepared = pk.prepare_packing(job_id)
+        group = prepared["destinations"][0]
+        assert group["source_delivery_notes"] == \
+            ["ZZWHKD11-OZSO202606040284"]
+        mapping = group["carton_mappings"][0]
+        assert mapping["source_carton_key"]["delivery_note_number"] == \
+            "ZZWHKD11-OZSO202606040284"
+        for line in group["prepared_lines"]:
+            for source in line["sources"]:
+                assert source["delivery_note_number"] == \
+                    "ZZWHKD11-OZSO202606040284"
+
+    def test_line_level_dn_still_wins_over_header(self, tmp_path):
+        """The fallback must not override a line-level D/N when present."""
+        job_id = prepared_job(tmp_path)
+        prepared = pk.prepare_packing(job_id)
+        group = prepared["destinations"][0]
+        # the default fixture pages print a D/N: it must be used verbatim
+        assert group["source_delivery_notes"]
+        for line in group["prepared_lines"]:
+            for source in line["sources"]:
+                assert source["delivery_note_number"] in \
+                    group["source_delivery_notes"]
 
 
 # --- carton identity, ordering, resequencing --------------------------------------

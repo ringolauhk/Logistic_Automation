@@ -48,6 +48,9 @@ from apps.web.transfer.models import (
     JOB_PACKING_PREPARATION_WITH_ISSUES,
     JOB_PRODUCT_LOOKUP_COMPLETE,
     JOB_PRODUCT_LOOKUP_WITH_ISSUES,
+    JOB_WORKBOOK_GENERATION_COMPLETE,
+    JOB_WORKBOOK_GENERATION_FAILED,
+    JOB_WORKBOOK_GENERATION_WITH_ISSUES,
 )
 from apps.web.transfer.review_models import REVIEW_APPROVED
 
@@ -78,13 +81,20 @@ PACKING_PREPARATION_FAILED_CODE = "PACKING_PREPARATION_FAILED"
 SEV_BLOCKING = "blocking"
 SEV_WARNING = "warning"
 
-# Job states allowed to start/retry preparation.
+# Job states allowed to start/retry preparation. Pilot-proven (Build 9):
+# the Build 7 transition table already allows WORKBOOK_GENERATION_* back to
+# PACKING_PREPARATION_IN_PROGRESS, but this gate was never extended, so a
+# job with generated workbooks could never re-prepare after an upstream
+# fix. Regeneration marks existing outputs stale (Build 7 staleness chain).
 PREPARABLE_STATUSES = (JOB_PRODUCT_LOOKUP_COMPLETE,
                        JOB_PRODUCT_LOOKUP_WITH_ISSUES,
                        JOB_PACKING_PREPARATION_IN_PROGRESS,
                        JOB_PACKING_PREPARATION_COMPLETE,
                        JOB_PACKING_PREPARATION_WITH_ISSUES,
-                       JOB_PACKING_PREPARATION_FAILED)
+                       JOB_PACKING_PREPARATION_FAILED,
+                       JOB_WORKBOOK_GENERATION_COMPLETE,
+                       JOB_WORKBOOK_GENERATION_WITH_ISSUES,
+                       JOB_WORKBOOK_GENERATION_FAILED)
 
 
 # --- configuration ----------------------------------------------------------------
@@ -256,6 +266,11 @@ class _LineCtx:
     carton_entity: object
     quantity: int | None
     order: tuple
+    # Pilot-proven (Build 9): a reviewed HEADER delivery-note correction
+    # must reach packing outputs when page parsing left line/carton D/N
+    # empty - so the resolved value (line original, else header effective)
+    # is carried per line.
+    delivery_note_number: str | None = None
 
 
 def _line_blocking_codes(enrichment: dict) -> dict[str, list[str]]:
@@ -343,7 +358,11 @@ def _collect_lines(review, enrichment) -> tuple[list[_LineCtx], list[dict]]:
             product=products[enrich["product_ref"]],
             destination=destination, destination_name=destination_name,
             carton_entity=carton, quantity=quantity,
-            order=(line.upload_sequence, line.source_page, ordinal)))
+            order=(line.upload_sequence, line.source_page, ordinal),
+            delivery_note_number=(
+                line.original.get("delivery_note_number")
+                or (header.effective("delivery_note_number")
+                    if header else None))))
     return contexts, issues
 
 
@@ -424,9 +443,8 @@ def _build_preparation(job_id, review, enrichment,
             group["carton_order"].append(carton_id)
         group["cartons"][carton_id].append(ctx)
         group["documents"].add(ctx.line.document_id)
-        dn = ctx.line.original.get("delivery_note_number")
-        if dn:
-            group["dns"].add(dn)
+        if ctx.delivery_note_number:
+            group["dns"].add(ctx.delivery_note_number)
 
     dest_blocked = {i["destination"] for i in issues
                     if i.get("severity") == SEV_BLOCKING
@@ -488,7 +506,8 @@ def _build_preparation(job_id, review, enrichment,
                     "upload_sequence": entity.upload_sequence,
                     "source_file": entity.source_file,
                     "delivery_note_number":
-                        entity.original.get("delivery_note_number"),
+                        entity.original.get("delivery_note_number")
+                        or ctxs[0].delivery_note_number,
                     "first_source_page": (entity.source_pages[0]
                                           if entity.source_pages else None),
                 },
@@ -559,8 +578,7 @@ def _build_preparation(job_id, review, enrichment,
                     "source_file": ctx.line.source_file,
                     "upload_sequence": ctx.line.upload_sequence,
                     "source_page": ctx.line.source_page,
-                    "delivery_note_number":
-                        ctx.line.original.get("delivery_note_number"),
+                    "delivery_note_number": ctx.delivery_note_number,
                     "original_carton_number":
                         ctx.line.original.get("original_carton_number"),
                     "source_quantity": ctx.line.original.get("quantity"),

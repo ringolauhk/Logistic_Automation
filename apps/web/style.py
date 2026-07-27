@@ -10,22 +10,35 @@ paths, or secrets - a test asserts that.
 # controls. Body text stays >= ~0.85rem for readability.
 COMPACT_CSS = """
 <style>
-/* page frame: trim outer padding, keep wide layout usable */
+/* page frame: trim outer padding, keep wide layout usable. The top
+   padding MUST clear Streamlit's fixed toolbar (measured 60px tall,
+   absolutely positioned above the content) or the first elements render
+   underneath it. */
 [data-testid="stMainBlockContainer"] {
-    padding-top: 1.6rem;
+    padding-top: 4.5rem;
     padding-bottom: 1rem;
     padding-left: 2.5rem;
     padding-right: 2.5rem;
 }
 /* tighter vertical rhythm between elements */
 [data-testid="stVerticalBlock"] { gap: 0.45rem; }
-[data-testid="stElementContainer"] { margin-bottom: 0; }
 
-/* type scale: compact headings, readable body */
-h1 { font-size: 1.45rem !important; padding-bottom: 0.2rem !important; }
-h2 { font-size: 1.05rem !important; padding-top: 0.4rem !important;
-     padding-bottom: 0.15rem !important; }
-h3 { font-size: 0.95rem !important; padding-bottom: 0.1rem !important; }
+/* Streamlit ships margin-bottom:-1rem inside every heading to cancel its
+   DEFAULT 1rem block gap; with the compact 0.45rem gap above that nets a
+   ~-0.55rem overlap, so tables/grids painted over heading descenders.
+   Neutralize it: headings keep the normal compact gap below them. */
+[data-testid="stHeading"] [data-testid="stMarkdownContainer"] {
+    margin-bottom: 0 !important;
+}
+
+/* type scale: compact headings, readable body. line-height >= 1.3 so no
+   glyph clipping at compact sizes. */
+h1 { font-size: 1.45rem !important; line-height: 1.3 !important;
+     padding-bottom: 0.2rem !important; }
+h2 { font-size: 1.05rem !important; line-height: 1.3 !important;
+     padding-top: 0.4rem !important; padding-bottom: 0.15rem !important; }
+h3 { font-size: 0.95rem !important; line-height: 1.3 !important;
+     padding-bottom: 0.1rem !important; }
 [data-testid="stMarkdownContainer"] p { font-size: 0.88rem; }
 [data-testid="stCaptionContainer"] p { font-size: 0.76rem; }
 

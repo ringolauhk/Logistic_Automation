@@ -119,11 +119,12 @@ class FakeTransport:
         return item
 
 
-def run_lookup(job_id, responses, *, auth=None, config=None):
+def run_lookup(job_id, responses, *, auth=None, config=None, **kwargs):
     auth = auth or FakeAuth()
     transport = FakeTransport(responses)
     enrichment = pl.run_product_lookup(job_id, auth=auth,
-                                       transport=transport, config=config)
+                                       transport=transport, config=config,
+                                       **kwargs)
     return enrichment, transport, auth
 
 
@@ -471,6 +472,52 @@ class TestResponse:
         assert product["original_retail_price"] == "1400.0"
         assert product["ean"] == EAN_A                  # leading zero kept
 
+    def test_live_confirmed_wire_schema_normalizes(self):
+        """Build 9 live-confirmed schema, replayed with SYNTHETIC values:
+        flat camelCase record; analysisCode01..15 always present with
+        blank-as-empty-string; compositions arrive MISSPELLED and unpadded
+        as compositon1..compositon4; locationCode/plu echo the request;
+        ean keeps leading zeros; qty echoes as an int; prices are JSON
+        numbers; unknown fields are preserved in the raw copy."""
+        raw = wire_record("FAKE0010001111A1BXYZM", ean="0999990000012345",
+                          item="FAKE0010001111A1B", color="A1BXY", size="M")
+        raw.update({f"analysisCode{i:02d}": "" for i in range(1, 16)})
+        raw.update({"analysisCode01": "FAKE SEASON",
+                    "analysisCode02": "FAKE-GROUP",
+                    "analysisCode06": "12.5"})
+        raw.update({f"compositon{i}": "" for i in range(1, 5)})
+        raw.update({"compositon1": "FAKE 90% WOOL",
+                    "compositon2": "FAKE 10% SILK"})
+        raw.update({"qty": 1, "someFutureField": "kept-safely"})
+        product = pl.normalize_record(raw)
+        assert product["analysis_code_01"] == "FAKE SEASON"
+        assert product["analysis_code_02"] == "FAKE-GROUP"
+        assert product["analysis_code_06"] == "12.5"
+        assert product["analysis_code_03"] == ""        # blank, not None
+        assert product["analysis_code_15"] == ""
+        # the misspelled real wire names are captured
+        assert product["composition_01"] == "FAKE 90% WOOL"
+        assert product["composition_02"] == "FAKE 10% SILK"
+        assert product["composition_03"] == ""
+        assert product["composition_04"] == ""
+        assert product["ean"] == "0999990000012345"     # leading zero kept
+        assert product["plu"] == "FAKE0010001111A1BXYZM"
+        assert product["location_code"] == "ZZOHK101"
+        assert product["qty_echo"] == "1"
+        assert product["raw"]["someFutureField"] == "kept-safely"
+
+    def test_composition_spelling_variants_all_accepted(self):
+        for key, expected_field in (("compositon1", "composition_01"),
+                                    ("composition1", "composition_01"),
+                                    ("composition01", "composition_01"),
+                                    ("Compositon4", "composition_04"),
+                                    ("composition #4", "composition_04")):
+            product = pl.normalize_record(wire_record("X", **{key: "VAL"}))
+            assert product[expected_field] == "VAL", key
+        # out-of-range numbers are not analysis/composition fields
+        product = pl.normalize_record(wire_record("X", compositon5="V"))
+        assert "composition_05" not in product
+
 
 # --- fallback ---------------------------------------------------------------------
 
@@ -478,6 +525,197 @@ def _fallback_job(tmp_path):
     """Two lines sharing EAN_A (dedup) so fallback is exercised once."""
     dup_rows = (ROW_A, ("2",) + ROW_A[1:])
     return approved_job(tmp_path, [{"rows": dup_rows, "carton_total": None}])
+
+
+class TestRetryResumeAndRateLimit:
+    """Pilot-proven defect (job with 481 lookups): a retry re-ran ALL
+    batches from scratch, resending hundreds of successful requests and
+    triggering an HTTP 429. Retries must resume: completed logical
+    batches are never resent; only failed ones run again with the same
+    logical_batch_number and attempt_number + 1; a run lock makes one
+    click at most one outbound run; 429 maps to a non-retrying
+    rate-limited state."""
+
+    RECORD_A = wire_record(EAN_A)
+    RECORD_B = wire_record(EAN_B, item="ZETF381237E085", color="E085",
+                           size="XS", desc="SRT - JAZZ SHORTS",
+                           price=1900.00)
+    ONE_PER_BATCH = pl.ProductLookupConfig(batch_size=1)
+
+    def test_two_identifiers_produce_one_logical_batch(self, tmp_path):
+        job_id = approved_job(tmp_path)
+        enrichment, transport, _ = run_lookup(
+            job_id, [(200, envelope([self.RECORD_A, self.RECORD_B]))])
+        assert len(transport.calls) == 1
+        assert enrichment["summary"]["batches"] == 1
+        batch = enrichment["batches"][0]
+        assert batch["logical_batch_number"] == 1
+        assert batch["batch_number"] == 1            # legacy alias kept
+        assert batch["attempt_number"] == 1
+        assert batch["status"] == "success"
+        assert batch["started_at"] and batch["completed_at"]
+
+    def test_retry_resends_only_the_failed_batch(self, tmp_path):
+        job_id = approved_job(tmp_path)
+        enrichment, transport, _ = run_lookup(
+            job_id, [(200, envelope([self.RECORD_A])), (500, None)],
+            config=self.ONE_PER_BATCH)
+        assert enrichment["status"] == "failed"
+        assert len(transport.calls) == 2
+        by_number = {b["logical_batch_number"]: b
+                     for b in enrichment["batches"]}
+        assert by_number[1]["status"] == "success"
+        assert by_number[2]["status"] == "failed"
+        assert by_number[2]["error_code"] == pl.PRODUCT_HTTP_ERROR
+
+        # retry: ONLY logical batch 2 goes out; batch 1 is not resent
+        enrichment, transport, _ = run_lookup(
+            job_id, [(200, envelope([self.RECORD_B]))],
+            config=self.ONE_PER_BATCH)
+        assert len(transport.calls) == 1
+        sent = transport.calls[0]["body"]["RequestList"]
+        assert [item["PLU"] for item in sent] == [EAN_B]
+        assert enrichment["status"] == "complete"
+        assert enrichment["summary"]["matched_lines"] == 2
+        by_number = {b["logical_batch_number"]: b
+                     for b in enrichment["batches"]}
+        assert len(by_number) == 2                    # no duplicates
+        assert by_number[1]["attempt_number"] == 1    # preserved
+        assert by_number[2]["attempt_number"] == 2    # replaced in place
+        assert by_number[2]["status"] == "success"
+
+    def test_ten_retries_increment_attempts_not_batches(self, tmp_path):
+        job_id = approved_job(tmp_path)
+        run_lookup(job_id, [(200, envelope([self.RECORD_A])), (500, None)],
+                   config=self.ONE_PER_BATCH)
+        for _ in range(9):
+            enrichment, transport, _ = run_lookup(
+                job_id, [(500, None)], config=self.ONE_PER_BATCH)
+            assert len(transport.calls) == 1          # only the failed one
+        assert len(enrichment["batches"]) == 2
+        assert sorted(b["logical_batch_number"]
+                      for b in enrichment["batches"]) == [1, 2]
+        by_number = {b["logical_batch_number"]: b
+                     for b in enrichment["batches"]}
+        assert by_number[2]["attempt_number"] == 10
+        assert enrichment["summary"]["batch_attempts"] == 11
+
+    def test_completed_run_retry_sends_nothing(self, tmp_path):
+        job_id = approved_job(tmp_path)
+        run_lookup(job_id,
+                   [(200, envelope([self.RECORD_A, self.RECORD_B]))])
+        enrichment, transport, _ = run_lookup(job_id, [])
+        assert transport.calls == []                  # zero outbound
+        assert enrichment["status"] == "complete"
+        assert enrichment["summary"]["matched_lines"] == 2
+
+    def test_rate_limited_maps_and_never_auto_retries(self, tmp_path):
+        job_id = approved_job(tmp_path)
+        enrichment, transport, _ = run_lookup(
+            job_id, [(429, None, {"Retry-After": "120"})])
+        assert len(transport.calls) == 1              # no auto retry at all
+        assert enrichment["status"] == "failed"
+        issue = next(i for i in enrichment["issues"]
+                     if i["code"] == pl.PRODUCT_LOOKUP_RATE_LIMITED)
+        assert issue["retry_after_seconds"] == 120
+        assert "120" in issue["message"]
+        batch = enrichment["batches"][0]
+        assert batch["status"] == "failed"
+        assert batch["http_status"] == 429
+        assert (tjobs.load_transfer_job(job_id).status
+                == tm.JOB_PRODUCT_LOOKUP_FAILED)      # stays retryable
+
+    def test_rate_limit_without_header_still_safe(self, tmp_path):
+        job_id = approved_job(tmp_path)
+        enrichment, transport, _ = run_lookup(job_id, [(429, None)])
+        assert len(transport.calls) == 1              # 429 blocks fallback
+        issue = next(i for i in enrichment["issues"]
+                     if i["code"] == pl.PRODUCT_LOOKUP_RATE_LIMITED)
+        assert issue["retry_after_seconds"] is None
+
+    def test_run_lock_one_click_one_run(self, tmp_path):
+        job_id = approved_job(tmp_path)
+        lock = pl._run_lock_path(job_id)
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text("{}")
+        assert pl.lookup_running(job_id) is True
+        with pytest.raises(JobError, match="already running"):
+            run_lookup(job_id, [(200, envelope([self.RECORD_A,
+                                                self.RECORD_B]))])
+        # a stale lock from a crashed run is reclaimed
+        import os as _os
+        old = 4000.0
+        _os.utime(lock, (old, old))
+        assert pl.lookup_running(job_id) is False
+        enrichment, transport, _ = run_lookup(
+            job_id, [(200, envelope([self.RECORD_A, self.RECORD_B]))])
+        assert enrichment["status"] == "complete"
+        assert not lock.exists()                      # released after run
+
+    def test_legacy_artifact_without_checkpoints_resets_cleanly(
+            self, tmp_path):
+        job_id = approved_job(tmp_path)
+        run_lookup(job_id, [(200, envelope([self.RECORD_A])), (500, None)],
+                   config=self.ONE_PER_BATCH)
+        # simulate a pre-fix artifact: no per-key checkpoints persisted
+        path = pl.result_path(job_id)
+        legacy = json.loads(path.read_text())
+        legacy.pop("key_results", None)
+        path.write_text(json.dumps(legacy))
+        # a plain retry REFUSES the silent full resend
+        with pytest.raises(JobError, match="Restart Product Lookup"):
+            run_lookup(job_id, [], config=self.ONE_PER_BATCH)
+        # the explicitly confirmed restart performs one clean full run:
+        # numbering restarts, no batch-11-style continuation appears
+        enrichment, transport, _ = run_lookup(
+            job_id, [(200, envelope([self.RECORD_A])),
+                     (200, envelope([self.RECORD_B]))],
+            config=self.ONE_PER_BATCH, allow_full_rerun=True)
+        assert len(transport.calls) == 2
+        assert sorted(b["logical_batch_number"]
+                      for b in enrichment["batches"]) == [1, 2]
+        assert all(b["attempt_number"] == 1 for b in enrichment["batches"])
+        assert enrichment["status"] == "complete"
+        # extraction and approved review are untouched by the reset
+        review = rv.load_review(job_id)
+        assert review is not None
+
+    def test_review_change_invalidates_resume(self, tmp_path):
+        job_id = approved_job(tmp_path)
+        run_lookup(job_id, [(200, envelope([self.RECORD_A])), (500, None)],
+                   config=self.ONE_PER_BATCH)
+        review = rv.load_review(job_id)
+        rv.apply_correction(review, "line", review.lines[0].entity_id,
+                            "description", "EDITED AFTER FAILURE")
+        rv.save_review(job_id, review)
+        rv.approve_review(job_id)
+        # the invalidated resume also requires the explicit confirmation
+        with pytest.raises(JobError, match="Restart Product Lookup"):
+            run_lookup(job_id, [], config=self.ONE_PER_BATCH)
+        enrichment, transport, _ = run_lookup(
+            job_id, [(200, envelope([self.RECORD_A])),
+                     (200, envelope([self.RECORD_B]))],
+            config=self.ONE_PER_BATCH, allow_full_rerun=True)
+        assert len(transport.calls) == 2              # full clean rerun
+        assert enrichment["status"] == "complete"
+
+    def test_failed_first_run_needs_no_confirmation(self, tmp_path):
+        """A prior artifact with NO successful batches (or none at all)
+        retries plainly - the confirmation gate is only for reruns that
+        would resend completed work."""
+        job_id = approved_job(tmp_path)
+        run_lookup(job_id, [(429, None)])             # nothing succeeded
+        enrichment, transport, _ = run_lookup(
+            job_id, [(200, envelope([self.RECORD_A, self.RECORD_B]))])
+        assert enrichment["status"] == "complete"
+        assert len(transport.calls) == 1
+
+    def test_resumable_artifact_never_asks_for_confirmation(self, tmp_path):
+        job_id = approved_job(tmp_path)
+        run_lookup(job_id, [(200, envelope([self.RECORD_A])), (500, None)],
+                   config=self.ONE_PER_BATCH)
+        plan = pl.build_plan(job_id, self.ONE_PER_BATCH)
+        assert pl.requires_full_rerun_confirmation(job_id, plan) is False
 
 
 class TestFallback:
@@ -634,10 +872,13 @@ class TestPersistence:
         rv.save_review(job_id, review)
         assert pl.load_enrichment(job_id)["stale"] is True
         rv.approve_review(job_id)
+        # a stale prior with completed batches requires the explicit
+        # confirmed restart (retry-storm protection)
         run_lookup(job_id, [(200, envelope(
             [wire_record(EAN_A, size="M"), wire_record(
                 EAN_B, item="ZETF381237E085", color="E085", size="XS",
-                desc="SRT - JAZZ SHORTS", price=1900.00)]))])
+                desc="SRT - JAZZ SHORTS", price=1900.00)]))],
+            allow_full_rerun=True)
         archived = list(pl.result_path(job_id).parent.glob(
             "result-stale-*.json"))
         assert len(archived) == 1                       # audit copy kept

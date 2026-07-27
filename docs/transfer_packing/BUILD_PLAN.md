@@ -98,3 +98,33 @@ workflow untouched and ships with offline tests.
   customer mappings stay blank until business evidence confirms them.
 - Not in Build 8: global invoice numbering, print/email automation,
   SSO/RBAC, background queues, merge to main.
+
+## Build 9 — live validation and pilot acceptance (this build)
+
+- Controlled live probes executed under explicit approval: auth (one
+  login), product schema (one batch), Qty comparison (one batch). Wire
+  schema confirmed; see `LIVE_VALIDATION.md`.
+- Evidence-based fixes only:
+  1. composition wire names arrive misspelled (`compositon1..4`) — the
+     Build 5 adapter now accepts them (spelling-tolerant regex);
+  2. a reviewed HEADER delivery-note correction now reaches packing
+     outputs (TN# remark, carton source keys, line sources) when page
+     parsing left line/carton D/N empty;
+  3. `PREPARABLE_STATUSES` now includes the workbook states the Build 7
+     transition table always allowed, so packing can be re-prepared after
+     workbook generation (outputs go stale, invoice numbers stay stable).
+- Qty policy A confirmed (Qty stays 1, out of the dedup key).
+- Customer mappings remain blank (no confirming evidence).
+- One controlled end-to-end Docker pilot on a real 1-page image-only
+  Transfer Note: OCR extraction exact, live lookup 1 batch/2 EANs/0
+  fallbacks, workbook validated and opened in Excel without repair,
+  restart recovery proven, redacted `pilot/result.json` written.
+- Not in Build 9: unknown-identifier live test (not approved), global
+  invoice numbering, print/email automation, merge to main.
+- Pilot-hardening follow-up (real 481-lookup job): product lookup is now
+  checkpointed and resumable - completed logical batches are persisted
+  per key and NEVER resent on retry; a failed batch is replaced in place
+  with the same logical_batch_number and attempt_number + 1; a per-job
+  run lock makes one click at most one outbound run; HTTP 429 maps to
+  PRODUCT_LOOKUP_RATE_LIMITED with Retry-After honored and no automatic
+  retry (legacy pre-checkpoint artifacts trigger one clean reset run).

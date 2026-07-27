@@ -95,9 +95,8 @@ def _render_extraction_section(job: TransferPackingJob) -> None:
 
     if result is None:
         st.caption("Extraction output: structured cartons and item lines "
-                   "grouped for review. Product enrichment, carton "
-                   "renumbering, and per-destination packing lists arrive "
-                   "in later builds.")
+                   "grouped for review, then product lookup, packing "
+                   "groups, and per-destination packing-list workbooks.")
         return
 
     summary = result.summary()
@@ -174,9 +173,9 @@ def _render_extraction_section(job: TransferPackingJob) -> None:
     # --- Build 3: review, correction, and approval --------------------------------
     if job.status in review_page.review_mod.REVIEWABLE_JOB_STATUSES:
         review_page.render_review_section(job, result)
-    st.caption("Later builds: product enrichment via the internal API, "
-               "carton renumbering per destination, and Excel packing "
-               "lists.")
+    st.caption("Full workflow: extract, review and approve, run product "
+               "lookup (API is called only on Run), prepare packing "
+               "groups, then generate the packing-list workbooks.")
 
 
 def _render_pilot_readiness() -> None:
@@ -283,6 +282,7 @@ def render() -> None:
         except JobError as exc:
             st.error(str(exc))
 
-    st.caption("Build 1 stores and validates uploads only. Extraction, "
-               "To-Loc. grouping, carton renumbering, and per-destination "
-               "Excel packing lists arrive in later builds.")
+    st.caption("Creating a job stores and validates the uploads; "
+               "extraction, review, product lookup, packing groups, and "
+               "the per-destination workbooks then run from the job page. "
+               "No API is called until you press Run Product Lookup.")

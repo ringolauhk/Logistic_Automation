@@ -34,6 +34,19 @@ from apps.web.style import COMPACT_CSS
 st.set_page_config(page_title="Invoice Extractor Pilot", page_icon="🧾",
                    layout="wide")
 st.markdown(COMPACT_CSS, unsafe_allow_html=True)
+# UI-only fix (pilot-reported): the workflow radio option text rendered
+# invisible in some browsers. Narrowly scoped to radio widgets; no other
+# control or logic is affected.
+st.markdown("""<style>
+div[data-testid="stRadio"] label,
+div[data-testid="stRadio"] p,
+div[data-testid="stRadio"] span {
+    color: #262730 !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+    font-size: 0.9rem !important;
+}
+</style>""", unsafe_allow_html=True)
 
 
 # --- one-time-per-server startup cleanup --------------------------------------

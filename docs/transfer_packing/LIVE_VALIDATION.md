@@ -71,8 +71,39 @@ Outcome must be recorded in `FUNCTIONAL_SPEC.md` as one of:
   quantity (code + tests + docs updated together);
 - **C** — ambiguous; configuration retained and pilot approval blocked.
 
-## Current status
+## Current status (Build 9 — executed under explicit approval)
 
-**Not executed.** Both gates are disabled and no live call has been made.
-Analysis Code / Composition wire names and the Qty policy remain
-**unconfirmed** until the probes above are approved and run.
+All gates were enabled per-command only and are disabled again. Total live
+requests: 3 logins (one per probe/pilot run — probe tokens are never
+reused) + 3 product batches (probe Qty=1, probe Qty=2, pilot lookup).
+One additional auth attempt was interrupted by a local process timeout
+before any result was captured; its downstream request status could not
+be proven, and it is recorded here for completeness.
+
+**Confirmed by evidence** (one product, `CMSHKG11`, PriceDate
+`2026-07-01`, plus a 2-EAN pilot lookup at `ZZOHK101`, `2026-06-06`):
+
+- Flat camelCase records; no nesting; `data` is a list.
+- **Analysis Codes**: `analysisCode01`…`analysisCode15` — always all 15
+  present, blanks are empty strings (never null/omitted).
+- **Compositions**: `compositon1`…`compositon4` — the wire misspells
+  "composition" (missing the second "i") and does not zero-pad; always
+  all 4 present, blank-as-empty-string. The Build 5 adapter was extended
+  to accept the real spelling (plus the previously tolerated variants).
+- **Correlation**: `locationCode` and `plu` echo the request verbatim;
+  `(locationCode, plu)` is a safe correlation key; ordering is not relied
+  upon. `ean` is a string with leading zeros preserved. `qty` echoes as
+  an int. Prices are JSON numbers.
+- **Qty policy A confirmed**: Qty=1 vs Qty=2 for the same product
+  returned byte-identical business fields except the qty echo —
+  `resolve_lookup_qty()` stays 1 and Qty stays out of the deduplication
+  key. Evidence covers one approved product, location, and date.
+- `xf_group5/12/16` values overlapped with some analysisCode values on
+  the sampled product but are **not** a proven mapping — treated as
+  independent fields.
+- **Unknown-identifier omission**: NOT live-tested (not approved);
+  remains specification-based.
+
+Customer Style/Color mappings remain **unconfirmed** and blank — no
+accepted evidence form (written confirmation, spec, production code, or
+explicit instruction) exists yet.

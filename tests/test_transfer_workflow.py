@@ -83,6 +83,28 @@ class TestWorkflowIsolation:
         assert "[WORKFLOW_INVOICE, WORKFLOW_TRANSFER]" in self.APP
         assert "if transfer_jobs.workflow_enabled():" in self.APP
 
+    def test_workflow_radio_labels_present_and_visible(self):
+        """Pilot-reported UI defect: the workflow radio option text
+        rendered invisible. Both option labels must exist, and app.py must
+        carry the narrowly scoped stRadio visibility override (applied
+        after COMPACT_CSS) forcing visible, opaque, colored label text."""
+        assert 'WORKFLOW_INVOICE = "Invoice Extraction"' in self.APP
+        assert 'WORKFLOW_TRANSFER = "Transfer Note Packing List"' in self.APP
+        css_start = self.APP.index("COMPACT_CSS, unsafe_allow_html=True)")
+        override = self.APP[css_start:]
+        assert 'div[data-testid="stRadio"]' in override
+        for rule in ("color: #262730 !important",
+                     "opacity: 1 !important",
+                     "visibility: visible !important",
+                     "font-size: 0.9rem !important"):
+            assert rule in override, rule
+        # the override targets radio widgets only - no broad selectors
+        css_block = override.split("<style>", 1)[1].split("</style>", 1)[0]
+        for selector_line in css_block.splitlines():
+            line = selector_line.strip()
+            if line.endswith("{") or line.endswith(","):
+                assert 'div[data-testid="stRadio"]' in line, line
+
     def test_transfer_page_only_rendered_behind_flag_and_stops(self):
         gated = self.APP.split("workflow_enabled():", 1)[1]
         assert "transfer_page.render()" in gated

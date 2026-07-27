@@ -290,13 +290,20 @@ consolidation, and Excel.**
   colorDesc, sizeCode, plu, ean, itemDesc, longItemDesc, subcat, gender,
   prodLine, supplierItemCode, xf_group5/12/16, originalRetailPrice,
   discountPrice, qty (echo). Prices arrive as JSON numbers and are stored
-  as strings. **Analysis Code 01-15 / Composition #1-4 wire names appear in
-  NO local specification**; the normalizer captures any key matching
-  `analysisCode01`- / `composition01`-style patterns into
-  `analysis_code_01..15` / `composition_01..04`, keeps all `xf_group*`
-  fields, and stores the full token-free raw record - so live responses
-  are captured losslessly whatever the real names are (confirm on first
-  live call).
+  as strings. **Wire names LIVE-CONFIRMED in Build 9** (one controlled
+  probe + the pilot lookup): `analysisCode01`..`analysisCode15` are always
+  all present with blanks as empty strings, and the composition fields
+  arrive MISSPELLED and unpadded as `compositon1`..`compositon4` (also
+  blank-as-empty-string). The normalizer accepts the real wire spelling
+  plus the previously tolerated `composition01`/`Composition #1` variants,
+  maps them into `analysis_code_01..15` / `composition_01..04`, keeps all
+  `xf_group*` fields (their observed value overlap with some analysis
+  codes is NOT a proven mapping), and stores the full token-free raw
+  record. `plu`/`locationCode` echo the request ((locationCode, plu) is
+  the confirmed correlation key), `ean` preserves leading zeros, and Qty
+  is lookup-only (policy A: identical prices/attributes for Qty 1 vs 2 on
+  the sampled product), so `Qty = 1` stays fixed and out of the
+  deduplication key.
 
 ### Identifier rules
 

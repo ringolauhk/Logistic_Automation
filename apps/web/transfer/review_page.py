@@ -79,6 +79,12 @@ def _render_product_lookup_section(job, result, review) -> None:
     presses Run/Retry. No token or credential ever reaches this page."""
     from apps.web.transfer import product_lookup as pl
 
+    # Stable navigation anchor: pure markup, no state, no API. The
+    # scroll-margin keeps the section clear of the fixed 60px toolbar
+    # when jumped to via the #product-lookup-section links.
+    st.markdown('<div id="product-lookup-section" '
+                'style="scroll-margin-top: 4.5rem;"></div>',
+                unsafe_allow_html=True)
     st.header("Product lookup")
     state = pl.readiness()
     label = {"configured": "Configured",
@@ -116,17 +122,52 @@ def _render_product_lookup_section(job, result, review) -> None:
     for problem in plan_problems[:3]:
         st.error(problem)
 
+    running = pl.lookup_running(job.job_id)
     run_disabled = (state["status"] != "configured" or plan is None
-                    or bool(plan_problems) or plan.line_count == 0)
-    run_label = ("Retry Product Lookup"
-                 if job.status in (JOB_PRODUCT_LOOKUP_FAILED,
-                                   JOB_PRODUCT_LOOKUP_WITH_ISSUES,
-                                   JOB_PRODUCT_LOOKUP_IN_PROGRESS)
-                 or enrichment is not None
-                 else "Run Product Lookup")
-    if job.status == JOB_PRODUCT_LOOKUP_IN_PROGRESS:
+                    or bool(plan_problems) or plan.line_count == 0
+                    or running)
+    if running:
+        st.info("A product lookup is running for this job. The button is "
+                "locked so reruns and extra clicks cannot resend anything.")
+    rate_issue = next((i for i in (enrichment or {}).get("issues", [])
+                       if i.get("code") == pl.PRODUCT_LOOKUP_RATE_LIMITED),
+                      None)
+    if rate_issue is not None:
+        wait = rate_issue.get("retry_after_seconds")
+        st.warning("The product API rate-limited the last run. Wait "
+                   + (f"about {wait} seconds" if wait else "a few minutes")
+                   + " before retrying - completed batches are saved and "
+                     "will NOT be resent.")
+    needs_restart_confirmation = (
+        plan is not None and not plan_problems
+        and pl.requires_full_rerun_confirmation(job.job_id, plan))
+    allow_full_rerun = False
+    if needs_restart_confirmation:
+        batch_estimate = -(-len(plan.lookups) // max(config.batch_size, 1))
+        st.warning(
+            "The previous lookup results cannot be resumed (they predate "
+            "checkpointing, or the review changed). A restart will resend "
+            f"ALL {len(plan.lookups)} identifiers in {batch_estimate} API "
+            "batch(es). Previous extraction and review approval remain "
+            "unchanged.")
+        confirmed = st.checkbox(
+            f"I understand: {len(plan.lookups)} identifiers will be "
+            f"resent and {batch_estimate} API batch(es) will run again.",
+            key="transfer_lookup_restart_confirm")
+        run_label = "Restart Product Lookup from Beginning"
+        run_disabled = run_disabled or not confirmed
+        allow_full_rerun = confirmed
+    else:
+        run_label = ("Retry Product Lookup"
+                     if job.status in (JOB_PRODUCT_LOOKUP_FAILED,
+                                       JOB_PRODUCT_LOOKUP_WITH_ISSUES,
+                                       JOB_PRODUCT_LOOKUP_IN_PROGRESS)
+                     or enrichment is not None
+                     else "Run Product Lookup")
+    if job.status == JOB_PRODUCT_LOOKUP_IN_PROGRESS and not running:
         st.warning("A previous product lookup did not finish; retrying is "
-                   "safe (results are written once, atomically).")
+                   "safe - completed batches are checkpointed and are not "
+                   "resent.")
     if st.button(run_label, type="primary", disabled=run_disabled):
         progress = st.progress(0.0, text="Contacting the product API...")
 
@@ -138,7 +179,8 @@ def _render_product_lookup_section(job, result, review) -> None:
         try:
             with st.spinner("Looking up products via the internal API "
                             "Gateway..."):
-                pl.run_product_lookup(job.job_id, on_progress=on_progress)
+                pl.run_product_lookup(job.job_id, on_progress=on_progress,
+                                      allow_full_rerun=allow_full_rerun)
         except Exception as exc:
             st.error(str(exc))
         st.rerun()
@@ -146,9 +188,8 @@ def _render_product_lookup_section(job, result, review) -> None:
     if enrichment is None:
         st.caption("Lookup output: authoritative product attributes "
                    "(including Analysis Codes and Compositions) per "
-                   "reviewed line. Destination grouping, carton "
-                   "renumbering, and Excel packing lists arrive in later "
-                   "builds.")
+                   "reviewed line. Afterwards: Prepare Packing Groups and "
+                   "Generate Workbooks, both further down this page.")
         return
 
     if enrichment.get("stale"):
@@ -191,21 +232,44 @@ def _render_product_lookup_section(job, result, review) -> None:
             "Disc price": product.get("discount_price"),
             "Issues": line.get("comparison_issue_count", 0),
         }
-        for i in (1, 2, 3):                        # compact preview columns
-            row[f"AC{i:02d}"] = product.get(f"analysis_code_{i:02d}")
-        row["Comp01"] = product.get("composition_01")
         rows.append(row)
+    # Show only Analysis/Composition columns that carry a value for at
+    # least one product - blank wire fields (always present, empty) stay
+    # off screen. Full values remain in the artifact and the Detail sheet.
+    populated_acs = [i for i in range(1, 16) if any(
+        (p.get(f"analysis_code_{i:02d}") or "").strip() for p in products)]
+    populated_comps = [i for i in range(1, 5) if any(
+        (p.get(f"composition_{i:02d}") or "").strip() for p in products)]
+    for row, line in zip(rows, enrichment.get("line_enrichments", [])):
+        product = (products[line["product_ref"]]
+                   if line.get("product_ref") is not None else {})
+        for i in populated_acs[:4]:                # compact preview columns
+            row[f"AC{i:02d}"] = product.get(f"analysis_code_{i:02d}")
+        for i in populated_comps[:2]:
+            row[f"Comp{i:02d}"] = product.get(f"composition_{i:02d}")
     if rows:
         st.subheader("Per-line enrichment (source vs API)")
         st.dataframe(rows, height=380)
-        with st.expander("Full Analysis Codes 01-15 and Compositions 1-4"):
+        with st.expander("All populated Analysis Codes and Compositions"):
             st.dataframe([{
                 "Product": p.get("plu") or p.get("ean"),
                 **{f"AC{i:02d}": p.get(f"analysis_code_{i:02d}")
-                   for i in range(1, 16)},
+                   for i in populated_acs},
                 **{f"Comp{i:02d}": p.get(f"composition_{i:02d}")
-                   for i in range(1, 5)},
+                   for i in populated_comps},
             } for p in products])
+            empty_acs = [f"{i:02d}" for i in range(1, 16)
+                         if i not in populated_acs]
+            empty_comps = [str(i) for i in range(1, 5)
+                           if i not in populated_comps]
+            if empty_acs or empty_comps:
+                st.caption(
+                    "Returned blank for every product (hidden): "
+                    + (f"Analysis Codes {', '.join(empty_acs)}"
+                       if empty_acs else "")
+                    + ("; " if empty_acs and empty_comps else "")
+                    + (f"Compositions {', '.join(empty_comps)}"
+                       if empty_comps else "") + ".")
 
     issues = enrichment.get("issues", [])
     if issues:
@@ -220,9 +284,9 @@ def _render_product_lookup_section(job, result, review) -> None:
             "Message": i.get("message"),
         } for i in issues[:300]])
     st.caption("API values never overwrite reviewed source values. Next "
-               "stages (later builds): destination grouping, carton "
-               "renumbering, delivery invoice numbering, and Excel "
-               "packing lists.")
+               "stages: Prepare Packing Groups (destination grouping, "
+               "carton renumbering, delivery invoice numbers), then "
+               "Generate Workbooks - both below, both local.")
 
 
 def render_review_section(job, result: TransferExtractionResult) -> None:
@@ -390,6 +454,11 @@ def render_review_section(job, result: TransferExtractionResult) -> None:
         disabled=("entity_id", "File", "Page", "Carton", "Seq#", "Method",
                   "Original size", "Ready"),
         column_config={"entity_id": None})
+    # The tall grid captures wheel/trackpad scrolling; give users a direct
+    # way back to the Product lookup section without scrolling past it.
+    if job.status in _PRODUCT_STATES:
+        st.markdown(_goto_lookup_link("Back to Product Lookup"),
+                    unsafe_allow_html=True)
 
     # --- F. excluded overview -----------------------------------------------------
     excluded_rows = [
@@ -444,9 +513,10 @@ def render_review_section(job, result: TransferExtractionResult) -> None:
             try:
                 review_mod.approve_review(job.job_id)
                 st.session_state["transfer_review_msg"] = (
-                    "Approved - job is READY_FOR_PRODUCT_LOOKUP. Product "
-                    "lookup itself arrives in a later build; no API was "
-                    "called.")
+                    "Approved - job is READY_FOR_PRODUCT_LOOKUP. Use the "
+                    "Go to Product Lookup button below, then press Run "
+                    "Product Lookup (the API is called only when you "
+                    "press it).")
                 st.rerun()
             except JobError as exc:
                 st.error(str(exc))
@@ -456,6 +526,23 @@ def render_review_section(job, result: TransferExtractionResult) -> None:
                        + (" ..." if len(ev.approval_problems) > 3 else ""))
     if st.session_state.get("transfer_review_msg"):
         st.success(st.session_state.pop("transfer_review_msg"))
+    # Persistent navigation control: pure in-page anchor link - no rerun,
+    # no workflow state change, no API call.
+    if job.status in _PRODUCT_STATES:
+        st.markdown(_goto_lookup_link("Go to Product Lookup"),
+                    unsafe_allow_html=True)
+
+
+def _goto_lookup_link(label: str) -> str:
+    """Button-styled in-page anchor link to #product-lookup-section.
+    Browser-verified to scroll the OUTER Streamlit container (not the
+    grid) even when focus is inside a data editor; triggers no rerun and
+    no API request."""
+    return ('<a href="#product-lookup-section" style="display: '
+            'inline-block; padding: 0.25rem 0.9rem; border: 1px solid '
+            '#d0d0d5; border-radius: 0.5rem; background: #f6f6f8; '
+            f'color: #262730; font-size: 0.85rem; '
+            f'text-decoration: none;">{label}</a>')
 
 
 def _render_packing_section(job) -> None:

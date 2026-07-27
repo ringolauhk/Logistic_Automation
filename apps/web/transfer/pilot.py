@@ -464,10 +464,11 @@ def _probe_with_qty(client, request_items, count):
     """Raw single request honoring a non-default Qty (for the controlled
     Qty comparison) - still one batch, one attempt."""
     token = client.auth.ensure_access_token()
-    status, parsed = client.transport.post_json(
+    result = client.transport.post_json(
         client.lookup_url, {"RequestList": request_items},
         headers={"Authorization": f"Bearer {token}"},
         timeout=client.config.timeout_seconds)
+    status, parsed = result[0], result[1]   # fakes 2-tuple, real 3-tuple
     envelope = parsed if isinstance(parsed, dict) else {}
     data = envelope.get("data")
     from apps.web.transfer.product_lookup import normalize_record

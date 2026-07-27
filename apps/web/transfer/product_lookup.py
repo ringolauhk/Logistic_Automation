@@ -82,6 +82,7 @@ PRODUCT_ACCESS_DENIED = "PRODUCT_ACCESS_DENIED"
 PRODUCT_RESPONSE_INVALID = "PRODUCT_RESPONSE_INVALID"
 PRODUCT_CORRELATION_ERROR = "PRODUCT_CORRELATION_ERROR"
 PRODUCT_RETRY_EXHAUSTED = "PRODUCT_RETRY_EXHAUSTED"
+PRODUCT_RATE_LIMITED = "PRODUCT_RATE_LIMITED"
 
 # --- enrichment issue codes -------------------------------------------------------
 
@@ -90,6 +91,7 @@ PRODUCT_MULTIPLE_MATCHES = "PRODUCT_MULTIPLE_MATCHES"
 PRODUCT_LOOKUP_API_ERROR = "PRODUCT_LOOKUP_API_ERROR"
 PRODUCT_LOOKUP_AUTH_ERROR = "PRODUCT_LOOKUP_AUTH_ERROR"
 PRODUCT_LOOKUP_ACCESS_DENIED = "PRODUCT_LOOKUP_ACCESS_DENIED"
+PRODUCT_LOOKUP_RATE_LIMITED = "PRODUCT_LOOKUP_RATE_LIMITED"
 PRODUCT_LOOKUP_RESPONSE_INVALID = "PRODUCT_LOOKUP_RESPONSE_INVALID"
 PRODUCT_LOOKUP_RESPONSE_AMBIGUOUS = "PRODUCT_LOOKUP_RESPONSE_AMBIGUOUS"
 PRODUCT_LOOKUP_IDENTIFIER_MISSING = "PRODUCT_LOOKUP_IDENTIFIER_MISSING"
@@ -112,7 +114,8 @@ class ProductError(Exception):
                  request_count: int | None = None,
                  http_status: int | None = None,
                  gateway_code: int | None = None,
-                 retryable: bool = False):
+                 retryable: bool = False,
+                 retry_after_seconds: int | None = None):
         self.code = code
         self.operation = operation
         self.batch_number = batch_number
@@ -120,6 +123,7 @@ class ProductError(Exception):
         self.http_status = http_status
         self.gateway_code = gateway_code
         self.retryable = retryable
+        self.retry_after_seconds = retry_after_seconds
         tail = [f"operation={operation}"]
         if batch_number is not None:
             tail.append(f"batch={batch_number}")
@@ -233,10 +237,13 @@ def resolve_price_date(header_date: str | None,
 
 
 def resolve_lookup_qty() -> int:
-    """Qty = 1 for every lookup request (lookup-only semantics). The
-    label-print system sends line quantities and the spec hints Qty may
-    influence returned prices - business confirmation is required before
-    changing this. A constant makes deduplication and correlation exact."""
+    """Qty = 1 for every lookup request (lookup-only semantics).
+    LIVE-CONFIRMED (Build 9, controlled Qty=1 vs Qty=2 comparison on one
+    approved product): the gateway echoes Qty back but returns identical
+    prices, identity fields, analysis codes, and compositions regardless
+    of Qty - policy A, Qty does not affect returned attributes. Evidence
+    scope: one product/location/date; revisit only if a broader defect
+    appears. A constant keeps deduplication and correlation exact."""
     return LOOKUP_QTY
 
 
@@ -450,7 +457,7 @@ class ProductTransport:
             parsed = response.json()
         except (json.JSONDecodeError, ValueError):
             parsed = None
-        return response.status_code, parsed
+        return response.status_code, parsed, dict(response.headers)
 
 
 @dataclass
@@ -494,8 +501,8 @@ class ProductGatewayClient:
                                f"Authentication failed: {exc.code}.",
                                batch_number=batch_number,
                                request_count=len(batch)) from exc
-        status, parsed = self._send_with_retries(body, token, batch_number,
-                                                 len(batch))
+        status, parsed, resp_headers = self._send_with_retries(
+            body, token, batch_number, len(batch))
         auth_recovered = False
         if status == 401:
             logger.info("product lookup batch %d unauthorized; recovering "
@@ -507,8 +514,8 @@ class ProductGatewayClient:
                                    "Authentication could not be restored: "
                                    f"{exc.code}.", batch_number=batch_number,
                                    request_count=len(batch)) from exc
-            status, parsed = self._send_with_retries(body, token,
-                                                     batch_number, len(batch))
+            status, parsed, resp_headers = self._send_with_retries(
+                body, token, batch_number, len(batch))
             auth_recovered = True
             if status == 401:
                 raise ProductError(PRODUCT_ACCESS_DENIED,
@@ -517,17 +524,21 @@ class ProductGatewayClient:
                                    batch_number=batch_number,
                                    request_count=len(batch), http_status=401)
         return self._interpret(status, parsed, batch_number, len(batch),
-                               self.clock() - started, auth_recovered)
+                               self.clock() - started, auth_recovered,
+                               resp_headers)
 
     def _send_with_retries(self, body, token, batch_number, request_count):
         attempts = max(0, self.config.max_retries) + 1
         last: ProductError | None = None
         for attempt in range(1, attempts + 1):
             try:
-                return self.transport.post_json(
+                result = self.transport.post_json(
                     self.lookup_url, body,
                     headers={"Authorization": f"Bearer {token}"},
                     timeout=self.config.timeout_seconds)
+                # fakes may return (status, parsed); real transport adds
+                # response headers for Retry-After handling
+                return result if len(result) == 3 else (*result, {})
             except TransportTimeout:
                 last = ProductError(PRODUCT_TIMEOUT,
                                     "The product API did not respond in "
@@ -551,7 +562,30 @@ class ProductGatewayClient:
                            request_count=request_count)
 
     def _interpret(self, status, parsed, batch_number, request_count,
-                   duration, auth_recovered) -> BatchOutcome:
+                   duration, auth_recovered,
+                   resp_headers=None) -> BatchOutcome:
+        if status == 429:
+            # Rate limited: NEVER auto-retried at any level. The run stops,
+            # completed batches stay persisted, and the operator retries
+            # manually after the advised wait.
+            retry_after = None
+            raw = (resp_headers or {}).get("Retry-After") \
+                or (resp_headers or {}).get("retry-after")
+            if raw is not None:
+                try:
+                    retry_after = max(0, int(float(str(raw).strip())))
+                except (TypeError, ValueError):
+                    retry_after = None
+            wait_text = (f"about {retry_after} seconds" if retry_after
+                         else "a few minutes")
+            raise ProductError(PRODUCT_RATE_LIMITED,
+                               "The product API rate-limited these "
+                               f"requests. Wait {wait_text}, then retry - "
+                               "completed batches will not be resent.",
+                               batch_number=batch_number,
+                               request_count=request_count,
+                               http_status=429,
+                               retry_after_seconds=retry_after)
         if status >= 500:
             raise ProductError(PRODUCT_HTTP_ERROR,
                                "The product API returned a server error.",
@@ -600,7 +634,11 @@ class ProductGatewayClient:
 # --- response normalization -------------------------------------------------------
 
 _ANALYSIS_RE = re.compile(r"(?i)^analysis[_ ]?code[_ ]?0?(\d{1,2})$")
-_COMPOSITION_RE = re.compile(r"(?i)^composition[_ #]?0?(\d{1,2})$")
+# Live-confirmed (Build 9, one controlled probe): the gateway spells the
+# composition wire fields "compositon1".."compositon4" - missing the second
+# "i" and unpadded. Accept both the real wire spelling and the correctly
+# spelled variants used before confirmation.
+_COMPOSITION_RE = re.compile(r"(?i)^composit(?:io|o)n[_ #]*0?(\d{1,2})$")
 
 
 def _wire(raw: dict, *names):
@@ -618,11 +656,15 @@ def _wire(raw: dict, *names):
 
 
 def normalize_record(raw: dict) -> dict:
-    """Wire record -> normalized product dict. Analysis Code 01-15 and
-    Composition #1-4 wire names are NOT present in any local specification
-    (only xf_group5/12/16 appear in evidence); this adapter captures any
-    key matching the documented patterns and keeps the full token-free raw
-    record so nothing is lost whatever the live gateway returns."""
+    """Wire record -> normalized product dict. Live-confirmed schema
+    (Build 9, one controlled probe): flat camelCase record;
+    "analysisCode01".."analysisCode15" always present with blanks as empty
+    strings; compositions arrive misspelled as "compositon1".."compositon4"
+    (also blank-as-empty-string); "locationCode"/"plu" echo the request;
+    "ean" is a string with leading zeros preserved; "qty" echoes as an int;
+    prices are JSON numbers. The adapter still tolerates the previously
+    assumed spellings and keeps the full token-free raw record so nothing
+    is lost if the gateway schema drifts."""
     product = {
         "org_id": _wire(raw, "orgId"),
         "location_code": _wire(raw, "locationCode"),
@@ -825,20 +867,148 @@ def correlate_records(batch: list[ProductLookupKey],
 
 # --- the enrichment run -----------------------------------------------------------
 
+RUN_LOCK_NAME = ".run.lock"
+RUN_LOCK_STALE_SECONDS = 1800
+
+
+def _run_lock_path(job_id: str) -> Path:
+    return result_path(job_id).parent / RUN_LOCK_NAME
+
+
+def lookup_running(job_id: str) -> bool:
+    """True when a fresh run lock exists (another orchestration is live)."""
+    path = _run_lock_path(job_id)
+    try:
+        return time.time() - path.stat().st_mtime < RUN_LOCK_STALE_SECONDS
+    except OSError:
+        return False
+
+
+def _acquire_run_lock(job_id: str) -> Path:
+    """Atomic per-job run lock: one click/rerun = at most one live
+    orchestration. A stale lock (crashed run) is reclaimed."""
+    path = _run_lock_path(job_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for _ in range(2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, json.dumps({"pid": os.getpid(),
+                                     "started_at": utc_now()}).encode())
+            os.close(fd)
+            return path
+        except FileExistsError:
+            try:
+                age = time.time() - path.stat().st_mtime
+            except OSError:
+                continue                     # holder just released: retry
+            if age < RUN_LOCK_STALE_SECONDS:
+                raise JobError(
+                    "A product lookup for this job is already running. "
+                    "Wait for it to finish; nothing was resent.")
+            path.unlink(missing_ok=True)     # stale lock from a dead run
+    raise JobError("The product lookup run lock could not be acquired; "
+                   "try again.")
+
+
+def _serialize_key_results(key_results: dict) -> list[dict]:
+    return [{"key": key.as_dict(), "stage": value["stage"],
+             "products": value["products"]}
+            for key, value in key_results.items()]
+
+
+def _deserialize_key_results(entries) -> dict:
+    key_results = {}
+    for entry in entries or []:
+        try:
+            key = ProductLookupKey(**entry["key"])
+            key_results[key] = {"stage": entry.get("stage", "primary"),
+                                "products": entry.get("products") or []}
+        except (TypeError, KeyError):
+            return {}                        # malformed: force a clean run
+    return key_results
+
+
+def _resumable_prior(job_id: str, plan) -> dict | None:
+    """A prior enrichment usable for resume: same approved review, same
+    plan, and per-key checkpoints present (new-schema artifacts only).
+    Legacy artifacts without checkpoints force a clean reset - batch
+    numbering restarts at 1 and nothing of extraction/review is touched."""
+    prior = load_enrichment(job_id)
+    if prior is None or prior.get("stale"):
+        return None
+    if prior.get("review_checksum") != _review_checksum(job_id):
+        return None
+    if not prior.get("key_results"):
+        return None
+    if prior.get("lookups") != [p.as_dict() for p in plan.lookups]:
+        return None
+    return prior
+
+
+def requires_full_rerun_confirmation(job_id: str, plan) -> bool:
+    """True when a prior enrichment holds successful batches that CANNOT
+    be resumed (legacy pre-checkpoint artifact, or the review/plan changed)
+    - so a retry would resend EVERY lookup. Such a rerun must be
+    explicitly confirmed; the plain Retry action refuses it."""
+    prior = load_enrichment(job_id)
+    if prior is None:
+        return False
+    if not any(b.get("status", "success") == "success"
+               for b in prior.get("batches", [])):
+        return False
+    return _resumable_prior(job_id, plan) is None
+
+
 def run_product_lookup(job_id: str, *,
                        auth: ApiGatewayAuthClient | None = None,
                        transport: ProductTransport | None = None,
                        config: ProductLookupConfig | None = None,
-                       on_progress=None) -> dict:
+                       on_progress=None,
+                       allow_full_rerun: bool = False) -> dict:
     """Execute the full Build 5 enrichment for an approved job. Stops
     before grouping, carton renumbering, row consolidation, or any
-    workbook output."""
+    workbook output.
+
+    Retry semantics (pilot-hardened): results are checkpointed per batch;
+    a retry resumes - completed logical batches are NEVER resent, only
+    missing/failed ones run again with the SAME logical batch number and
+    an incremented attempt_number. A per-job run lock makes one click at
+    most one outbound run."""
     config = config or load_product_config()
     job, result, review = load_approved_inputs(job_id)
     plan = build_plan(job_id, config)
     if plan.planning_problems:
         raise JobError("Product lookup cannot start: "
                        + " ".join(plan.planning_problems[:3]))
+    if not allow_full_rerun and requires_full_rerun_confirmation(job_id,
+                                                                 plan):
+        batches = -(-len(plan.lookups) // max(config.batch_size, 1))
+        raise JobError(
+            "The previous lookup results cannot be resumed, so a retry "
+            f"would resend ALL {len(plan.lookups)} identifiers in "
+            f"{batches} API batch(es). Use the explicit 'Restart Product "
+            "Lookup from Beginning' confirmation to proceed; extraction "
+            "and the approved review are unaffected either way.")
+    lock = _acquire_run_lock(job_id)
+    try:
+        return _run_locked(job_id, plan, config, auth, transport,
+                           on_progress, review)
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def _run_locked(job_id, plan, config, auth, transport, on_progress, review):
+    prior = _resumable_prior(job_id, plan)
+    prior_key_results = (_deserialize_key_results(prior["key_results"])
+                         if prior else {})
+    # ALL prior batch records carry over: successes are preserved (their
+    # keys resolve from checkpoints so they are never resent) and failed /
+    # interrupted records keep the attempt history - a rerun replaces them
+    # in place with attempt_number + 1.
+    preserved_batches = [dict(b) for b in (prior or {}).get("batches", [])]
+    preserved_issues = [i for b in preserved_batches
+                        if b.get("status") == "success"
+                        for i in b.get("correlation_issues", [])]
     jobs.update_job_status(job_id, JOB_PRODUCT_LOOKUP_IN_PROGRESS)
 
     enrichment = {
@@ -859,10 +1029,11 @@ def run_product_lookup(job_id: str, *,
             "price_dates": plan.price_dates,
         },
         "lookups": [p.as_dict() for p in plan.lookups],
-        "batches": [],
+        "batches": preserved_batches,
+        "key_results": [],
         "products": [],
         "line_enrichments": [],
-        "issues": list(plan.line_issues),
+        "issues": list(plan.line_issues) + preserved_issues,
         "summary": {},
     }
 
@@ -871,7 +1042,9 @@ def run_product_lookup(job_id: str, *,
             auth = build_client()
         client = ProductGatewayClient(auth, config, transport=transport)
         key_results = _run_stages(client, plan, config, enrichment,
-                                  on_progress)
+                                  on_progress, job_id=job_id,
+                                  prior_key_results=prior_key_results)
+        enrichment["key_results"] = _serialize_key_results(key_results)
         _assemble_line_enrichments(review, plan, key_results, enrichment)
     except (ProductError, AuthError, JobError) as exc:
         code = getattr(exc, "code", None)
@@ -881,9 +1054,13 @@ def run_product_lookup(job_id: str, *,
                      or code in (PRODUCT_AUTH_ERROR,)
                      else PRODUCT_LOOKUP_ACCESS_DENIED
                      if code == PRODUCT_ACCESS_DENIED
+                     else PRODUCT_LOOKUP_RATE_LIMITED
+                     if code == PRODUCT_RATE_LIMITED
                      else PRODUCT_LOOKUP_API_ERROR),
             "severity": SEV_BLOCKING, "line_id": None, "field": None,
             "source_value": None, "api_value": None,
+            "retry_after_seconds": getattr(exc, "retry_after_seconds",
+                                           None),
             "message": str(exc)})
         enrichment["status"] = "failed"
         enrichment["updated_at"] = utc_now()
@@ -904,37 +1081,87 @@ def run_product_lookup(job_id: str, *,
     return enrichment
 
 
-def _run_stages(client, plan, config, enrichment, on_progress):
+def _run_stages(client, plan, config, enrichment, on_progress, *,
+                job_id=None, prior_key_results=None):
     """Stage 1: all primary lookups (batched). Stage 2: deduplicated
     constructed fallbacks for definitive not-founds only. Returns
-    key -> {"product": dict|None, "products": [..], "stage": ...}."""
-    key_results: dict[ProductLookupKey, dict] = {}
+    key -> {"products": [..], "stage": ...}.
+
+    Resume-safe: logical batch numbers are fixed by the plan; batches
+    whose every key already has a checkpointed result are SKIPPED (never
+    resent). A re-sent batch replaces its failed record in place with the
+    same logical_batch_number and attempt_number + 1. After every batch
+    the enrichment is checkpointed atomically to disk."""
+    key_results: dict[ProductLookupKey, dict] = dict(prior_key_results or {})
+
+    def checkpoint():
+        if job_id is not None:
+            enrichment["key_results"] = _serialize_key_results(key_results)
+            enrichment["updated_at"] = utc_now()
+            _write_enrichment(job_id, enrichment)
+
+    def find_record(stage, number):
+        for existing in enrichment["batches"]:
+            if existing.get("stage") == stage and existing.get(
+                    "logical_batch_number",
+                    existing.get("batch_number")) == number:
+                return existing
+        return None
 
     def run_batches(keys: list[ProductLookupKey], stage: str,
                     batch_offset: int) -> int:
         batches = make_batches(keys, config.batch_size)
-        for number, batch in enumerate(batches, start=batch_offset + 1):
+        total = batch_offset + len(batches)
+        for index, batch in enumerate(batches):
+            number = batch_offset + index + 1
+            if all(key in key_results for key in batch):
+                continue                # completed earlier - never resent
+            previous = find_record(stage, number)
+            record = {
+                "logical_batch_number": number,
+                "batch_number": number,         # backward-compatible alias
+                "stage": stage,
+                "attempt_number": (previous.get("attempt_number", 1) + 1
+                                   if previous else 1),
+                "status": "in_progress",
+                "started_at": utc_now(), "completed_at": None,
+                "request_count": len(batch),
+                "http_status": None, "gateway_code": None,
+                "records_returned": 0, "duration_seconds": None,
+                "auth_recovered": False, "correlation_issues": [],
+            }
+            if previous is not None:            # replace, never append dupes
+                enrichment["batches"][
+                    enrichment["batches"].index(previous)] = record
+            else:
+                enrichment["batches"].append(record)
             if on_progress is not None:
                 try:
-                    on_progress(stage, number,
-                                batch_offset + len(batches), len(batch))
+                    on_progress(stage, number, total, len(batch))
                 except Exception:
                     pass
-            outcome = client.lookup_batch(batch, number)
+            try:
+                outcome = client.lookup_batch(batch, number)
+            except ProductError as exc:
+                record.update(status="failed", completed_at=utc_now(),
+                              http_status=exc.http_status,
+                              gateway_code=exc.gateway_code,
+                              error_code=exc.code)
+                checkpoint()
+                raise
             matches, batch_issues = correlate_records(batch, outcome.records)
             enrichment["issues"].extend(batch_issues)
-            enrichment["batches"].append({
-                "batch_number": number, "stage": stage,
-                "request_count": outcome.request_count,
-                "http_status": outcome.http_status,
-                "gateway_code": outcome.gateway_code,
-                "records_returned": len(outcome.records),
-                "duration_seconds": outcome.duration_seconds,
-                "auth_recovered": outcome.auth_recovered,
-            })
+            record.update(status="success", completed_at=utc_now(),
+                          http_status=outcome.http_status,
+                          gateway_code=outcome.gateway_code,
+                          records_returned=len(outcome.records),
+                          duration_seconds=outcome.duration_seconds,
+                          auth_recovered=outcome.auth_recovered,
+                          correlation_issues=list(batch_issues))
             for key in batch:
                 found = matches.get(key, [])
                 key_results[key] = {"stage": stage, "products": found}
+            checkpoint()
         return len(batches)
 
     primary_keys = [p.key for p in plan.lookups]
@@ -1099,6 +1326,8 @@ def _summarize(enrichment: dict) -> None:
             and l["status"] == "matched"),
         "unique_products": len(enrichment["products"]),
         "batches": len(enrichment["batches"]),
+        "batch_attempts": sum(b.get("attempt_number", 1)
+                              for b in enrichment["batches"]),
         "blocking_issues": sum(1 for i in issues
                                if i.get("severity") == SEV_BLOCKING),
         "warning_issues": sum(1 for i in issues

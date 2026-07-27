@@ -455,6 +455,22 @@ class TestZip:
 # --- persistence + staleness + states ---------------------------------------------
 
 class TestPersistence:
+    def test_repreparation_allowed_after_workbook_generation(self, tmp_path):
+        """Build 9 pilot-proven: WORKBOOK_GENERATION_COMPLETE must allow a
+        packing rerun (the transition table always did); the rerun keeps
+        the invoice number stable and marks existing outputs stale."""
+        job_id, meta = generated_job(tmp_path)
+        invoice_before = meta["destination_workbooks"][0][
+            "delivery_invoice_number"]
+        prepared = pk.prepare_packing(job_id)      # was refused before fix
+        group = prepared["destinations"][0]
+        assert group["delivery_invoice_number"] == invoice_before
+        assert wb.load_output(job_id)["stale"] is True
+        regenerated = wb.generate_workbooks(job_id)
+        assert (regenerated["destination_workbooks"][0][
+            "delivery_invoice_number"] == invoice_before)
+        assert wb.load_output(job_id)["stale"] is False
+
     def test_metadata_schema_checksum_reload(self, tmp_path):
         job_id, meta = generated_job(tmp_path)
         raw = json.loads(wb.output_meta_path(job_id).read_text())
