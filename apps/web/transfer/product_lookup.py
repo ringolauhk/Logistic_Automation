@@ -576,12 +576,17 @@ class ProductGatewayClient:
                     retry_after = max(0, int(float(str(raw).strip())))
                 except (TypeError, ValueError):
                     retry_after = None
-            wait_text = (f"about {retry_after} seconds" if retry_after
-                         else "a few minutes")
-            raise ProductError(PRODUCT_RATE_LIMITED,
-                               "The product API rate-limited these "
-                               f"requests. Wait {wait_text}, then retry - "
-                               "completed batches will not be resent.",
+            if retry_after:
+                message = (f"The product service is rate-limiting this "
+                           f"request. Retry after about {retry_after} "
+                           "seconds - completed batches will not be "
+                           "resent.")
+            else:
+                message = ("The product service is rate-limiting this "
+                           "request. The gateway did not provide a retry "
+                           "time. Do not retry repeatedly. Contact the "
+                           "API administrator or retry later.")
+            raise ProductError(PRODUCT_RATE_LIMITED, message,
                                batch_number=batch_number,
                                request_count=request_count,
                                http_status=429,

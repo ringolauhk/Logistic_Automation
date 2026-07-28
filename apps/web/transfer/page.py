@@ -45,8 +45,66 @@ def _selection_table(validated, *, from_job: bool = False) -> list[dict]:
     return rows
 
 
+_STAGE_GLYPHS = {"complete": "✔", "active": "▶", "failed": "✖",
+                 "blocked": "⛔", "pending": "○"}
+
+
+def _workflow_stages(status: str) -> list[tuple[str, str, str]]:
+    """(stage, state, label) derived ONLY from the persisted job status -
+    the existing single source of truth. No second state system."""
+    def rank(prefixes):
+        return any(status.startswith(p) for p in prefixes)
+
+    extraction = ("active" if status == "EXTRACTING"
+                  else "pending" if status == "READY_FOR_EXTRACTION"
+                  else "complete")
+    review = ("blocked" if status == "REVIEW_REJECTED"
+              else "active" if status in ("EXTRACTED",
+                                          "EXTRACTED_WITH_ISSUES",
+                                          "REVIEW_IN_PROGRESS")
+              else "complete" if not rank(("READY_FOR_EXTRACTION",
+                                           "EXTRACTING"))
+              else "pending")
+    lookup = ("failed" if status == "PRODUCT_LOOKUP_FAILED"
+              else "active" if status == "PRODUCT_LOOKUP_IN_PROGRESS"
+              else "complete" if rank(("PRODUCT_LOOKUP_COMPLETE",
+                                       "PRODUCT_LOOKUP_WITH_ISSUES",
+                                       "PACKING_", "WORKBOOK_"))
+              else "pending")
+    packing = ("failed" if status == "PACKING_PREPARATION_FAILED"
+               else "active" if status == "PACKING_PREPARATION_IN_PROGRESS"
+               else "complete" if rank(("PACKING_PREPARATION_COMPLETE",
+                                        "PACKING_PREPARATION_WITH_ISSUES",
+                                        "WORKBOOK_"))
+               else "pending")
+    workbook = ("failed" if status == "WORKBOOK_GENERATION_FAILED"
+                else "active" if status == "WORKBOOK_GENERATION_IN_PROGRESS"
+                else "complete" if rank(("WORKBOOK_GENERATION_COMPLETE",
+                                         "WORKBOOK_GENERATION_WITH_ISSUES"))
+                else "pending")
+    labels = {"complete": "Complete", "active": "In progress",
+              "failed": "Failed", "blocked": "Blocked",
+              "pending": "Not started"}
+    return [("Extraction", extraction, labels[extraction]),
+            ("Review", review,
+             "Approved" if review == "complete" else labels[review]),
+            ("Product Lookup", lookup, labels[lookup]),
+            ("Packing", packing, labels[packing]),
+            ("Workbook", workbook,
+             "Generated" if workbook == "complete"
+             else "Not generated" if workbook == "pending"
+             else labels[workbook])]
+
+
+def _render_workflow_progress(job: TransferPackingJob) -> None:
+    parts = [f"{_STAGE_GLYPHS[state]} **{stage}** {label}"
+             for stage, state, label in _workflow_stages(job.status)]
+    st.markdown("&nbsp;·&nbsp;".join(parts))
+
+
 def _render_job_summary(job: TransferPackingJob) -> None:
     st.subheader("Transfer Packing job")
+    _render_workflow_progress(job)
     row = st.columns(5)
     row[0].metric("Job ID", job.job_id.rsplit("-", 1)[-1])
     row[1].metric("Files", len(job.files))
@@ -122,22 +180,24 @@ def _render_extraction_section(job: TransferPackingJob) -> None:
 
     cartons = [c for d in result.documents for c in d.cartons]
     if cartons:
-        st.subheader("Cartons")
-        st.table([{
-            "Order": i + 1,
-            "Carton": c.original_carton_number or "?",
-            "Destination": c.destination_code or "?",
-            "D/N": c.delivery_note_number or "?",
-            "File": c.source_file,
-            "Page(s)": ",".join(str(p) for p in c.source_pages),
-            "Lines": len(c.lines),
-            "Units": c.calculated_carton_total,
-            "Printed": (c.printed_carton_total
-                        if c.printed_carton_total is not None else "-"),
-            "Check": c.validation_status,
-        } for i, c in enumerate(cartons)])
+        # Progressive disclosure: successful extraction details stay in
+        # collapsed expanders; the compact summary above is the default.
+        with st.expander("View carton details"):
+            st.table([{
+                "Order": i + 1,
+                "Carton": c.original_carton_number or "?",
+                "Destination": c.destination_code or "?",
+                "D/N": c.delivery_note_number or "?",
+                "File": c.source_file,
+                "Page(s)": ",".join(str(p) for p in c.source_pages),
+                "Lines": len(c.lines),
+                "Units": c.calculated_carton_total,
+                "Printed": (c.printed_carton_total
+                            if c.printed_carton_total is not None else "-"),
+                "Check": c.validation_status,
+            } for i, c in enumerate(cartons)])
 
-        with st.expander("Item lines (read-only preview)"):
+        with st.expander("View extracted item lines"):
             for c in cartons:
                 st.markdown(f"**Carton {c.original_carton_number or '?'}** - "
                             f"{c.destination_code or '?'} - "
@@ -157,7 +217,10 @@ def _render_extraction_section(job: TransferPackingJob) -> None:
 
     issues = result.all_issues()
     if issues:
-        with st.expander(f"Extraction issues - source record ({len(issues)})"):
+        # blocking extraction errors auto-expand; warnings stay collapsed
+        has_blocking = any(i.severity == "error" for i in issues)
+        with st.expander(f"Extraction issues - source record "
+                         f"({len(issues)})", expanded=has_blocking):
             st.table([{
                 "Severity": i.severity,
                 "Code": i.code,

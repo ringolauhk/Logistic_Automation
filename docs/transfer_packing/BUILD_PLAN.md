@@ -121,6 +121,31 @@ workflow untouched and ships with offline tests.
   restart recovery proven, redacted `pilot/result.json` written.
 - Not in Build 9: unknown-identifier live test (not approved), global
   invoice numbering, print/email automation, merge to main.
+## Build 10 — guided workflow UI, consolidated attributes, Excel export
+
+- The Transfer page is a guided top-to-bottom flow: workflow progress
+  indicator (derived solely from the persisted job status), Upload,
+  Extraction, Review & approve, Product lookup, Final enriched product
+  lines, Packing, Workbooks, downloads - the next action always appears
+  directly below the last successful stage (the Build 9 anchor-jump
+  controls are gone).
+- Progressive disclosure: successful stage details collapse into
+  expanders; blocking sections auto-expand; warnings stay collapsed.
+- ONE line-based "Final enriched product lines" table replaces the
+  separate per-line/attribute tables: source values, API values, prices,
+  AC01-AC15 and Composition 1-4 in the same row, fixed schema across
+  jobs, column selector + "Show all product attributes" toggle,
+  identifiers as text.
+- Local Excel export of that table (`enriched_export.py`):
+  Transfer_<job_id>_Enriched_Product_Lines.xlsx, worksheet "Enriched
+  Product Lines", frozen bold header, AutoFilter, text identifiers with
+  leading zeros, numeric quantities/prices, blank attributes stay blank;
+  built in memory from the persisted artifact - no API call, no state
+  change, no temp files.
+- All Build 5-9 protections unchanged (checkpoints, run lock, 429
+  handling incl. the exact no-Retry-After wording, restart confirmation,
+  staleness, redaction).
+
 - Pilot-hardening follow-up (real 481-lookup job): product lookup is now
   checkpointed and resumable - completed logical batches are persisted
   per key and NEVER resent on retry; a failed batch is replaced in place

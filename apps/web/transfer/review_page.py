@@ -79,12 +79,6 @@ def _render_product_lookup_section(job, result, review) -> None:
     presses Run/Retry. No token or credential ever reaches this page."""
     from apps.web.transfer import product_lookup as pl
 
-    # Stable navigation anchor: pure markup, no state, no API. The
-    # scroll-margin keeps the section clear of the fixed 60px toolbar
-    # when jumped to via the #product-lookup-section links.
-    st.markdown('<div id="product-lookup-section" '
-                'style="scroll-margin-top: 4.5rem;"></div>',
-                unsafe_allow_html=True)
     st.header("Product lookup")
     state = pl.readiness()
     label = {"configured": "Configured",
@@ -134,10 +128,16 @@ def _render_product_lookup_section(job, result, review) -> None:
                       None)
     if rate_issue is not None:
         wait = rate_issue.get("retry_after_seconds")
-        st.warning("The product API rate-limited the last run. Wait "
-                   + (f"about {wait} seconds" if wait else "a few minutes")
-                   + " before retrying - completed batches are saved and "
-                     "will NOT be resent.")
+        if wait:
+            st.warning(f"The product service is rate-limiting this "
+                       f"request. Retry after about {wait} seconds - "
+                       "completed batches are saved and will NOT be "
+                       "resent.")
+        else:
+            st.warning("The product service is rate-limiting this "
+                       "request. The gateway did not provide a retry "
+                       "time. Do not retry repeatedly. Contact the API "
+                       "administrator or retry later.")
     needs_restart_confirmation = (
         plan is not None and not plan_problems
         and pl.requires_full_rerun_confirmation(job.job_id, plan))
@@ -198,105 +198,138 @@ def _render_product_lookup_section(job, result, review) -> None:
                    "will require a fresh lookup.")
 
     summary = enrichment.get("summary") or {}
+    batch_records = enrichment.get("batches", [])
+    completed = sorted(b.get("logical_batch_number", b.get("batch_number"))
+                       for b in batch_records
+                       if b.get("status", "success") == "success")
+    failed_batches = sorted(b.get("logical_batch_number",
+                                  b.get("batch_number"))
+                            for b in batch_records
+                            if b.get("status") == "failed")
+    issues = enrichment.get("issues", [])
+    blocking_issues = [i for i in issues if i.get("severity") == "blocking"]
+    warning_issues = [i for i in issues if i.get("severity") != "blocking"]
+
+    def issue_table(items):
+        st.table([{
+            "Severity": i.get("severity"), "Code": i.get("code"),
+            "Line": i.get("line_id") or "-", "Field": i.get("field") or "-",
+            "Source": i.get("source_value"), "API": i.get("api_value"),
+            "Message": i.get("message"),
+        } for i in items[:300]])
+
     st.subheader("Lookup summary")
     r1 = st.columns(6)
-    r1[0].metric("Lines", summary.get("lines", 0))
+    r1[0].metric("Unique products", summary.get("unique_products", 0))
     r1[1].metric("Matched", summary.get("matched_lines", 0))
     r1[2].metric("Via fallback", summary.get("matched_via_fallback", 0))
     r1[3].metric("Unmatched", summary.get("unmatched_lines", 0))
     r1[4].metric("Blocking issues", summary.get("blocking_issues", 0))
     r1[5].metric("Warnings", summary.get("warning_issues", 0))
-    st.caption(f"Unique products: {summary.get('unique_products', 0)} | "
-               f"Batches: {summary.get('batches', 0)} | Status: "
-               f"{enrichment.get('status')}")
+    st.caption(f"Planned batches: {summary.get('batches', 0)} | Completed "
+               f"batches: {len(completed)} | Attempts: "
+               f"{summary.get('batch_attempts', len(batch_records))} | "
+               f"Status: {enrichment.get('status')}")
 
-    products = enrichment.get("products", [])
-    rows = []
-    for line in enrichment.get("line_enrichments", []):
-        product = (products[line["product_ref"]]
-                   if line.get("product_ref") is not None else {})
-        source = line.get("source", {})
-        row = {
-            "Line": line["line_id"],
-            "Carton": line.get("original_carton_number"),
-            "Status": line.get("status"),
-            "Via": line.get("matched_via") or "-",
-            "Src EAN": source.get("ean"),
-            "API EAN": product.get("ean"),
-            "Src item": source.get("item_code"),
-            "API item": product.get("item_code"),
-            "API color": product.get("color_code"),
-            "API size": product.get("size_code"),
-            "API desc": (product.get("item_desc") or "")[:40],
-            "Orig price": product.get("original_retail_price"),
-            "Disc price": product.get("discount_price"),
-            "Issues": line.get("comparison_issue_count", 0),
-        }
-        rows.append(row)
-    # Show only Analysis/Composition columns that carry a value for at
-    # least one product - blank wire fields (always present, empty) stay
-    # off screen. Full values remain in the artifact and the Detail sheet.
-    populated_acs = [i for i in range(1, 16) if any(
-        (p.get(f"analysis_code_{i:02d}") or "").strip() for p in products)]
-    populated_comps = [i for i in range(1, 5) if any(
-        (p.get(f"composition_{i:02d}") or "").strip() for p in products)]
-    for row, line in zip(rows, enrichment.get("line_enrichments", [])):
-        product = (products[line["product_ref"]]
-                   if line.get("product_ref") is not None else {})
-        for i in populated_acs[:4]:                # compact preview columns
-            row[f"AC{i:02d}"] = product.get(f"analysis_code_{i:02d}")
-        for i in populated_comps[:2]:
-            row[f"Comp{i:02d}"] = product.get(f"composition_{i:02d}")
-    if rows:
-        st.subheader("Per-line enrichment (source vs API)")
-        st.dataframe(rows, height=380)
-        with st.expander("All populated Analysis Codes and Compositions"):
-            st.dataframe([{
-                "Product": p.get("plu") or p.get("ean"),
-                **{f"AC{i:02d}": p.get(f"analysis_code_{i:02d}")
-                   for i in populated_acs},
-                **{f"Comp{i:02d}": p.get(f"composition_{i:02d}")
-                   for i in populated_comps},
-            } for p in products])
-            empty_acs = [f"{i:02d}" for i in range(1, 16)
-                         if i not in populated_acs]
-            empty_comps = [str(i) for i in range(1, 5)
-                           if i not in populated_comps]
-            if empty_acs or empty_comps:
-                st.caption(
-                    "Returned blank for every product (hidden): "
-                    + (f"Analysis Codes {', '.join(empty_acs)}"
-                       if empty_acs else "")
-                    + ("; " if empty_acs and empty_comps else "")
-                    + (f"Compositions {', '.join(empty_comps)}"
-                       if empty_comps else "") + ".")
+    # Failures are prominent and auto-expanded; successful diagnostics are
+    # collapsed by default (progressive disclosure).
+    if enrichment.get("status") == "failed" and blocking_issues:
+        if completed:
+            st.caption("Completed batches that will be SKIPPED on retry: "
+                       + ", ".join(str(n) for n in completed)
+                       + (f" | Next failed logical batch: "
+                          f"{failed_batches[0]}" if failed_batches else ""))
+        with st.expander(f"Lookup failure details "
+                         f"({len(blocking_issues)})", expanded=True):
+            issue_table(blocking_issues)
+    elif blocking_issues:
+        with st.expander(f"View lookup issues ({len(blocking_issues)})",
+                         expanded=True):
+            issue_table(blocking_issues)
+    if warning_issues:
+        with st.expander(f"View lookup warnings ({len(warning_issues)})"):
+            issue_table(warning_issues)
+    if batch_records:
+        with st.expander("View API batch history"):
+            st.table([{
+                "Batch": b.get("logical_batch_number",
+                               b.get("batch_number")),
+                "Stage": b.get("stage"),
+                "Attempt": b.get("attempt_number", 1),
+                "Status": b.get("status", "success"),
+                "HTTP": b.get("http_status"),
+                "Requests": b.get("request_count"),
+                "Records": b.get("records_returned"),
+                "Seconds": b.get("duration_seconds"),
+            } for b in batch_records])
+        with st.expander("View retry and checkpoint diagnostics"):
+            st.caption(
+                f"Checkpointed lookups: "
+                f"{len(enrichment.get('key_results') or [])} | Total "
+                f"batch attempts: "
+                f"{summary.get('batch_attempts', len(batch_records))} | "
+                "Completed batches are persisted per key and are never "
+                "resent; a retry re-runs only missing or failed logical "
+                "batches with the same batch number.")
 
-    issues = enrichment.get("issues", [])
-    if issues:
-        st.subheader(f"Product lookup issues ({len(issues)})")
-        st.table([{
-            "Severity": i.get("severity"),
-            "Code": i.get("code"),
-            "Line": i.get("line_id") or "-",
-            "Field": i.get("field") or "-",
-            "Source": i.get("source_value"),
-            "API": i.get("api_value"),
-            "Message": i.get("message"),
-        } for i in issues[:300]])
-    st.caption("API values never overwrite reviewed source values. Next "
-               "stages: Prepare Packing Groups (destination grouping, "
-               "carton renumbering, delivery invoice numbers), then "
-               "Generate Workbooks - both below, both local.")
+    _render_enriched_lines_table(job, enrichment)
+    st.caption("API values never overwrite reviewed source values. "
+               "Continue below: Prepare Packing Groups, then Generate "
+               "Workbooks - both local.")
+
+
+def _render_enriched_lines_table(job, enrichment) -> None:
+    """Build 10: THE primary detailed result - one line-based table with
+    source values, API values, prices, all Analysis Codes and Composition
+    fields, plus the Excel export. Everything comes from the persisted
+    artifact; rendering makes no API call and changes no state."""
+    from apps.web.transfer import enriched_export as ex
+
+    rows = ex.build_rows(enrichment)
+    if not rows:
+        return
+    st.subheader("Final enriched product lines")
+    all_columns = [header for header, _ in ex.EXPORT_COLUMNS]
+    show_all = st.checkbox("Show all product attributes",
+                           key="transfer_enriched_show_all",
+                           help="Adds AC01-AC15 and Composition 1-4 to the "
+                                "table below (same table, more columns).")
+    chosen = st.multiselect(
+        "Columns", all_columns,
+        default=list(ex.DEFAULT_VISIBLE_COLUMNS),
+        key="transfer_enriched_columns")
+    visible = [c for c in all_columns
+               if c in set(chosen)
+               or (show_all and c in ex.ATTRIBUTE_COLUMNS)]
+    display = [{c: ("" if row.get(c) is None else row.get(c))
+                for c in visible} for row in rows]
+    st.dataframe(display, height=420)
+    st.caption(f"{len(rows)} line(s), one row per delivery-note line. "
+               "Identifiers are text - leading zeros preserved. The Excel "
+               "export always contains every column.")
+    try:
+        st.download_button(
+            "Download enriched product lines - Excel",
+            data=ex.build_enriched_workbook_bytes(job.job_id),
+            file_name=ex.export_filename(job.job_id),
+            mime=("application/vnd.openxmlformats-officedocument"
+                  ".spreadsheetml.sheet"),
+            key="transfer_enriched_xlsx")
+    except JobError as exc:
+        st.error(str(exc))
 
 
 def render_review_section(job, result: TransferExtractionResult) -> None:
-    st.header("Review & correct")
+    """Build 10 guided flow: the stages render strictly top-to-bottom -
+    Review & approve, then Product lookup, then the final enriched lines,
+    then Packing, then Workbooks. After each successful stage the next
+    action appears directly BELOW it; no upward navigation is needed."""
+    st.header("Review & approve")
     st.caption("Original extracted values stay stored unchanged; your "
                "corrections are saved separately and the effective value is "
                "correction-if-present, otherwise the original. Empty cells "
                "never erase a value - type `<clear>` to clear one "
-               "deliberately. Product lookup itself arrives in a later "
-               "build.")
+               "deliberately.")
 
     review = review_mod.get_or_create_review(job.job_id)
     if review is None:
@@ -315,22 +348,18 @@ def render_review_section(job, result: TransferExtractionResult) -> None:
         review_mod.begin_review(job.job_id)
 
     ev = review_mod.evaluate(result, review)
+    approved = review.status == REVIEW_APPROVED
 
-    # --- B. blocking banner -----------------------------------------------------
+    # --- B. blocking banner / approved summary ------------------------------------
     if ev.unresolved_blocking:
         st.error(f"{len(ev.unresolved_blocking)} blocking issue(s) must be "
                  "corrected or excluded before approval.")
     elif job.status == JOB_READY_FOR_PRODUCT_LOOKUP:
-        st.success("Approved - ready for product lookup. Editing below "
-                   "reopens the review and makes any enrichment stale.")
-    if job.status in _PRODUCT_STATES:
-        _render_product_lookup_section(job, result, review)
-    if job.status in _PACKING_STATES:
-        _render_packing_section(job)
-    if job.status in _WORKBOOK_STATES:
-        _render_workbook_section(job)
+        st.success("Approved - continue with Product lookup directly "
+                   "below. Editing the review reopens it and makes any "
+                   "enrichment stale.")
 
-    # --- G. validation summary ----------------------------------------------------
+    # --- compact review summary ----------------------------------------------------
     r1 = st.columns(6)
     r1[0].metric("Documents",
                  f"{ev.included_documents}/{ev.included_documents + ev.excluded_documents}")
@@ -351,114 +380,125 @@ def render_review_section(job, result: TransferExtractionResult) -> None:
     if ev.destinations:
         st.caption("Destinations (To Loc.): " + ", ".join(ev.destinations))
 
-    # --- C. header review ---------------------------------------------------------
-    st.subheader("Delivery-note headers")
-    header_rows = []
-    for h in review.headers:
-        header_rows.append({
-            "entity_id": h.entity_id,
-            "File": h.source_file,
-            "Seq": h.upload_sequence,
-            "batch_reference": _fmt(h.effective("batch_reference")),
-            "from_location_code": _fmt(h.effective("from_location_code")),
-            "from_location_name": _fmt(h.effective("from_location_name")),
-            "to_location_code": _fmt(h.effective("to_location_code")),
-            "to_location_name": _fmt(h.effective("to_location_name")),
-            "pick_reference": _fmt(h.effective("pick_reference")),
-            "delivery_note_number": _fmt(h.effective("delivery_note_number")),
-            "delivery_date": _fmt(h.effective("delivery_date")),
-            "Original To Loc.": _fmt(h.original.get("to_location_code")),
-            "Original D/N": _fmt(h.original.get("delivery_note_number")),
-            "excluded": h.excluded,
-            "exclusion_reason": _fmt(h.exclusion_reason),
-        })
-    edited_headers = st.data_editor(
-        header_rows, key="transfer_review_headers", hide_index=True,
-        disabled=("entity_id", "File", "Seq", "Original To Loc.",
-                  "Original D/N"),
-        column_config={"entity_id": None})
+    # --- C/D/E. detail editors ------------------------------------------------------
+    # Progressive disclosure: while the review is ACTIVE the editors are
+    # visible; once APPROVED they collapse into an expander so the next
+    # stages dominate the page. Editing (then saving) still reopens the
+    # review exactly as before.
+    detail_container = (
+        st.expander("View reviewed source records (headers, cartons, "
+                    "product lines)")
+        if approved else st.container())
+    with detail_container:
+        st.subheader("Delivery-note headers")
+        header_rows = []
+        for h in review.headers:
+            header_rows.append({
+                "entity_id": h.entity_id,
+                "File": h.source_file,
+                "Seq": h.upload_sequence,
+                "batch_reference": _fmt(h.effective("batch_reference")),
+                "from_location_code":
+                    _fmt(h.effective("from_location_code")),
+                "from_location_name":
+                    _fmt(h.effective("from_location_name")),
+                "to_location_code": _fmt(h.effective("to_location_code")),
+                "to_location_name": _fmt(h.effective("to_location_name")),
+                "pick_reference": _fmt(h.effective("pick_reference")),
+                "delivery_note_number":
+                    _fmt(h.effective("delivery_note_number")),
+                "delivery_date": _fmt(h.effective("delivery_date")),
+                "Original To Loc.": _fmt(h.original.get("to_location_code")),
+                "Original D/N": _fmt(h.original.get("delivery_note_number")),
+                "excluded": h.excluded,
+                "exclusion_reason": _fmt(h.exclusion_reason),
+            })
+        edited_headers = st.data_editor(
+            header_rows, key="transfer_review_headers", hide_index=True,
+            disabled=("entity_id", "File", "Seq", "Original To Loc.",
+                      "Original D/N"),
+            column_config={"entity_id": None})
 
-    # --- D. carton review ---------------------------------------------------------
-    st.subheader("Cartons (upload order, then page order - not reorderable)")
-    carton_rows = []
-    for c in review.cartons:
-        carton_rows.append({
-            "entity_id": c.entity_id,
-            "File": c.source_file,
-            "Seq": c.upload_sequence,
-            "Pages": ",".join(str(p) for p in c.source_pages),
-            "D/N": _fmt(c.original.get("delivery_note_number")),
-            "Destination": _fmt(c.effective("destination_code")
-                                or c.original.get("destination_code")),
-            "Inherited dest.": bool(c.original.get("destination_inherited")),
-            "original_carton_number":
-                _fmt(c.effective("original_carton_number")),
-            "Extracted carton no.":
-                _fmt(c.original.get("original_carton_number")),
-            "Printed total": _fmt(c.original.get("printed_carton_total")),
-            "Effective total": ev.carton_effective_totals.get(c.entity_id, 0),
-            "excluded": c.excluded,
-            "exclusion_reason": _fmt(c.exclusion_reason),
-        })
-    edited_cartons = st.data_editor(
-        carton_rows, key="transfer_review_cartons", hide_index=True,
-        disabled=("entity_id", "File", "Seq", "Pages", "D/N", "Destination",
-                  "Inherited dest.", "Extracted carton no.", "Printed total",
-                  "Effective total"),
-        column_config={"entity_id": None})
+        st.subheader("Cartons (upload order, then page order - "
+                     "not reorderable)")
+        carton_rows = []
+        for c in review.cartons:
+            carton_rows.append({
+                "entity_id": c.entity_id,
+                "File": c.source_file,
+                "Seq": c.upload_sequence,
+                "Pages": ",".join(str(p) for p in c.source_pages),
+                "D/N": _fmt(c.original.get("delivery_note_number")),
+                "Destination": _fmt(c.effective("destination_code")
+                                    or c.original.get("destination_code")),
+                "Inherited dest.":
+                    bool(c.original.get("destination_inherited")),
+                "original_carton_number":
+                    _fmt(c.effective("original_carton_number")),
+                "Extracted carton no.":
+                    _fmt(c.original.get("original_carton_number")),
+                "Printed total": _fmt(c.original.get("printed_carton_total")),
+                "Effective total":
+                    ev.carton_effective_totals.get(c.entity_id, 0),
+                "excluded": c.excluded,
+                "exclusion_reason": _fmt(c.exclusion_reason),
+            })
+        edited_cartons = st.data_editor(
+            carton_rows, key="transfer_review_cartons", hide_index=True,
+            disabled=("entity_id", "File", "Seq", "Pages", "D/N",
+                      "Destination", "Inherited dest.",
+                      "Extracted carton no.", "Printed total",
+                      "Effective total"),
+            column_config={"entity_id": None})
 
-    # --- E. line review (filtered) ------------------------------------------------
-    st.subheader("Product lines")
-    chosen = st.selectbox("Show", _FILTERS, key="transfer_review_filter")
-    line_rows = []
-    for ln in review.lines:
-        line_ev = ev.lines[ln.entity_id]
-        blocking = bool(line_ev.problems)
-        has_warning = any(
-            w.get("line_ref") == ln.original.get("source_sequence_number")
-            and w.get("carton") == ln.original.get("original_carton_number")
-            for w in ev.unresolved_warnings)
-        if chosen == "Changed" and not ln.corrections:
-            continue
-        if chosen == "Blocking issues" and not blocking:
-            continue
-        if chosen == "Warnings" and not has_warning:
-            continue
-        if chosen == "Excluded" and not line_ev.effective_excluded:
-            continue
-        if chosen == "Lookup not ready" and (line_ev.lookup_ready
-                                             or line_ev.effective_excluded):
-            continue
-        line_rows.append({
-            "entity_id": ln.entity_id,
-            "File": ln.source_file,
-            "Page": ln.source_page,
-            "Carton": _fmt(ln.original.get("original_carton_number")),
-            "Seq#": _fmt(ln.original.get("source_sequence_number")),
-            "Method": _fmt(ln.original.get("extraction_method")),
-            "item_code": _fmt(ln.effective("item_code")),
-            "ean": _fmt(ln.effective("ean")),
-            "description": _fmt(ln.effective("description")),
-            "retail_price": _fmt(ln.effective("retail_price")),
-            "color_code": _fmt(ln.effective("color_code")),
-            "size_code": _fmt(ln.effective("size_code")),
-            "quantity": _fmt(ln.effective("quantity")),
-            "Original size": _fmt(ln.original.get("size_code")),
-            "Ready": "yes" if line_ev.lookup_ready else "NO",
-            "excluded": ln.excluded,
-            "exclusion_reason": _fmt(ln.exclusion_reason),
-        })
-    edited_lines = st.data_editor(
-        line_rows, key=f"transfer_review_lines_{chosen}", hide_index=True,
-        height=420,
-        disabled=("entity_id", "File", "Page", "Carton", "Seq#", "Method",
-                  "Original size", "Ready"),
-        column_config={"entity_id": None})
-    # The tall grid captures wheel/trackpad scrolling; give users a direct
-    # way back to the Product lookup section without scrolling past it.
-    if job.status in _PRODUCT_STATES:
-        st.markdown(_goto_lookup_link("Back to Product Lookup"),
-                    unsafe_allow_html=True)
+        st.subheader("Product lines")
+        chosen = st.selectbox("Show", _FILTERS, key="transfer_review_filter")
+        line_rows = []
+        for ln in review.lines:
+            line_ev = ev.lines[ln.entity_id]
+            blocking = bool(line_ev.problems)
+            has_warning = any(
+                w.get("line_ref") == ln.original.get("source_sequence_number")
+                and w.get("carton") == ln.original.get(
+                    "original_carton_number")
+                for w in ev.unresolved_warnings)
+            if chosen == "Changed" and not ln.corrections:
+                continue
+            if chosen == "Blocking issues" and not blocking:
+                continue
+            if chosen == "Warnings" and not has_warning:
+                continue
+            if chosen == "Excluded" and not line_ev.effective_excluded:
+                continue
+            if chosen == "Lookup not ready" and (line_ev.lookup_ready
+                                                 or
+                                                 line_ev.effective_excluded):
+                continue
+            line_rows.append({
+                "entity_id": ln.entity_id,
+                "File": ln.source_file,
+                "Page": ln.source_page,
+                "Carton": _fmt(ln.original.get("original_carton_number")),
+                "Seq#": _fmt(ln.original.get("source_sequence_number")),
+                "Method": _fmt(ln.original.get("extraction_method")),
+                "item_code": _fmt(ln.effective("item_code")),
+                "ean": _fmt(ln.effective("ean")),
+                "description": _fmt(ln.effective("description")),
+                "retail_price": _fmt(ln.effective("retail_price")),
+                "color_code": _fmt(ln.effective("color_code")),
+                "size_code": _fmt(ln.effective("size_code")),
+                "quantity": _fmt(ln.effective("quantity")),
+                "Original size": _fmt(ln.original.get("size_code")),
+                "Ready": "yes" if line_ev.lookup_ready else "NO",
+                "excluded": ln.excluded,
+                "exclusion_reason": _fmt(ln.exclusion_reason),
+            })
+        edited_lines = st.data_editor(
+            line_rows, key=f"transfer_review_lines_{chosen}",
+            hide_index=True, height=420,
+            disabled=("entity_id", "File", "Page", "Carton", "Seq#",
+                      "Method", "Original size", "Ready"),
+            column_config={"entity_id": None})
 
     # --- F. excluded overview -----------------------------------------------------
     excluded_rows = [
@@ -472,7 +512,9 @@ def render_review_section(job, result: TransferExtractionResult) -> None:
             st.table(excluded_rows)
 
     if ev.unresolved_blocking or ev.unresolved_warnings:
-        with st.expander("Unresolved issues"):
+        # blocking issues auto-expand; warnings stay collapsed
+        with st.expander("Unresolved issues",
+                         expanded=bool(ev.unresolved_blocking)):
             st.table([{"Severity": ("blocking" if r in ev.unresolved_blocking
                                     else "warning"),
                        "Code": r["code"], "File": r["source_file"],
@@ -513,10 +555,9 @@ def render_review_section(job, result: TransferExtractionResult) -> None:
             try:
                 review_mod.approve_review(job.job_id)
                 st.session_state["transfer_review_msg"] = (
-                    "Approved - job is READY_FOR_PRODUCT_LOOKUP. Use the "
-                    "Go to Product Lookup button below, then press Run "
-                    "Product Lookup (the API is called only when you "
-                    "press it).")
+                    "Approved - the Product lookup stage is now directly "
+                    "below. Press Run Product Lookup there (the API is "
+                    "called only when you press it).")
                 st.rerun()
             except JobError as exc:
                 st.error(str(exc))
@@ -526,23 +567,17 @@ def render_review_section(job, result: TransferExtractionResult) -> None:
                        + (" ..." if len(ev.approval_problems) > 3 else ""))
     if st.session_state.get("transfer_review_msg"):
         st.success(st.session_state.pop("transfer_review_msg"))
-    # Persistent navigation control: pure in-page anchor link - no rerun,
-    # no workflow state change, no API call.
+
+    # --- later stages, strictly BELOW the approval area ---------------------------
+    # The top-to-bottom flow makes the old anchor-jump navigation
+    # unnecessary: after approval the Product lookup action appears right
+    # here, and each successful stage reveals the next one beneath it.
     if job.status in _PRODUCT_STATES:
-        st.markdown(_goto_lookup_link("Go to Product Lookup"),
-                    unsafe_allow_html=True)
-
-
-def _goto_lookup_link(label: str) -> str:
-    """Button-styled in-page anchor link to #product-lookup-section.
-    Browser-verified to scroll the OUTER Streamlit container (not the
-    grid) even when focus is inside a data editor; triggers no rerun and
-    no API request."""
-    return ('<a href="#product-lookup-section" style="display: '
-            'inline-block; padding: 0.25rem 0.9rem; border: 1px solid '
-            '#d0d0d5; border-radius: 0.5rem; background: #f6f6f8; '
-            f'color: #262730; font-size: 0.85rem; '
-            f'text-decoration: none;">{label}</a>')
+        _render_product_lookup_section(job, result, review)
+    if job.status in _PACKING_STATES:
+        _render_packing_section(job)
+    if job.status in _WORKBOOK_STATES:
+        _render_workbook_section(job)
 
 
 def _render_packing_section(job) -> None:
@@ -596,10 +631,11 @@ def _render_packing_section(job) -> None:
         st.rerun()
 
     if prepared is None:
-        st.caption("Preparation output: one destination package per future "
+        st.caption("Preparation output: one destination package per "
                    "workbook - grouped by To Loc., cartons renumbered from "
                    "001 per destination, same-carton duplicate lines "
-                   "combined. Excel generation arrives in a later build.")
+                   "combined. Generate Workbooks appears below once "
+                   "preparation succeeds.")
         return
 
     if prepared.get("stale"):
@@ -664,19 +700,20 @@ def _render_packing_section(job) -> None:
 
     issues = prepared.get("issues", [])
     if issues:
-        st.subheader(f"Packing preparation issues ({len(issues)})")
-        st.table([{
-            "Severity": i.get("severity"),
-            "Code": i.get("code"),
-            "Destination": i.get("destination") or "-",
-            "Line": i.get("line_id") or "-",
-            "File": i.get("source_file") or "-",
-            "Message": i.get("message"),
-        } for i in issues[:300]])
+        blocking = any(i.get("severity") == "blocking" for i in issues)
+        with st.expander(f"View packing preparation issues ({len(issues)})",
+                         expanded=blocking):
+            st.table([{
+                "Severity": i.get("severity"),
+                "Code": i.get("code"),
+                "Destination": i.get("destination") or "-",
+                "Line": i.get("line_id") or "-",
+                "File": i.get("source_file") or "-",
+                "Message": i.get("message"),
+            } for i in issues[:300]])
     st.caption("Original carton numbers stay auditable above; API and "
-               "reviewed values remain stored separately. Workbook "
-               "generation arrives in a later build - no files are created "
-               "here.")
+               "reviewed values remain stored separately. Generate "
+               "Workbooks continues directly below.")
 
 
 def _render_workbook_section(job) -> None:

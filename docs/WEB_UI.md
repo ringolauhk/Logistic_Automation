@@ -120,7 +120,15 @@ finally (Build 7) **Generate Workbooks**: one validated packing-list
 Review, Source Documents sheets) with per-workbook downloads and a ZIP
 for multiple destinations; stale inputs disable downloads until
 regeneration. Tokens and credentials never reach the browser. Printing
-and email delivery are not included. Build 8 adds a **Pilot readiness**
+and email delivery are not included. Build 10 turns the page into a
+**guided top-to-bottom flow** (progress indicator, compact stage
+summaries with details in collapsed expanders, the next action always
+directly below the last successful stage) whose primary result is the
+**Final enriched product lines** table - source + API values, prices,
+and all Analysis Code/Composition attributes per line, with a column
+selector and a local **Excel export**
+(`Transfer_<job_id>_Enriched_Product_Lines.xlsx`; no API call, no state
+change). Build 8 adds a **Pilot readiness**
 expander (on-demand redacted diagnostics: OCR, API configuration status
 by variable name, job states, retention — never secrets) and Docker OCR
 support so scanned notes work in the container; live API probes are

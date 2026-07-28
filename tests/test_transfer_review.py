@@ -654,39 +654,59 @@ class TestUiWiring:
         assert "or running)" in self.RPAGE.replace("\n", " ") \
             or "or running" in self.RPAGE
         assert "PRODUCT_LOOKUP_RATE_LIMITED" in self.RPAGE
-        assert "will NOT be resent" in self.RPAGE
+        assert "will NOT be" in self.RPAGE
 
-    def test_enrichment_display_shows_only_populated_attribute_columns(self):
-        """Analysis/Composition columns appear on screen only when at least
-        one product carries a value; always-blank wire fields stay hidden
-        (with a caption naming them) instead of rendering empty columns."""
-        assert "populated_acs" in self.RPAGE
-        assert "populated_comps" in self.RPAGE
-        assert "Returned blank for every product (hidden)" in self.RPAGE
-        assert "All populated Analysis Codes and Compositions" in self.RPAGE
-        # the old fixed AC01-03/Comp01 preview must not come back
-        assert "for i in (1, 2, 3)" not in self.RPAGE
-        assert 'row["Comp01"]' not in self.RPAGE
+    def test_guided_top_to_bottom_stage_order(self):
+        """Build 10 layout: Review & approve first, then (strictly below
+        the save/approve controls) Product lookup, the final enriched
+        lines, Packing, and Workbooks - in source-render order."""
+        section = self.RPAGE.split("def render_review_section", 1)[1]
+        section = section.split("\ndef ", 1)[0]
+        order = [section.index('st.header("Review & approve")'),
+                 section.index('"Save Review"'),
+                 section.index("_render_product_lookup_section(job"),
+                 section.index("_render_packing_section(job)"),
+                 section.index("_render_workbook_section(job)")]
+        assert order == sorted(order), order
+        # the enriched table renders inside the lookup section, before the
+        # packing/workbook stages that follow it
+        lookup = self.RPAGE.split("def _render_product_lookup_section", 1)[1]
+        lookup = lookup.split("\ndef render_review_section", 1)[0]
+        assert "_render_enriched_lines_table(job" in lookup
 
-    def test_product_lookup_navigation_anchor_and_controls(self):
-        """Pilot UX fix: the tall Product lines grid captures scrolling, so
-        the page provides in-page anchor navigation to the Product lookup
-        section. Pure links only - no rerun, no state, no API."""
-        # stable anchor with toolbar-safe scroll margin
-        assert 'id="product-lookup-section"' in self.RPAGE
-        anchor_block = self.RPAGE.split('id="product-lookup-section"')[1]
-        assert "scroll-margin-top" in anchor_block.split(">")[0]
-        # both navigation controls exist and target the anchor
-        assert "Go to Product Lookup" in self.RPAGE
-        assert "Back to Product Lookup" in self.RPAGE
-        helper = self.RPAGE.split("def _goto_lookup_link")[1]
-        assert 'href="#product-lookup-section"' in helper
-        # plain <a> links: no button/rerun/API wiring in the helper
-        for forbidden in ("st.button", "st.rerun", "run_product_lookup",
-                          "http", "onclick"):
-            assert forbidden not in helper.split("def ", 1)[0], forbidden
-        # the anchor markup itself carries no script
-        assert "<script" not in self.RPAGE.lower()
+    def test_no_upward_navigation_and_no_duplicate_lookup_controls(self):
+        """The old anchor-jump controls are gone; exactly one Product
+        Lookup action area exists."""
+        assert "product-lookup-section" not in self.RPAGE
+        assert "Go to Product Lookup" not in self.RPAGE
+        assert "Back to Product Lookup" not in self.RPAGE
+        assert "_goto_lookup_link" not in self.RPAGE
+        # single run/retry/restart action: one st.button in the lookup
+        # section drives all three labels
+        lookup = self.RPAGE.split("def _render_product_lookup_section", 1)[1]
+        lookup = lookup.split("\ndef ", 1)[0]
+        assert lookup.count("st.button(run_label") == 1
+        assert self.RPAGE.count('"Run Product Lookup"') == 1
+
+    def test_progressive_disclosure_defaults(self):
+        """Successful details are collapsed; blocking sections auto-expand;
+        warnings stay collapsed."""
+        # approved review collapses the editors into an expander
+        assert "View reviewed source records" in self.RPAGE
+        assert "if approved else st.container()" in self.RPAGE
+        # unresolved issues expand only when blocking
+        assert "expanded=bool(ev.unresolved_blocking)" in self.RPAGE
+        # lookup failure section auto-expands; diagnostics stay collapsed
+        assert "Lookup failure details" in self.RPAGE
+        for collapsed in ('"View lookup warnings',
+                          '"View API batch history"',
+                          '"View retry and checkpoint diagnostics"'):
+            start = self.RPAGE.index(collapsed)
+            assert "expanded=True" not in self.RPAGE[start:start + 120]
+        # rate-limit copy: exact no-Retry-After wording, no vague estimate
+        assert "did not provide a retry" in self.RPAGE
+        assert "Do not retry repeatedly" in self.RPAGE
+        assert "a few minutes" not in self.RPAGE
 
     def test_product_lines_grid_height_is_practical(self):
         import re
@@ -695,9 +715,14 @@ class TestUiWiring:
         assert all(h <= 500 for h in heights), heights
 
     def test_no_api_or_excel_controls(self):
-        # Build 7 added a sanctioned workbook/download section; the review
-        # sections themselves must stay free of API/Excel controls.
-        review_part = self.RPAGE.split("def _render_workbook_section")[0]
+        # Build 7 sanctioned the workbook/download section; Build 10
+        # sanctioned the enriched-lines Excel export renderer. The rest of
+        # the review page must stay free of API/Excel controls.
+        before, rest = self.RPAGE.split("def _render_enriched_lines_table",
+                                        1)
+        after_enriched = "def " + rest.split("\ndef ", 1)[1]
+        review_part = before + after_enriched.split(
+            "def _render_workbook_section")[0]
         low = (self.PAGE + review_part).lower()
         for forbidden in ("plulabel", "access_token", "auth/login",
                           "openpyxl", "download_button", "resequenc"):

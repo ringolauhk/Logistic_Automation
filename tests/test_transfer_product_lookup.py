@@ -920,13 +920,23 @@ class TestUiAndBoundaries:
 
     def test_summary_and_attribute_columns_present(self):
         assert "Lookup summary" in self.RPAGE
-        assert "analysis_code_" in self.RPAGE
-        assert "composition_" in self.RPAGE
+        # Build 10: Analysis/Composition columns surface through the shared
+        # enriched-export schema in the final enriched lines table
+        assert "Final enriched product lines" in self.RPAGE
+        from apps.web.transfer import enriched_export as ex
+        headers = [h for h, _ in ex.EXPORT_COLUMNS]
+        assert "AC01" in headers and "AC15" in headers
+        assert "Composition 1" in headers and "Composition 4" in headers
 
     def test_no_excel_or_resequencing_controls(self):
-        # scope to the pre-Build-7 sections: the workbook section holds the
+        # scope to the unsanctioned sections: the Build 7 workbook section
+        # and the Build 10 enriched-lines export renderer hold the
         # sanctioned Excel downloads
-        page_part = self.RPAGE.split("def _render_workbook_section")[0]
+        before, rest = self.RPAGE.split("def _render_enriched_lines_table",
+                                        1)
+        after_enriched = "def " + rest.split("\ndef ", 1)[1]
+        page_part = before + after_enriched.split(
+            "def _render_workbook_section")[0]
         low = (page_part + self.PL).lower()
         for forbidden in ("openpyxl", "xlsx", "resequenc", "zipfile",
                           "download_button"):
