@@ -291,10 +291,18 @@ consolidation, and Excel.**
   prodLine, supplierItemCode, xf_group5/12/16, originalRetailPrice,
   discountPrice, qty (echo). Prices arrive as JSON numbers and are stored
   as strings. **Wire names LIVE-CONFIRMED in Build 9** (one controlled
-  probe + the pilot lookup): `analysisCode01`..`analysisCode15` are always
-  all present with blanks as empty strings, and the composition fields
-  arrive MISSPELLED and unpadded as `compositon1`..`compositon4` (also
-  blank-as-empty-string). The normalizer accepts the real wire spelling
+  probe + the pilot lookup) **and corroborated by the official OpenAPI
+  spec** (`docs/api/imaginex-api-swagger-v1.json`, operator-provided;
+  `tests/test_api_spec_sync.py` keeps the adapters aligned with it):
+  `analysisCode01`..`analysisCode15` are always all present with blanks
+  as empty strings, and the composition fields arrive MISSPELLED and
+  unpadded as `compositon1`..`compositon4` (also blank-as-empty-string).
+  The spec documents camelCase request properties
+  (locationCode/plu/qty/priceDate); the client's live-proven PascalCase
+  wire casing binds case-insensitively on the server and stays unchanged.
+  The spec also lists endpoints this project does not call
+  (invByItem-get, invByPluLoc-get, itemMaster-get) and optional request
+  fields it does not send (item/color/size, login targetData). The normalizer accepts the real wire spelling
   plus the previously tolerated `composition01`/`Composition #1` variants,
   maps them into `analysis_code_01..15` / `composition_01..04`, keeps all
   `xf_group*` fields (their observed value overlap with some analysis

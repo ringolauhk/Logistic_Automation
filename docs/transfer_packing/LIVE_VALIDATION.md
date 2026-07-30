@@ -107,3 +107,13 @@ be proven, and it is recorded here for completeness.
 Customer Style/Color mappings remain **unconfirmed** and blank — no
 accepted evidence form (written confirmation, spec, production code, or
 explicit instruction) exists yet.
+
+**Official API spec (post-Build-10 update):** the operator supplied the
+authoritative imxapig OpenAPI document, now tracked at
+`docs/api/imaginex-api-swagger-v1.json`. It corroborates every live observation
+above (envelope shape, `analysisCode01..15`, the misspelled
+`compositon1..4`, string `plu`/`ean`, decimal prices, int `qty`, login
+`client`/`userId`/`password`/`locale`, refresh `rt`).
+`tests/test_api_spec_sync.py` fails loudly if a future spec update drifts
+from what the clients expect. When a newer spec is issued, replace that
+file and re-run the suite.
