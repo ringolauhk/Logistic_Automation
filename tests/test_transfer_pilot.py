@@ -143,32 +143,29 @@ class TestAuthProbe:
 
 class TestProductProbe:
     def _run(self, monkeypatch, responses, *, plus=("4894532999996",),
-             qty=1, show_values=False):
+             show_values=False):
         monkeypatch.setenv("PILOT_ENABLE_LIVE_PRODUCT_LOOKUP", "true")
         transport = FakeTransport(responses)
         auth = FakeAuth()
         observation = pilot.product_probe(
-            location="ZZOHK101", price_date="2026-07-24", plus=list(plus),
-            qty=qty, confirm=True, show_values=show_values,
+            org_id="100009", plus=list(plus),
+            confirm=True, show_values=show_values,
             transport=transport, auth=auth)
         return observation, transport, auth
 
     def test_disabled_by_default(self):
         with pytest.raises(JobError, match="disabled"):
-            pilot.product_probe(location="X", price_date="2026-07-24",
-                                plus=["1"], confirm=True)
+            pilot.product_probe(org_id="100009", plus=["1"], confirm=True)
 
     def test_requires_confirmation_and_limits_identifiers(self, monkeypatch):
         monkeypatch.setenv("PILOT_ENABLE_LIVE_PRODUCT_LOOKUP", "true")
         with pytest.raises(JobError, match="confirmation"):
-            pilot.product_probe(location="X", price_date="2026-07-24",
-                                plus=["1"])
+            pilot.product_probe(org_id="100009", plus=["1"])
         with pytest.raises(JobError, match="1-3"):
-            pilot.product_probe(location="X", price_date="2026-07-24",
+            pilot.product_probe(org_id="100009",
                                 plus=["1", "2", "3", "4"], confirm=True)
-        with pytest.raises(JobError, match="YYYY-MM-DD"):
-            pilot.product_probe(location="X", price_date="24/07/2026",
-                                plus=["1"], confirm=True)
+        with pytest.raises(JobError, match="Organization ID"):
+            pilot.product_probe(org_id="999999", plus=["1"], confirm=True)
 
     def test_success_observes_schema_without_values(self, monkeypatch):
         record = wire_record("4894532999996", ean="4894532999996")
@@ -202,15 +199,15 @@ class TestProductProbe:
         for banned in ("password", "accessToken", "Authorization"):
             assert banned not in blob
 
-    def test_non_default_qty_sends_single_raw_request(self, monkeypatch):
+    def test_request_carries_org_and_plu_only(self, monkeypatch):
         record = wire_record("4894532999996", ean="4894532999996")
         observation, transport, _ = self._run(
-            monkeypatch, [(200, envelope([record]))], qty=6)
+            monkeypatch, [(200, envelope([record]))])
         assert observation["success"] is True
-        assert observation["qty"] == 6
+        assert observation["organization_id"] == "100009"
         assert len(transport.calls) == 1
-        items = transport.calls[0]["body"]["RequestList"]
-        assert all(item["Qty"] == 6 for item in items)
+        items = transport.calls[0]["body"]["requestList"]
+        assert items == [{"orgId": "100009", "plu": "4894532999996"}]
 
     def test_failure_reports_error_code_and_clears_tokens(self, monkeypatch):
         observation, _, auth = self._run(monkeypatch, [(500, None)])
@@ -452,8 +449,8 @@ class TestCli:
 
     def test_product_check_blocked_without_env_flag(self):
         with pytest.raises(JobError, match="disabled"):
-            pilot.main(["product-check", "--yes", "--location", "X",
-                        "--price-date", "2026-07-24", "--plu", "1"])
+            pilot.main(["product-check", "--yes", "--org", "100009",
+                        "--plu", "1"])
 
 
 # --- Docker / packaging (static) --------------------------------------------------
@@ -512,8 +509,7 @@ class TestUiAndBoundaries:
     def test_probe_output_shapes_are_json_safe(self, monkeypatch):
         monkeypatch.setenv("PILOT_ENABLE_LIVE_PRODUCT_LOOKUP", "true")
         observation = pilot.product_probe(
-            location="ZZOHK101", price_date="2026-07-24",
-            plus=["123"], confirm=True,
+            org_id="100009", plus=["123"], confirm=True,
             transport=FakeTransport([(200, envelope([]))]),
             auth=FakeAuth())
         json.dumps(observation)          # must not raise

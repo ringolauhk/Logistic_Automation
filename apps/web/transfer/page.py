@@ -102,9 +102,35 @@ def _render_workflow_progress(job: TransferPackingJob) -> None:
     st.markdown("&nbsp;·&nbsp;".join(parts))
 
 
+def _render_organization_selector() -> None:
+    """Build 11: the API login account is shared and NOT tied to one
+    organization, so the user must deliberately choose the organization
+    whose item master is queried. The selection (name + Organization ID)
+    lives in session state; product lookup stays blocked without it and
+    the ID is sent as `orgId` on every itemMaster-get request. Never
+    derived from the login account, token, or .env."""
+    from apps.web.transfer import organizations as orgs
+    chosen = st.selectbox(
+        "Organization", orgs.organization_names(), index=None,
+        placeholder="Select an organization",
+        key="transfer_org_name",
+        help="Determines which organization's item master is queried. "
+             "The API credentials in the server environment are a shared "
+             "account and do not imply an organization.")
+    org = orgs.by_name(chosen) if chosen else None
+    st.session_state["transfer_org_id"] = org.org_id if org else None
+    if org is not None:
+        st.caption(f"Organization ID: {org.org_id} (sent as orgId with "
+                   "every product lookup)")
+    else:
+        st.caption("Product lookup stays disabled until an organization "
+                   "is selected.")
+
+
 def _render_job_summary(job: TransferPackingJob) -> None:
     st.subheader("Transfer Packing job")
     _render_workflow_progress(job)
+    _render_organization_selector()
     row = st.columns(5)
     row[0].metric("Job ID", job.job_id.rsplit("-", 1)[-1])
     row[1].metric("Files", len(job.files))

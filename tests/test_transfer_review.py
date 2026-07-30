@@ -646,6 +646,56 @@ class TestUiWiring:
         assert "Approve for Product Lookup" in self.RPAGE
         assert "disabled=approve_disabled" in self.RPAGE
 
+    def test_organization_selector_and_gating(self):
+        """Build 11: a deliberate organization selection is required
+        before Product Lookup - selector near the top, placeholder (no
+        silent default), name+ID in session state, lookup blocked and a
+        specific message shown without a selection, and the selected ID
+        (never the login account) drives the request."""
+        # selector renders in the job summary, BEFORE the workflow stages
+        summary = self.PAGE.split("def _render_job_summary", 1)[1]
+        summary = summary.split("\ndef ", 1)[0]
+        assert "_render_organization_selector()" in summary
+        assert (summary.index("_render_organization_selector()")
+                < summary.index("_render_extraction_section"))
+        selector = self.PAGE.split("def _render_organization_selector",
+                                   1)[1].split("\ndef ", 1)[0]
+        assert 'placeholder="Select an organization"' in selector
+        assert "index=None" in selector              # no silent default
+        assert '"transfer_org_name"' in selector     # session state keys
+        assert '"transfer_org_id"' in selector
+        assert "Organization ID" in selector
+        # lookup side: gated on the session selection with a clear message
+        lookup = self.RPAGE.split("def _render_product_lookup_section",
+                                  1)[1].split("\ndef ", 1)[0]
+        assert 'st.session_state.get("transfer_org_id")' in lookup
+        assert "Select an organization" in lookup
+        assert "org_id=org_id" in lookup             # plan uses the UI org
+        assert "run_product_lookup(job.job_id, org_id=org_id" in lookup
+        # never derived from credentials/token (docstrings may explain
+        # the prohibition; no credential/token API is touched)
+        for banned in ("API_GATEWAY_USER_ID", "ensure_access_token",
+                       "credentials.", "load_credentials"):
+            assert banned not in selector, banned
+
+    def test_org_change_invalidates_lookup_and_downstream(self):
+        """Changing organization hides stale enrichment and blocks the
+        packing/workbook stages until a fresh lookup runs; extraction and
+        review rendering stay unconditional."""
+        assert "_lookup_org_mismatch" in self.RPAGE
+        section = self.RPAGE.split("def render_review_section", 1)[1]
+        section = section.split("\ndef ", 1)[0]
+        assert "_lookup_org_mismatch(job) is None" in section
+        # packing/workbook gated on the mismatch; review editors are not
+        gate = section.index("_lookup_org_mismatch(job) is None")
+        assert section.index("_render_packing_section(job)") > gate
+        assert section.index("_render_workbook_section(job)") > gate
+        assert section.index("Save Review") < gate
+        lookup = self.RPAGE.split("def _render_product_lookup_section",
+                                  1)[1].split("\ndef ", 1)[0]
+        assert "NOT the" in lookup                   # explicit stale-org copy
+        assert "Extraction and the approved" in lookup
+
     def test_lookup_button_guarded_by_run_lock(self):
         """One click = at most one outbound run: the button is disabled
         while pl.lookup_running() reports a live run, and the rate-limit

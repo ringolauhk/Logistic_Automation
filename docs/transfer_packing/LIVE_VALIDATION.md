@@ -117,3 +117,19 @@ above (envelope shape, `analysisCode01..15`, the misspelled
 `tests/test_api_spec_sync.py` fails loudly if a future spec update drifts
 from what the clients expect. When a newer spec is issued, replace that
 file and re-run the suite.
+
+**Build 11 endpoint change — live validation PENDING:** the Transfer
+lookup now calls `/corpTool/itemMaster-get` with
+`{"requestList": [{"orgId", "plu"}]}` (organization selected in the UI;
+`locationCode` omitted per the nullable schema). The Build 9 evidence
+above validated `pluLabel-get`; the itemMaster form is implemented
+strictly from the tracked spec and offline tests. Before pilot use,
+run one controlled probe under the usual double gate:
+
+```bash
+PILOT_ENABLE_LIVE_PRODUCT_LOOKUP=true python -m apps.web.transfer.pilot \
+  product-check --yes --org <APPROVED-ORGANIZATION-ID> --plu <APPROVED-ID>
+```
+
+to confirm: envelope shape, plu/ean echo, orgId echo, AC01-15 and
+compositon1-4 population, and originalPrice/currentPrice semantics.

@@ -56,19 +56,27 @@ def approved_job(tmp_path, page_specs=None, approve=True):
     return job_id
 
 
-def wire_record(plu, *, location="ZZOHK101", ean=None, item=None, color=None,
-                size=None, desc="TOP - SQ NK BRA", price=1400.00, **extra):
+ORG_HK = "100009"                       # IMAGINEX Hong Kong (approved)
+ORG_TW = "100012"                       # IMAGINEX Taiwan (approved)
+
+
+def wire_record(plu, *, org=ORG_HK, ean=None, item=None, color=None,
+                size=None, desc="TOP - SQ NK BRA", price=1400.00,
+                location=None, **extra):
+    """Synthetic ItemMasterResDto-shaped record (spec: no locationCode,
+    no xf_group*, no qty echo; prices are originalPrice/currentPrice).
+    `location` is accepted for legacy call sites and ignored."""
     record = {
-        "orgId": "100009", "locationCode": location, "brand": "ZE",
+        "orgId": org, "brand": "ZE",
         "brandName": "Test Brand", "currency": "HKD",
         "itemCode": item or "ZEHE380331E997",
         "colorCode": color or "E997", "sizeCode": size or "S",
         "plu": plu, "ean": ean if ean is not None else plu,
         "itemDesc": desc, "longItemDesc": desc, "colorDesc": "BLACK",
-        "subcat": "X", "gender": "L", "prodLine": "N/A",
-        "supplierItemCode": "295900078001", "xf_group5": "N/A",
-        "xf_group12": "MAIN", "xf_group16": "169.5",
-        "originalRetailPrice": price, "discountPrice": 399.00, "qty": 1,
+        "subcat": "X", "subcatDesc": "Sub", "cat": "C1", "gender": "L",
+        "prodLine": "N/A", "season": "FW26", "seasonDesc": "Fall 2026",
+        "supplierItemCode": "295900078001", "countryOfOrigin": "CN",
+        "originalPrice": price, "currentPrice": 399.00,
     }
     record.update(extra)
     return record
@@ -122,6 +130,8 @@ class FakeTransport:
 def run_lookup(job_id, responses, *, auth=None, config=None, **kwargs):
     auth = auth or FakeAuth()
     transport = FakeTransport(responses)
+    kwargs.setdefault("org_id", ORG_HK)
+    kwargs.setdefault("org_name", "IMAGINEX Hong Kong")
     enrichment = pl.run_product_lookup(job_id, auth=auth,
                                        transport=transport, config=config,
                                        **kwargs)
@@ -133,7 +143,7 @@ def run_lookup(job_id, responses, *, auth=None, config=None, **kwargs):
 class TestConfig:
     def test_defaults_and_endpoint_path(self):
         config = pl.load_product_config()
-        assert config.lookup_path == "/corpTool/pluLabel-get"
+        assert config.lookup_path == "/corpTool/itemMaster-get"
         assert config.batch_size == 50
         assert config.timeout_seconds == 120
         assert config.max_retries == 3
@@ -165,19 +175,19 @@ class TestConfig:
 class TestReviewBoundary:
     def test_approved_current_review_accepted(self, tmp_path):
         job_id = approved_job(tmp_path)
-        plan = pl.build_plan(job_id)
+        plan = pl.build_plan(job_id, org_id=ORG_HK)
         assert plan.line_count == 2
 
     def test_unapproved_review_rejected(self, tmp_path):
         job_id = approved_job(tmp_path, approve=False)
         with pytest.raises(JobError):
-            pl.build_plan(job_id)
+            pl.build_plan(job_id, org_id=ORG_HK)
 
     def test_stale_review_rejected(self, tmp_path):
         job_id = approved_job(tmp_path)
         extraction.run_extraction(job_id, use_default_adapter=False)
         with pytest.raises(JobError):
-            pl.build_plan(job_id)
+            pl.build_plan(job_id, org_id=ORG_HK)
 
     def test_excluded_lines_omitted_and_corrections_used(self, tmp_path):
         job_id = approved_job(tmp_path)
@@ -187,7 +197,7 @@ class TestReviewBoundary:
                             "0099900011122")
         rv.save_review(job_id, review)
         rv.approve_review(job_id)
-        plan = pl.build_plan(job_id)
+        plan = pl.build_plan(job_id, org_id=ORG_HK)
         assert plan.line_count == 1
         assert plan.lookups[0].key.plu == "0099900011122"   # corrected value
         assert all(EAN_A != p.key.plu for p in plan.lookups)  # original unused
@@ -198,7 +208,7 @@ class TestReviewBoundary:
 class TestPlanning:
     def test_ean_primary_with_leading_zeros(self, tmp_path):
         job_id = approved_job(tmp_path)
-        plan = pl.build_plan(job_id)
+        plan = pl.build_plan(job_id, org_id=ORG_HK)
         assert [p.key.plu for p in plan.lookups] == [EAN_A, EAN_B]
         assert all(p.key.identifier_type == "EAN" for p in plan.lookups)
         assert plan.lookups[0].key.plu.startswith("0")
@@ -213,7 +223,7 @@ class TestPlanning:
         rv.apply_correction(review, "line", "D001-C001-L001", "ean", CLEAR)
         rv.save_review(job_id, review)
         rv.approve_review(job_id)
-        plan = pl.build_plan(job_id)
+        plan = pl.build_plan(job_id, org_id=ORG_HK)
         first = plan.lookups[0]
         # item ZEHE380331E997 already ends with color E997 - kept anyway
         assert first.key.plu == CONSTRUCTED_A
@@ -229,7 +239,7 @@ class TestPlanning:
         for fld in ("ean", "color_code"):
             rv.apply_correction(review, "line", "D001-C001-L001", fld, CLEAR)
         rv.save_review(job_id, review)
-        plan = pl.build_plan(job_id)
+        plan = pl.build_plan(job_id, org_id=ORG_HK)
         assert plan.no_identifier_lines == 1
         issues = [i for i in plan.line_issues
                   if i["code"] == pl.PRODUCT_LOOKUP_IDENTIFIER_MISSING]
@@ -240,7 +250,7 @@ class TestPlanning:
         dup_rows = (ROW_A, ("2",) + ROW_A[1:], ROW_B)
         job_id = approved_job(tmp_path, [{"rows": dup_rows,
                                           "carton_total": None}])
-        plan = pl.build_plan(job_id)
+        plan = pl.build_plan(job_id, org_id=ORG_HK)
         assert plan.line_count == 3
         assert len(plan.lookups) == 2                   # deduplicated
         first = next(p for p in plan.lookups if p.key.plu == EAN_A)
@@ -249,38 +259,38 @@ class TestPlanning:
 
     def test_deterministic_order(self, tmp_path):
         job_id = approved_job(tmp_path)
-        a = [p.key for p in pl.build_plan(job_id).lookups]
-        b = [p.key for p in pl.build_plan(job_id).lookups]
+        a = [p.key for p in pl.build_plan(job_id, org_id=ORG_HK).lookups]
+        b = [p.key for p in pl.build_plan(job_id, org_id=ORG_HK).lookups]
         assert a == b
 
-    def test_price_date_from_delivery_note_and_location_from_to_loc(self, tmp_path):
+    def test_org_from_ui_selection_is_the_key_identity(self, tmp_path):
+        """Build 11: keys carry the UI-selected Organization ID; no
+        location and no price date exist in the lookup identity."""
         job_id = approved_job(tmp_path)
-        plan = pl.build_plan(job_id)
+        plan = pl.build_plan(job_id, org_id=ORG_HK)
         key = plan.lookups[0].key
-        assert key.location_code == "ZZOHK101"          # To Loc. policy
-        assert key.price_date == "2026-06-06"           # note date, ISO
+        assert key.org_id == ORG_HK
+        assert plan.org_id == ORG_HK
+        assert not hasattr(key, "location_code")
+        assert not hasattr(key, "price_date")
 
-    def test_missing_date_blocks_unless_override(self, tmp_path, monkeypatch):
+    def test_missing_or_invalid_org_blocks_planning(self, tmp_path):
         job_id = approved_job(tmp_path)
-        review = rv.load_review(job_id)
-        from apps.web.transfer.review_models import CLEAR
-        rv.apply_correction(review, "document", "D001", "delivery_date",
-                            CLEAR)
-        rv.save_review(job_id, review)
-        rv.approve_review(job_id)
-        plan = pl.build_plan(job_id)
-        assert plan.planning_problems                   # blocked, not today()
-        monkeypatch.setenv("PRODUCT_LOOKUP_PRICE_DATE", "2026-07-01")
-        plan = pl.build_plan(job_id, pl.load_product_config())
-        assert not plan.planning_problems
-        assert plan.lookups[0].key.price_date == "2026-07-01"
+        plan = pl.build_plan(job_id, org_id=None)
+        assert plan.planning_problems and not plan.lookups
+        assert "organization" in plan.planning_problems[0].lower()
+        plan = pl.build_plan(job_id, org_id="999999")   # not in catalog
+        assert plan.planning_problems and not plan.lookups
+        with pytest.raises(JobError, match="organization"):
+            pl.run_product_lookup(job_id, auth=FakeAuth(),
+                                  transport=FakeTransport([]))
 
 
 # --- batching ---------------------------------------------------------------------
 
 class TestBatching:
     def test_exact_split_and_final_partial_batch(self):
-        keys = [pl.ProductLookupKey("L", "2026-01-01", f"E{i}", "EAN")
+        keys = [pl.ProductLookupKey(ORG_HK, f"E{i}", "EAN")
                 for i in range(7)]
         batches = pl.make_batches(keys, 3)
         assert [len(b) for b in batches] == [3, 3, 1]
@@ -378,14 +388,15 @@ class TestRequest:
                 EAN_B, item="ZETF381237E085", color="E085", size="XS",
                 desc="SRT - JAZZ SHORTS", price=1900.00)]))])
         body = transport.calls[0]["body"]
-        assert body == {"RequestList": [
-            {"LocationCode": "ZZOHK101", "PLU": EAN_A,
-             "PriceDate": "2026-06-06", "Qty": 1},
-            {"LocationCode": "ZZOHK101", "PLU": EAN_B,
-             "PriceDate": "2026-06-06", "Qty": 1},
+        # spec-exact itemMaster-get: requestList of orgId + plu ONLY -
+        # no locationCode (nullable in schema, deliberately omitted), no
+        # PriceDate, no Qty
+        assert body == {"requestList": [
+            {"orgId": ORG_HK, "plu": EAN_A},
+            {"orgId": ORG_HK, "plu": EAN_B},
         ]}
         assert transport.calls[0]["url"] == (
-            "https://gw.test/devgapi/corpTool/pluLabel-get")
+            "https://gw.test/devgapi/corpTool/itemMaster-get")
 
 
 # --- response handling ------------------------------------------------------------
@@ -468,8 +479,9 @@ class TestResponse:
         assert product["analysis_code_15"] == "A15"
         assert product["composition_01"] == "C1"
         assert product["composition_04"] == "C4"
-        assert product["xf_groups"]["xf_group16"] == "169.5"
+        assert product["xf_groups"] == {}       # not in itemMaster-get
         assert product["original_retail_price"] == "1400.0"
+        assert product["discount_price"] == "399.0"     # currentPrice
         assert product["ean"] == EAN_A                  # leading zero kept
 
     def test_live_confirmed_wire_schema_normalizes(self):
@@ -502,9 +514,29 @@ class TestResponse:
         assert product["composition_04"] == ""
         assert product["ean"] == "0999990000012345"     # leading zero kept
         assert product["plu"] == "FAKE0010001111A1BXYZM"
-        assert product["location_code"] == "ZZOHK101"
-        assert product["qty_echo"] == "1"
+        assert product["org_id"] == ORG_HK              # orgId echo
+        assert product["location_code"] is None         # not in itemMaster
+        assert product["qty_echo"] == "1"               # tolerated if sent
         assert product["raw"]["someFutureField"] == "kept-safely"
+
+    def test_wrong_org_record_never_matched(self, tmp_path):
+        """A response record whose orgId echo differs from the requested
+        Organization ID is NEVER matched to a line - it raises a blocking
+        PRODUCT_ORG_MISMATCH issue instead."""
+        job_id = approved_job(tmp_path)
+        enrichment, _, _ = run_lookup(job_id, [
+            (200, envelope([
+                wire_record(EAN_A, org=ORG_TW),          # wrong org
+                wire_record(EAN_B, org=ORG_HK, item="ZETF381237E085",
+                            color="E085", size="XS",
+                            desc="SRT - JAZZ SHORTS", price=1900.00)])),
+            (200, envelope([]))])                        # empty fallback
+        assert any(i["code"] == pl.PRODUCT_ORG_MISMATCH
+                   for i in enrichment["issues"])
+        by_line = {l["source"]["ean"]: l
+                   for l in enrichment["line_enrichments"]}
+        assert by_line[EAN_A]["status"] == "unmatched"   # never mismatched
+        assert by_line[EAN_B]["status"] == "matched"
 
     def test_composition_spelling_variants_all_accepted(self):
         for key, expected_field in (("compositon1", "composition_01"),
@@ -573,8 +605,8 @@ class TestRetryResumeAndRateLimit:
             job_id, [(200, envelope([self.RECORD_B]))],
             config=self.ONE_PER_BATCH)
         assert len(transport.calls) == 1
-        sent = transport.calls[0]["body"]["RequestList"]
-        assert [item["PLU"] for item in sent] == [EAN_B]
+        sent = transport.calls[0]["body"]["requestList"]
+        assert [item["plu"] for item in sent] == [EAN_B]
         assert enrichment["status"] == "complete"
         assert enrichment["summary"]["matched_lines"] == 2
         by_number = {b["logical_batch_number"]: b
@@ -680,6 +712,75 @@ class TestRetryResumeAndRateLimit:
         review = rv.load_review(job_id)
         assert review is not None
 
+    def test_different_org_never_resumes_checkpoints(self, tmp_path):
+        """Organization identity is part of the execution identity:
+        checkpoints from 100009 can never be reused for 100012; the same
+        org + same input resumes normally; switching org routes through
+        the explicit restart confirmation and re-sends everything with
+        the new orgId."""
+        job_id = approved_job(tmp_path)
+        run_lookup(job_id,
+                   [(200, envelope([self.RECORD_A, self.RECORD_B]))])
+        # same org, same input: full resume - zero outbound requests
+        _, transport, _ = run_lookup(job_id, [])
+        assert transport.calls == []
+        # different org: incompatible -> plain retry refused
+        with pytest.raises(JobError, match="Restart Product Lookup"):
+            run_lookup(job_id, [], org_id=ORG_TW,
+                       org_name="IMAGINEX Taiwan")
+        # confirmed restart re-sends ALL lookups for the NEW org
+        enrichment, transport, _ = run_lookup(
+            job_id, [(200, envelope([
+                wire_record(EAN_A, org=ORG_TW),
+                wire_record(EAN_B, org=ORG_TW, item="ZETF381237E085",
+                            color="E085", size="XS",
+                            desc="SRT - JAZZ SHORTS", price=1900.00)]))],
+            org_id=ORG_TW, org_name="IMAGINEX Taiwan",
+            allow_full_rerun=True)
+        assert len(transport.calls) == 1
+        sent = transport.calls[0]["body"]["requestList"]
+        assert all(item["orgId"] == ORG_TW for item in sent)
+        assert enrichment["organization"] == {"id": ORG_TW,
+                                              "name": "IMAGINEX Taiwan"}
+        assert enrichment["status"] == "complete"
+        # and the new-org artifact resumes for the new org
+        _, transport, _ = run_lookup(job_id, [], org_id=ORG_TW,
+                                     org_name="IMAGINEX Taiwan")
+        assert transport.calls == []
+
+    def test_checkpoint_metadata_records_organization(self, tmp_path):
+        job_id = approved_job(tmp_path)
+        enrichment, _, _ = run_lookup(
+            job_id, [(200, envelope([self.RECORD_A, self.RECORD_B]))])
+        raw = json.loads(pl.result_path(job_id).read_text())
+        assert raw["organization"] == {"id": ORG_HK,
+                                       "name": "IMAGINEX Hong Kong"}
+        assert raw["plan"]["organization_id"] == ORG_HK
+        assert raw["key_results"]
+        assert all(entry["key"]["org_id"] == ORG_HK
+                   for entry in raw["key_results"])
+
+    def test_legacy_artifact_without_org_identity_not_resumed(
+            self, tmp_path):
+        """Pre-Build-11 artifacts (checkpoints but no organization) are
+        legacy/incompatible: never silently resumed, only the explicit
+        confirmed restart runs - and nothing deletes the legacy file."""
+        job_id = approved_job(tmp_path)
+        run_lookup(job_id,
+                   [(200, envelope([self.RECORD_A, self.RECORD_B]))])
+        path = pl.result_path(job_id)
+        legacy = json.loads(path.read_text())
+        legacy.pop("organization", None)         # simulate pre-Build-11
+        path.write_text(json.dumps(legacy))
+        with pytest.raises(JobError, match="Restart Product Lookup"):
+            run_lookup(job_id, [])
+        enrichment, transport, _ = run_lookup(
+            job_id, [(200, envelope([self.RECORD_A, self.RECORD_B]))],
+            allow_full_rerun=True)
+        assert len(transport.calls) == 1         # clean full rerun
+        assert enrichment["status"] == "complete"
+        assert enrichment["organization"]["id"] == ORG_HK
+
     def test_review_change_invalidates_resume(self, tmp_path):
         job_id = approved_job(tmp_path)
         run_lookup(job_id, [(200, envelope([self.RECORD_A])), (500, None)],
@@ -714,7 +815,7 @@ class TestRetryResumeAndRateLimit:
         job_id = approved_job(tmp_path)
         run_lookup(job_id, [(200, envelope([self.RECORD_A])), (500, None)],
                    config=self.ONE_PER_BATCH)
-        plan = pl.build_plan(job_id, self.ONE_PER_BATCH)
+        plan = pl.build_plan(job_id, self.ONE_PER_BATCH, org_id=ORG_HK)
         assert pl.requires_full_rerun_confirmation(job_id, plan) is False
 
 
@@ -726,7 +827,7 @@ class TestFallback:
             (200, envelope([wire_record(CONSTRUCTED_A, ean=EAN_A)])),
         ])
         assert len(transport.calls) == 2
-        assert transport.calls[1]["body"]["RequestList"][0]["PLU"] == \
+        assert transport.calls[1]["body"]["requestList"][0]["plu"] == \
             CONSTRUCTED_A
         lines = enrichment["line_enrichments"]
         assert all(l["status"] == "matched" for l in lines)
@@ -754,7 +855,7 @@ class TestFallback:
         job_id = _fallback_job(tmp_path)
         _, transport, _ = run_lookup(job_id, [
             (200, envelope([])), (200, envelope([]))])
-        assert len(transport.calls[1]["body"]["RequestList"]) == 1
+        assert len(transport.calls[1]["body"]["requestList"]) == 1
 
 
 # --- comparison -------------------------------------------------------------------
@@ -944,8 +1045,14 @@ class TestUiAndBoundaries:
 
     def test_no_consolidation_in_build5(self):
         assert "consolidate" not in self.PL.lower()
-        # quantities are never summed into merged rows
-        assert "Qty\": resolve_lookup_qty()" in self.PL.replace("'", '"')
+        # itemMaster-get requests carry ONLY orgId + plu: quantities are
+        # never sent, never summed, and rows are never merged
+        assert '"orgId": self.org_id, "plu": self.plu' in self.PL
+        request_item = self.PL.split("def request_item", 1)[1]
+        request_item = request_item.split("def ", 1)[0]
+        for absent in ('"Qty"', '"PriceDate"', '"locationCode"',
+                       '"LocationCode"'):
+            assert absent not in request_item, absent
 
     def test_tokens_never_rendered(self):
         for forbidden in ("access_token", "get_authorization_header",

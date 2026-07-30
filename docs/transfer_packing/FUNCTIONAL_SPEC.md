@@ -575,6 +575,45 @@ Operational hardening only — no Build 1–7 business logic changes.
 automation, email automation, production SSO or RBAC, job queue /
 background worker, unrestricted live API testing, automatic merge to main.
 
+## Build 11 scope (implemented): organization-selected item master lookup
+
+Product enrichment now uses **`POST /corpTool/itemMaster-get`** (this
+workflow only; auth unchanged via `POST /auth/login`). The `.env` API
+account is SHARED and carries no organization, so:
+
+- The Transfer UI has a required **Organization selector** (typed
+  catalog of the 11 approved organizations in `organizations.py`;
+  placeholder "Select an organization"; the chosen name + Organization
+  ID live in session state and survive reruns). Product lookup is
+  blocked with a specific message until a selection exists; the ID is
+  sent as `orgId` with every `plu` and is NEVER derived from the login
+  account, token, or `.env`.
+- Requests (tracked-spec-exact): `{"requestList": [{"orgId", "plu"}]}`
+  batched at 50. `locationCode` is nullable in the schema and OMITTED
+  (no reliable organization-compatible location exists); no PriceDate
+  and no Qty are sent. EAN-first / Item+Color+Size fallback and
+  dedup-per-(orgId, PLU) are unchanged.
+- Responses correlate by echoed `plu`/`ean` (never array position) with
+  an `orgId` echo check - a wrong-organization record raises blocking
+  `PRODUCT_ORG_MISMATCH` and is never matched. Field mapping:
+  `originalPrice` -> original price slot, `currentPrice` -> discount
+  price slot (old pluLabel names still tolerated for stored artifacts);
+  AC01-15 and the misspelled `compositon1..4` unchanged; itemMaster has
+  no `locationCode`/`xf_group*`/qty echo, so those normalized fields stay
+  blank/None and the workbook Detail's API-location audit column is now
+  blank by design.
+- **Organization is part of the lookup execution identity**: the
+  enrichment artifact records `{organization: {id, name}}`; resume
+  requires the SAME Organization ID; a different selection (or a
+  pre-Build-11 artifact without organization identity) never resumes
+  silently - the explicit "Restart Product Lookup from Beginning"
+  confirmation governs, legacy files are never auto-deleted, and while
+  the stored organization mismatches the selection the enriched results
+  are hidden and packing/workbook stages are blocked (extraction and the
+  approved review are untouched).
+- Live validation of `itemMaster-get` is pending; no live calls were
+  made in this build.
+
 ## Upload order is a business rule
 
 Cartons follow **user upload order, then PDF page order**. The uploader's

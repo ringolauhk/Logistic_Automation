@@ -93,11 +93,20 @@ def _render_product_lookup_section(job, result, review) -> None:
 
     enrichment = pl.load_enrichment(job.job_id)
 
+    # Build 11: the lookup organization is the deliberate UI selection -
+    # never inferred from the API account. No selection = no lookup.
+    org_id = st.session_state.get("transfer_org_id")
+    org_name = st.session_state.get("transfer_org_name")
+    if not org_id:
+        st.warning("Select an organization at the top of this page before "
+                   "running product lookup - the shared API account is "
+                   "not tied to one organization.")
+
     plan = None
     plan_problems: list[str] = []
     try:
         config = pl.load_product_config()
-        plan = pl.build_plan(job.job_id, config)
+        plan = pl.build_plan(job.job_id, config, org_id=org_id)
         plan_problems = list(plan.planning_problems)
     except Exception as exc:                      # JobError / ProductError
         plan_problems = [str(exc)]
@@ -110,9 +119,11 @@ def _render_product_lookup_section(job, result, review) -> None:
         row[3].metric("Fallback-ready", plan.fallback_ready_lines)
         row[4].metric("No identifier", plan.no_identifier_lines)
         row[5].metric("Batch size", config.batch_size)
-        st.caption("Location(s): " + (", ".join(plan.locations) or "-")
-                   + " | PriceDate(s): " + (", ".join(plan.price_dates) or "-")
-                   + " | Qty policy: 1 (lookup-only)")
+        st.caption("Organization: "
+                   + (f"{org_name} (ID {org_id})" if org_id
+                      else "not selected")
+                   + " | Endpoint: itemMaster-get (orgId + plu; no "
+                     "location, no price date)")
     for problem in plan_problems[:3]:
         st.error(problem)
 
@@ -179,7 +190,9 @@ def _render_product_lookup_section(job, result, review) -> None:
         try:
             with st.spinner("Looking up products via the internal API "
                             "Gateway..."):
-                pl.run_product_lookup(job.job_id, on_progress=on_progress,
+                pl.run_product_lookup(job.job_id, org_id=org_id,
+                                      org_name=org_name,
+                                      on_progress=on_progress,
                                       allow_full_rerun=allow_full_rerun)
         except Exception as exc:
             st.error(str(exc))
@@ -190,6 +203,19 @@ def _render_product_lookup_section(job, result, review) -> None:
                    "(including Analysis Codes and Compositions) per "
                    "reviewed line. Afterwards: Prepare Packing Groups and "
                    "Generate Workbooks, both further down this page.")
+        return
+
+    mismatch = _lookup_org_mismatch(job)
+    if mismatch is not None:
+        old = (mismatch.get("name") or mismatch.get("id")
+               or "a legacy pre-organization run")
+        st.error(f"The stored lookup results belong to {old} - NOT the "
+                 f"currently selected organization"
+                 + (f" {org_name} (ID {org_id})" if org_id else "")
+                 + ". They are not shown, and packing/workbook stages are "
+                   "blocked until you run Product Lookup again for the "
+                   "selected organization. Extraction and the approved "
+                   "review are unaffected.")
         return
 
     if enrichment.get("stale"):
@@ -226,7 +252,10 @@ def _render_product_lookup_section(job, result, review) -> None:
     r1[3].metric("Unmatched", summary.get("unmatched_lines", 0))
     r1[4].metric("Blocking issues", summary.get("blocking_issues", 0))
     r1[5].metric("Warnings", summary.get("warning_issues", 0))
-    st.caption(f"Planned batches: {summary.get('batches', 0)} | Completed "
+    stored_org = enrichment.get("organization") or {}
+    st.caption(f"Organization: {stored_org.get('name') or '-'} "
+               f"(ID {stored_org.get('id') or '-'}) | Planned batches: "
+               f"{summary.get('batches', 0)} | Completed "
                f"batches: {len(completed)} | Attempts: "
                f"{summary.get('batch_attempts', len(batch_records))} | "
                f"Status: {enrichment.get('status')}")
@@ -264,13 +293,17 @@ def _render_product_lookup_section(job, result, review) -> None:
             } for b in batch_records])
         with st.expander("View retry and checkpoint diagnostics"):
             st.caption(
-                f"Checkpointed lookups: "
+                f"Organization: {stored_org.get('name') or '-'} "
+                f"(ID {stored_org.get('id') or '-'}) | Checkpointed "
+                f"lookups: "
                 f"{len(enrichment.get('key_results') or [])} | Total "
                 f"batch attempts: "
                 f"{summary.get('batch_attempts', len(batch_records))} | "
                 "Completed batches are persisted per key and are never "
                 "resent; a retry re-runs only missing or failed logical "
-                "batches with the same batch number.")
+                "batches with the same batch number AND the same "
+                "Organization ID - results from one organization are "
+                "never reused for another.")
 
     _render_enriched_lines_table(job, enrichment)
     st.caption("API values never overwrite reviewed source values. "
@@ -572,12 +605,35 @@ def render_review_section(job, result: TransferExtractionResult) -> None:
     # The top-to-bottom flow makes the old anchor-jump navigation
     # unnecessary: after approval the Product lookup action appears right
     # here, and each successful stage reveals the next one beneath it.
+    # Build 11: when the selected organization no longer matches the
+    # stored enrichment, everything derived from that enrichment is
+    # invalid - packing and workbook stages stay hidden until a fresh
+    # lookup runs for the selected organization.
     if job.status in _PRODUCT_STATES:
         _render_product_lookup_section(job, result, review)
-    if job.status in _PACKING_STATES:
-        _render_packing_section(job)
-    if job.status in _WORKBOOK_STATES:
-        _render_workbook_section(job)
+    if _lookup_org_mismatch(job) is None:
+        if job.status in _PACKING_STATES:
+            _render_packing_section(job)
+        if job.status in _WORKBOOK_STATES:
+            _render_workbook_section(job)
+
+
+def _lookup_org_mismatch(job) -> dict | None:
+    """The stored enrichment's organization when it is INCOMPATIBLE with
+    the currently selected one (or a legacy artifact without organization
+    identity while an organization is selected); None when compatible or
+    when there is nothing to compare."""
+    from apps.web.transfer import product_lookup as pl
+    enrichment = pl.load_enrichment(job.job_id)
+    if not enrichment:
+        return None
+    selected = st.session_state.get("transfer_org_id")
+    if not selected:
+        return None
+    stored = enrichment.get("organization") or {}
+    if stored.get("id") == selected:
+        return None
+    return stored or {"id": None, "name": None}
 
 
 def _render_packing_section(job) -> None:

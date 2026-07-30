@@ -128,7 +128,11 @@ directly below the last successful stage) whose primary result is the
 and all Analysis Code/Composition attributes per line, with a column
 selector and a local **Excel export**
 (`Transfer_<job_id>_Enriched_Product_Lines.xlsx`; no API call, no state
-change). Build 8 adds a **Pilot readiness**
+change). Build 11 adds a required **Organization selector** at the top of
+the workflow (11 approved organizations; product lookup calls
+`itemMaster-get` with the selected Organization ID as `orgId`; changing
+the organization invalidates enrichment and downstream stages until a
+fresh lookup). Build 8 adds a **Pilot readiness**
 expander (on-demand redacted diagnostics: OCR, API configuration status
 by variable name, job states, retention — never secrets) and Docker OCR
 support so scanned notes work in the container; live API probes are

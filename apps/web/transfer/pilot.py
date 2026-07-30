@@ -13,7 +13,7 @@ CLI:
     python -m apps.web.transfer.pilot doctor [--deep]
     python -m apps.web.transfer.pilot auth-check --yes
     python -m apps.web.transfer.pilot product-check --yes \
-        --location <LOC> --price-date <YYYY-MM-DD> --plu <ID> [--qty 1]
+        --org <ORGANIZATION-ID> --plu <ID>
         [--show-values]
     python -m apps.web.transfer.pilot cleanup [--dry-run | --execute]
 """
@@ -372,12 +372,13 @@ def observe_record_schema(records: list[dict]) -> dict:
             for name, info in sorted(fields.items())}
 
 
-def product_probe(*, location: str, price_date: str, plus: list[str],
-                  qty: int = 1, confirm: bool = False,
+def product_probe(*, org_id: str, plus: list[str],
+                  confirm: bool = False,
                   show_values: bool = False, transport=None,
                   auth=None) -> dict:
-    """ONE controlled product-lookup batch (max 3 identifiers) through the
-    sanctioned Build 5 client/endpoint configuration. Requires
+    """ONE controlled itemMaster-get batch (max 3 identifiers) through the
+    sanctioned Transfer client/endpoint configuration, using the given
+    Organization ID (never derived from the login account). Requires
     PILOT_ENABLE_LIVE_PRODUCT_LOOKUP=true AND confirm=True. Captures a
     schema observation; business VALUES (never tokens) are included only
     with show_values=True for explicit business confirmation."""
@@ -390,43 +391,34 @@ def product_probe(*, location: str, price_date: str, plus: list[str],
                        "(--yes).")
     if not plus or len(plus) > 3:
         raise JobError("The product probe accepts 1-3 identifiers only.")
-    import re as _re
-    if not _re.fullmatch(r"\d{4}-\d{2}-\d{2}", price_date):
-        raise JobError("PriceDate must be YYYY-MM-DD.")
+    from apps.web.transfer import organizations as orgs
     from apps.web.transfer import product_lookup as pl
     from apps.web.transfer.gateway_auth import build_client
+    if not orgs.is_valid_org_id(org_id):
+        raise JobError("Unknown Organization ID; use one from the "
+                       "approved organization catalog.")
+    org_id = str(org_id).strip()
     auth = auth or build_client()
     product_config = pl.load_product_config()
     client = pl.ProductGatewayClient(auth, product_config,
                                      transport=transport)
-    keys = [pl.ProductLookupKey(location_code=location.strip().upper(),
-                                price_date=price_date,
-                                plu=str(p).strip(),
+    keys = [pl.ProductLookupKey(org_id=org_id, plu=str(p).strip(),
                                 identifier_type="PROBE") for p in plus]
-    body_preview = [k.request_item() | {"Qty": qty} for k in keys]
     started = time.monotonic()
     observation = {"probe": "product", "at": utc_now(),
-                   "request_count": len(keys), "qty": qty,
-                   "location": location.strip().upper(),
-                   "price_date": price_date, "success": False,
+                   "request_count": len(keys),
+                   "organization_id": org_id, "success": False,
                    "duration_seconds": None, "http_status": None,
                    "gateway_code": None, "records_returned": 0,
                    "correlated": 0, "omitted_identifiers": [],
                    "record_schema": {}, "top_level_fields": [],
                    "error_code": None, "values": None}
     try:
-        # single batch through the Build 5 client (its Qty policy) unless a
-        # non-default Qty is being compared - then one raw request
-        outcome = (client.lookup_batch(keys, 1)
-                   if qty == pl.resolve_lookup_qty()
-                   else _probe_with_qty(client, body_preview, len(keys)))
+        outcome = client.lookup_batch(keys, 1)      # one batch, one attempt
         observation.update(
-            success=True, http_status=outcome["http_status"]
-            if isinstance(outcome, dict) else outcome.http_status,
-            gateway_code=(outcome["gateway_code"] if isinstance(outcome, dict)
-                          else outcome.gateway_code))
-        records = (outcome["records"] if isinstance(outcome, dict)
-                   else outcome.records)
+            success=True, http_status=outcome.http_status,
+            gateway_code=outcome.gateway_code)
+        records = outcome.records
         observation["records_returned"] = len(records)
         observation["record_schema"] = observe_record_schema(records)
         requested = {k.plu for k in keys}
@@ -458,27 +450,6 @@ def product_probe(*, location: str, price_date: str, plus: list[str],
 def pl_is_sensitive_key(key: str) -> bool:
     from apps.web.transfer.gateway_auth import _is_sensitive_key
     return _is_sensitive_key(str(key))
-
-
-def _probe_with_qty(client, request_items, count):
-    """Raw single request honoring a non-default Qty (for the controlled
-    Qty comparison) - still one batch, one attempt."""
-    token = client.auth.ensure_access_token()
-    result = client.transport.post_json(
-        client.lookup_url, {"RequestList": request_items},
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=client.config.timeout_seconds)
-    status, parsed = result[0], result[1]   # fakes 2-tuple, real 3-tuple
-    envelope = parsed if isinstance(parsed, dict) else {}
-    data = envelope.get("data")
-    from apps.web.transfer.product_lookup import normalize_record
-    records = ([normalize_record(r) for r in data if isinstance(r, dict)]
-               if isinstance(data, list) else [])
-    code = envelope.get("code")
-    return {"http_status": status,
-            "gateway_code": int(code) if isinstance(code, (int, float))
-            else None,
-            "records": records}
 
 
 # --- pilot manifest ---------------------------------------------------------------
@@ -576,11 +547,10 @@ def main(argv=None) -> int:
     p_auth.add_argument("--yes", action="store_true")
     p_prod = sub.add_parser("product-check")
     p_prod.add_argument("--yes", action="store_true")
-    p_prod.add_argument("--location", required=True)
-    p_prod.add_argument("--price-date", required=True)
+    p_prod.add_argument("--org", required=True,
+                        help="Organization ID from the approved catalog")
     p_prod.add_argument("--plu", action="append", required=True,
                         help="repeatable, max 3")
-    p_prod.add_argument("--qty", type=int, default=1)
     p_prod.add_argument("--show-values", action="store_true")
     p_clean = sub.add_parser("cleanup")
     group = p_clean.add_mutually_exclusive_group()
@@ -597,8 +567,7 @@ def main(argv=None) -> int:
         return 0
     if args.command == "product-check":
         print(json.dumps(product_probe(
-            location=args.location, price_date=args.price_date,
-            plus=args.plu, qty=args.qty, confirm=args.yes,
+            org_id=args.org, plus=args.plu, confirm=args.yes,
             show_values=args.show_values), indent=2))
         return 0
     if args.command == "cleanup":

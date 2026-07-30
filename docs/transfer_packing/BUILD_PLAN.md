@@ -121,6 +121,30 @@ workflow untouched and ships with offline tests.
   restart recovery proven, redacted `pilot/result.json` written.
 - Not in Build 9: unknown-identifier live test (not approved), global
   invoice numbering, print/email automation, merge to main.
+## Build 11 — organization-selected item master lookup (this build)
+
+- Transfer product lookup now calls `POST /corpTool/itemMaster-get`
+  (replacing `pluLabel-get` for THIS workflow only); auth stays
+  `POST /auth/login` with the shared `.env` account.
+- The organization is selected explicitly in the Transfer UI (typed
+  11-entry catalog in `organizations.py`, approved mapping, "Select an
+  organization" placeholder - no silent default, never inferred from the
+  login account/token). Lookup is blocked without a selection; the
+  selected Organization ID is sent as `orgId` with each `plu`.
+- Requests are spec-exact `{"requestList": [{"orgId", "plu"}]}` -
+  `locationCode` is nullable in the tracked schema and is omitted; no
+  PriceDate, no Qty. Responses correlate by echoed plu/ean with an orgId
+  echo check (`PRODUCT_ORG_MISMATCH`); `originalPrice`/`currentPrice`
+  map to the original/discount price slots; AC01-15 and compositon1-4
+  unchanged.
+- Organization identity joined the checkpoint identity: same org + same
+  input resumes; a different org (or a pre-Build-11 artifact without
+  organization) never resumes silently - the explicit restart
+  confirmation governs, and changing organization invalidates the
+  enriched results and blocks packing/workbook until a fresh lookup.
+- Live validation of the new endpoint is pending (no live calls in this
+  build).
+
 ## Build 10 — guided workflow UI, consolidated attributes, Excel export
 
 - The Transfer page is a guided top-to-bottom flow: workflow progress

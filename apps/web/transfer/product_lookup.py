@@ -1,25 +1,30 @@
-"""Product lookup + enrichment via /corpTool/pluLabel-get (Build 5).
+"""Product lookup + enrichment via /corpTool/itemMaster-get (Build 5
+client, Build 11 endpoint).
 
-Contract (ImagineX API Gateway spec v0.851-CorpTools §3.3 + the label-print
-integration): POST {base}/corpTool/pluLabel-get with
-{"RequestList": [{"LocationCode", "PLU", "PriceDate", "Qty"}]} and a Bearer
-access token from the Build 4 auth client. Success = HTTP 2xx AND envelope
-code == 100000. The gateway SKIPS non-existing PLU-location combinations -
-a missing record in `data` IS the not-found signal, so responses are
-correlated by the echoed (locationCode, plu), never by array position.
+Contract (tracked OpenAPI snapshot docs/api/imaginex-api-swagger-v1.json):
+POST {base}/corpTool/itemMaster-get with
+{"requestList": [{"orgId", "plu"}]} and a Bearer access token from the
+Build 4 auth client. `locationCode` is nullable in the schema and the
+workflow has no reliable organization-compatible location, so it is
+OMITTED entirely. Success = HTTP 2xx AND envelope code == 100000. A
+missing record in `data` IS the not-found signal, so responses are
+correlated by the echoed plu/ean (with an orgId echo check), never by
+array position.
 
-Identifier rules: reviewed effective EAN first (string, leading zeros
-kept); fallback is the literal concatenation Item + Color + Size (a
-repeated color suffix is never removed - the spec's own PLU example
-CM0010007804M5C2WAHM is exactly itemCode+colorCode+sizeCode). Duplicate
-API lookups are eliminated per (location, price date, PLU); source lines
-are NEVER merged and quantities are never changed.
+The `orgId` comes EXCLUSIVELY from the organization the user selected in
+the Transfer UI (see organizations.py) - never from the API login
+account, token claims, or `.env`.
 
-Policies isolated for business confirmation (documented in FUNCTIONAL_SPEC):
-resolve_lookup_location() -> effective destination To Loc. code;
-resolve_price_date() -> effective delivery-note date, else the
-PRODUCT_LOOKUP_PRICE_DATE override, else a blocking readiness problem;
-resolve_lookup_qty() -> constant 1 (lookup-only semantics).
+Identifier rules (unchanged from Build 5): reviewed effective EAN first
+(string, leading zeros kept); fallback is the literal concatenation
+Item + Color + Size (a repeated color suffix is never removed - the
+spec's own PLU example CM0010007804M5C2WAHM is exactly
+itemCode+colorCode+sizeCode). Duplicate API lookups are eliminated per
+(orgId, PLU); source lines are NEVER merged and quantities never change.
+
+resolve_lookup_location() remains the packing destination policy;
+resolve_price_date()/resolve_lookup_qty() are retained for reference but
+itemMaster-get requests carry neither PriceDate nor Qty.
 
 Security: composes the Build 4 client - tokens stay in its process cache;
 this module never logs, persists, or returns tokens or Authorization
@@ -61,7 +66,7 @@ ENRICHMENT_SCHEMA_VERSION = 1
 RESULT_DIR = "product_lookup"
 RESULT_NAME = "result.json"
 
-DEFAULT_LOOKUP_PATH = "/corpTool/pluLabel-get"
+DEFAULT_LOOKUP_PATH = "/corpTool/itemMaster-get"
 DEFAULT_BATCH_SIZE = 50
 DEFAULT_TIMEOUT_SECONDS = 120
 DEFAULT_MAX_RETRIES = 3
@@ -92,6 +97,7 @@ PRODUCT_LOOKUP_API_ERROR = "PRODUCT_LOOKUP_API_ERROR"
 PRODUCT_LOOKUP_AUTH_ERROR = "PRODUCT_LOOKUP_AUTH_ERROR"
 PRODUCT_LOOKUP_ACCESS_DENIED = "PRODUCT_LOOKUP_ACCESS_DENIED"
 PRODUCT_LOOKUP_RATE_LIMITED = "PRODUCT_LOOKUP_RATE_LIMITED"
+PRODUCT_ORG_MISMATCH = "PRODUCT_ORG_MISMATCH"
 PRODUCT_LOOKUP_RESPONSE_INVALID = "PRODUCT_LOOKUP_RESPONSE_INVALID"
 PRODUCT_LOOKUP_RESPONSE_AMBIGUOUS = "PRODUCT_LOOKUP_RESPONSE_AMBIGUOUS"
 PRODUCT_LOOKUP_IDENTIFIER_MISSING = "PRODUCT_LOOKUP_IDENTIFIER_MISSING"
@@ -154,7 +160,7 @@ class ProductLookupConfig:
                 "batch_size": self.batch_size,
                 "timeout_seconds": self.timeout_seconds,
                 "max_retries": self.max_retries,
-                "qty_policy": f"constant {LOOKUP_QTY} (lookup-only)",
+                "qty_policy": "not sent (itemMaster-get carries no Qty)",
                 "price_date_override": self.price_date_override}
 
 
@@ -272,15 +278,15 @@ def build_identifiers(line) -> tuple[str | None, str | None]:
 
 @dataclass(frozen=True)
 class ProductLookupKey:
-    location_code: str
-    price_date: str
+    org_id: str
     plu: str
     identifier_type: str          # EAN | CONSTRUCTED
 
     def request_item(self) -> dict:
-        # exact confirmed request casing and types
-        return {"LocationCode": self.location_code, "PLU": self.plu,
-                "PriceDate": self.price_date, "Qty": resolve_lookup_qty()}
+        # spec-exact itemMaster-get item: orgId + plu; locationCode is
+        # nullable in the schema and is deliberately OMITTED (no reliable
+        # organization-compatible location exists in this workflow).
+        return {"orgId": self.org_id, "plu": self.plu}
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -308,8 +314,7 @@ class LookupPlan:
     ean_lines: int = 0
     fallback_ready_lines: int = 0
     no_identifier_lines: int = 0
-    locations: list[str] = field(default_factory=list)
-    price_dates: list[str] = field(default_factory=list)
+    org_id: str | None = None       # UI-selected Organization ID (Build 11)
     planning_problems: list[str] = field(default_factory=list)
 
 
@@ -343,50 +348,41 @@ def load_approved_inputs(job_id: str):
 
 
 def build_plan(job_id: str,
-               config: ProductLookupConfig | None = None) -> LookupPlan:
+               config: ProductLookupConfig | None = None,
+               org_id: str | None = None) -> LookupPlan:
     """Deterministic lookup plan from ONLY the approved review's effective
-    included lines. Dedupes identical (location, date, PLU) requests while
-    keeping every source line separate."""
+    included lines. Dedupes identical (orgId, PLU) requests while keeping
+    every source line separate. `org_id` is the UI-selected Organization
+    ID (see organizations.py) - itemMaster-get requests carry no location
+    and no price date."""
+    from apps.web.transfer import organizations as orgs
+
     config = config or load_product_config()
     _, result, review = load_approved_inputs(job_id)
     ev = review_mod.evaluate(result, review)
-    headers = {h.entity_id: h for h in review.headers}
-    cartons = {c.entity_id: c for c in review.cartons}
 
     plan = LookupPlan()
+    if org_id is None or not orgs.is_valid_org_id(org_id):
+        plan.planning_problems.append(
+            "Select an organization before running product lookup - the "
+            "shared API account is not tied to one organization, so the "
+            "Organization ID must be chosen explicitly in the UI.")
+        return plan
+    org_id = str(org_id).strip()
+    plan.org_id = org_id
+
     by_key: dict[ProductLookupKey, PlannedLookup] = {}
     ordered = sorted(
         review.lines,
         key=lambda ln: (ln.upload_sequence, ln.source_page,
                         ln.original.get("source_sequence_number") or 0))
     sequence = 0
-    locations: set[str] = set()
-    dates: set[str] = set()
     for line in ordered:
         line_ev = ev.lines.get(line.entity_id)
         if line_ev is None or line_ev.effective_excluded:
             continue
         plan.line_count += 1
         sequence += 1
-        header = headers.get(line.document_id)
-        carton = cartons.get(line.carton_id)
-        location = resolve_lookup_location(
-            carton.effective("destination_code") if carton else None,
-            header.effective("to_location_code") if header else None)
-        price_date = resolve_price_date(
-            header.effective("delivery_date") if header else None,
-            config.price_date_override)
-        if location is None:
-            plan.planning_problems.append(
-                f"{line.entity_id}: no destination code available.")
-            continue
-        if price_date is None:
-            plan.planning_problems.append(
-                f"{line.entity_id}: no valid delivery-note date for "
-                "PriceDate (set PRODUCT_LOOKUP_PRICE_DATE to override).")
-            continue
-        locations.add(location)
-        dates.add(price_date)
         ean_id, constructed = build_identifiers(line)
         if ean_id:
             plan.ean_lines += 1
@@ -404,14 +400,11 @@ def build_plan(job_id: str,
             continue
         primary_type = IDENTIFIER_EAN if ean_id else IDENTIFIER_CONSTRUCTED
         primary_value = ean_id or constructed
-        key = ProductLookupKey(location_code=location,
-                               price_date=price_date, plu=primary_value,
+        key = ProductLookupKey(org_id=org_id, plu=primary_value,
                                identifier_type=primary_type)
         fallback = None
         if ean_id and constructed:
-            fallback = ProductLookupKey(location_code=location,
-                                        price_date=price_date,
-                                        plu=constructed,
+            fallback = ProductLookupKey(org_id=org_id, plu=constructed,
                                         identifier_type=IDENTIFIER_CONSTRUCTED)
         planned = by_key.get(key)
         if planned is None:
@@ -422,8 +415,6 @@ def build_plan(job_id: str,
         elif planned.fallback is None and fallback is not None:
             planned.fallback = fallback
         planned.line_ids.append(line.entity_id)
-    plan.locations = sorted(locations)
-    plan.price_dates = sorted(dates)
     return plan
 
 
@@ -492,7 +483,7 @@ class ProductGatewayClient:
 
     def lookup_batch(self, batch: list[ProductLookupKey],
                      batch_number: int) -> BatchOutcome:
-        body = {"RequestList": [k.request_item() for k in batch]}
+        body = {"requestList": [k.request_item() for k in batch]}
         started = self.clock()
         try:
             token = self.auth.ensure_access_token()
@@ -690,8 +681,13 @@ def normalize_record(raw: dict) -> dict:
         "gender": _wire(raw, "gender"),
         "prod_line": _wire(raw, "prodLine"),
         "supplier_item_code": _wire(raw, "supplierItemCode"),
-        "original_retail_price": _wire(raw, "originalRetailPrice"),
-        "discount_price": _wire(raw, "discountPrice"),
+        # itemMaster-get names first (originalPrice/currentPrice); the
+        # old pluLabel-get names stay tolerated for stored artifacts and
+        # fixtures. currentPrice maps to the discount/selling price slot.
+        "original_retail_price": _wire(raw, "originalPrice",
+                                       "originalRetailPrice"),
+        "discount_price": _wire(raw, "currentPrice", "discountPrice"),
+        "country_of_origin": _wire(raw, "countryOfOrigin"),
         "qty_echo": _wire(raw, "qty"),
     }
     for i in range(1, 16):
@@ -848,8 +844,19 @@ def correlate_records(batch: list[ProductLookupKey],
     normalized = [normalize_record(r) for r in records]
     for key in batch:
         for index, product in enumerate(normalized):
-            loc = _cmp_norm(product.get("location_code"))
-            if loc and loc != _cmp_norm(key.location_code):
+            org = _cmp_norm(product.get("org_id"))
+            if org and org != _cmp_norm(key.org_id):
+                if not claimed[index]:
+                    claimed[index] = True     # never matched to any key
+                    issues.append({
+                        "code": PRODUCT_ORG_MISMATCH,
+                        "severity": SEV_BLOCKING,
+                        "message": "The API returned a record for a "
+                                   f"DIFFERENT organization ('{org}' vs "
+                                   f"requested '{key.org_id}'); it was "
+                                   "not matched to any line.",
+                        "line_id": None, "field": None,
+                        "source_value": key.org_id, "api_value": org})
                 continue
             plu = _cmp_norm(product.get("plu"))
             ean = _cmp_norm(product.get("ean"))
@@ -945,6 +952,12 @@ def _resumable_prior(job_id: str, plan) -> dict | None:
         return None
     if not prior.get("key_results"):
         return None
+    # Organization identity is part of the execution identity (Build 11):
+    # results looked up for one Organization ID can NEVER be reused for
+    # another, and pre-organization artifacts are legacy/incompatible.
+    prior_org = (prior.get("organization") or {}).get("id")
+    if not prior_org or prior_org != plan.org_id:
+        return None
     if prior.get("lookups") != [p.as_dict() for p in plan.lookups]:
         return None
     return prior
@@ -965,23 +978,28 @@ def requires_full_rerun_confirmation(job_id: str, plan) -> bool:
 
 
 def run_product_lookup(job_id: str, *,
+                       org_id: str | None = None,
+                       org_name: str | None = None,
                        auth: ApiGatewayAuthClient | None = None,
                        transport: ProductTransport | None = None,
                        config: ProductLookupConfig | None = None,
                        on_progress=None,
                        allow_full_rerun: bool = False) -> dict:
-    """Execute the full Build 5 enrichment for an approved job. Stops
-    before grouping, carton renumbering, row consolidation, or any
+    """Execute the full enrichment for an approved job via
+    /corpTool/itemMaster-get. `org_id` is REQUIRED and comes from the
+    UI-selected organization (never from the login account or token).
+    Stops before grouping, carton renumbering, row consolidation, or any
     workbook output.
 
     Retry semantics (pilot-hardened): results are checkpointed per batch;
     a retry resumes - completed logical batches are NEVER resent, only
     missing/failed ones run again with the SAME logical batch number and
-    an incremented attempt_number. A per-job run lock makes one click at
-    most one outbound run."""
+    an incremented attempt_number; resume additionally requires the SAME
+    Organization ID. A per-job run lock makes one click at most one
+    outbound run."""
     config = config or load_product_config()
     job, result, review = load_approved_inputs(job_id)
-    plan = build_plan(job_id, config)
+    plan = build_plan(job_id, config, org_id=org_id)
     if plan.planning_problems:
         raise JobError("Product lookup cannot start: "
                        + " ".join(plan.planning_problems[:3]))
@@ -997,12 +1015,17 @@ def run_product_lookup(job_id: str, *,
     lock = _acquire_run_lock(job_id)
     try:
         return _run_locked(job_id, plan, config, auth, transport,
-                           on_progress, review)
+                           on_progress, review, org_name)
     finally:
         lock.unlink(missing_ok=True)
 
 
-def _run_locked(job_id, plan, config, auth, transport, on_progress, review):
+def _run_locked(job_id, plan, config, auth, transport, on_progress, review,
+                org_name=None):
+    from apps.web.transfer import organizations as orgs
+    if org_name is None:
+        org = orgs.by_id(plan.org_id)
+        org_name = org.name if org else None
     prior = _resumable_prior(job_id, plan)
     prior_key_results = (_deserialize_key_results(prior["key_results"])
                          if prior else {})
@@ -1024,14 +1047,15 @@ def _run_locked(job_id, plan, config, auth, transport, on_progress, review):
         "updated_at": "",
         "status": "in_progress",
         "config": config.summary(),
+        # the UI-selected organization is part of the lookup identity
+        "organization": {"id": plan.org_id, "name": org_name},
         "plan": {
             "line_count": plan.line_count,
             "unique_lookups": len(plan.lookups),
             "ean_lines": plan.ean_lines,
             "fallback_ready_lines": plan.fallback_ready_lines,
             "no_identifier_lines": plan.no_identifier_lines,
-            "locations": plan.locations,
-            "price_dates": plan.price_dates,
+            "organization_id": plan.org_id,
         },
         "lookups": [p.as_dict() for p in plan.lookups],
         "batches": preserved_batches,
@@ -1203,8 +1227,7 @@ def _assemble_line_enrichments(review, plan, key_results, enrichment):
         primary = key_results.get(planned.key, {"products": []})
         attempts = [{"identifier": planned.key.plu,
                      "identifier_type": planned.key.identifier_type,
-                     "location_code": planned.key.location_code,
-                     "price_date": planned.key.price_date,
+                     "organization_id": planned.key.org_id,
                      "matched": len(primary["products"]) == 1,
                      "match_count": len(primary["products"])}]
         chosen = None
@@ -1227,8 +1250,7 @@ def _assemble_line_enrichments(review, plan, key_results, enrichment):
                 attempts.append({
                     "identifier": planned.fallback.plu,
                     "identifier_type": IDENTIFIER_CONSTRUCTED,
-                    "location_code": planned.fallback.location_code,
-                    "price_date": planned.fallback.price_date,
+                    "organization_id": planned.fallback.org_id,
                     "matched": len(fb["products"]) == 1,
                     "match_count": len(fb["products"])})
                 if len(fb["products"]) == 1:

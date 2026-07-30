@@ -107,5 +107,74 @@ class TestPluLabelContract:
         for i in range(1, 5):
             assert product[f"composition_{i:02d}"] is not None, i
         assert product["ean"] and product["plu"]
-        assert set(product["xf_groups"]) == {"xf_group5", "xf_group12",
-                                             "xf_group16"}
+
+
+class TestItemMasterContract:
+    """Build 11: the Transfer workflow's ACTIVE endpoint is
+    /corpTool/itemMaster-get. These tests pin the tracked contract the
+    client is built against."""
+
+    def test_endpoint_and_auth_documented(self):
+        spec = _spec()
+        operation = spec["paths"]["/corpTool/itemMaster-get"]["post"]
+        assert operation["security"] == [{"JWTBearerAuth": []}]
+
+    def test_request_dto_orgid_plu_and_nullable_location(self):
+        fields = _schema("ComimaginexapigCorpToolItemMasterReqDto")
+        assert fields["orgId"]["type"] == "string"
+        assert fields["plu"]["type"] == "string"
+        # locationCode is nullable and NOT required -> the client omits it
+        assert fields["locationCode"].get("nullable") is True
+        wrapper = _schema("ComimaginexapigCorpToolItemMasterListReqDto")
+        assert "requestList" in wrapper          # batching supported
+        schema = _spec()["components"]["schemas"][
+            "ComimaginexapigCorpToolItemMasterReqDto"]
+        assert "required" not in schema
+
+    def test_client_request_matches_the_dto(self):
+        from apps.web.transfer.product_lookup import ProductLookupKey
+        item = ProductLookupKey(org_id="100009", plu="0123",
+                                identifier_type="EAN").request_item()
+        allowed = set(_schema("ComimaginexapigCorpToolItemMasterReqDto"))
+        assert set(item) <= allowed
+        assert item == {"orgId": "100009", "plu": "0123"}
+
+    def test_response_fields_cover_the_transfer_mapping(self):
+        fields = _schema("ItemMasterResDto")
+        expected = ["orgId", "itemCode", "itemDesc", "longItemDesc",
+                    "colorCode", "colorDesc", "sizeCode", "plu", "ean",
+                    "brand", "brandName", "season", "subcat", "gender",
+                    "prodLine", "supplierItemCode", "countryOfOrigin",
+                    "currency", "originalPrice", "currentPrice"]
+        expected += [f"analysisCode{i:02d}" for i in range(1, 16)]
+        expected += [f"compositon{i}" for i in range(1, 5)]
+        for field in expected:
+            assert field in fields, field
+        assert fields["ean"]["type"] == "string"
+        assert fields["plu"]["type"] == "string"
+        # NOT in this DTO: the old pluLabel names / echoes - the mapper
+        # must not rely on them
+        for absent in ("locationCode", "originalRetailPrice",
+                       "discountPrice", "xf_group5", "qty"):
+            assert absent not in fields, absent
+
+    def test_normalizer_maps_itemmaster_prices_and_attributes(self):
+        """Synthesize a record from the ItemMasterResDto field list and
+        prove the normalizer ingests it - including the explicit
+        originalPrice/currentPrice -> original/discount price mapping."""
+        from apps.web.transfer.product_lookup import normalize_record
+        fields = _schema("ItemMasterResDto")
+        raw = {name: ("1" if meta.get("type") == "integer"
+                      else 12.5 if meta.get("type") == "number"
+                      else f"V{i}")
+               for i, (name, meta) in enumerate(fields.items())}
+        product = normalize_record(raw)
+        for i in range(1, 16):
+            assert product[f"analysis_code_{i:02d}"] is not None, i
+        for i in range(1, 5):
+            assert product[f"composition_{i:02d}"] is not None, i
+        assert product["ean"] and product["plu"] and product["org_id"]
+        assert product["original_retail_price"] == "12.5"  # originalPrice
+        assert product["discount_price"] == "12.5"         # currentPrice
+        assert product["location_code"] is None            # not in DTO
+        assert product["xf_groups"] == {}                  # not in DTO

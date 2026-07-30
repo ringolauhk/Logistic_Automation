@@ -1,13 +1,26 @@
-# `POST /corpTool/itemMaster-get` — reference (documentation only)
+# `POST /corpTool/itemMaster-get` — reference and Transfer usage
 
-> **Status: NOT used by this project.** The Transfer workflow's product
-> enrichment continues to use `POST /corpTool/pluLabel-get` exclusively
-> (live-validated in Build 9). This page documents `itemMaster-get` as a
-> possible future data source only; nothing in the codebase calls it.
+> **Status: the ACTIVE product-lookup endpoint of the Transfer workflow
+> (Build 11).** It replaced `POST /corpTool/pluLabel-get` for Transfer
+> enrichment. Authentication is unchanged (`POST /auth/login` with the
+> shared account from `.env`); the **organization is selected by the user
+> in the Transfer UI** and its Organization ID is sent as `orgId` — never
+> derived from the login account or token.
+>
+> Implemented request form (per the contract resolution below):
+> `{"requestList": [{"orgId": "<selected ID>", "plu": "<EAN or
+> item+color+size>"}]}` — `locationCode` is **omitted** because it is
+> nullable in the schema and the workflow has no reliable
+> organization-compatible location. Batching uses the `requestList`
+> array (batch size 50). Responses are correlated by the echoed
+> `plu`/`ean` with an `orgId` echo check (`PRODUCT_ORG_MISMATCH` blocks
+> wrong-organization records); `originalPrice`/`currentPrice` map to the
+> normalized original/discount price slots.
 >
 > Source: `docs/api/imaginex-api-swagger-v1.json` (the tracked official
 > imxapig OpenAPI 3.0 snapshot, operator-provided). Everything below is
 > derived from that file — no live call was made to produce this page.
+> This live form is **pending controlled live validation**.
 
 ## Operation
 
@@ -76,9 +89,14 @@ on the wire, exactly as in `pluLabel-get`; never "correct" it)
   therefore undocumented here; `pluLabel-get` remains the source for
   date-effective pricing.
 
-## If it is ever adopted (future build, business approval required)
+## Adoption status (Build 11)
 
-It must be additive alongside `pluLabel-get`, go through the Build 4
-auth client, inherit the Build 9 protections (checkpointing, run lock,
-rate-limit handling, redaction), and extend
-`tests/test_api_spec_sync.py` with its contract before any live call.
+Adopted for the Transfer workflow through the Build 4 auth client with
+every Build 9 protection intact (organization-aware checkpoint/resume,
+completed-batch skipping, attempt tracking, run lock, 429 handling with
+`Retry-After`, legacy full-rerun confirmation, redaction). Checkpoints
+record the Organization ID; results from one organization are never
+resumed for another, and pre-Build-11 artifacts without organization
+identity require the explicit confirmed restart.
+`tests/test_api_spec_sync.py::TestItemMasterContract` pins this contract;
+controlled live validation of the new endpoint is still pending.

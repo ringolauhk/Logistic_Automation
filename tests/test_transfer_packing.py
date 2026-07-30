@@ -101,7 +101,8 @@ def enrich(job_id, extra_records=(), records=None):
         (records if records is not None
          else ALL_RECORDS + ALL_RECORDS_B) + list(extra_records))),
         (200, envelope([]))]     # empty fallback stage when triggered
-    pl.run_product_lookup(job_id, auth=FakeAuth(),
+    pl.run_product_lookup(job_id, org_id="100009",
+                          org_name="IMAGINEX Hong Kong", auth=FakeAuth(),
                           transport=FakeTransport(responses),
                           allow_full_rerun=True)   # fixtures re-enrich freely
 
