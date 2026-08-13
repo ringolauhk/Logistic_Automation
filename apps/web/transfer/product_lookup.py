@@ -606,9 +606,13 @@ class ProductGatewayClient:
         except (TypeError, ValueError):
             code = None
         if code != self.auth.config.success_code:
+            detail = _envelope_diagnostic(parsed)
             raise ProductError(PRODUCT_GATEWAY_REJECTED,
                                "The product API reported a failed "
-                               "operation.", batch_number=batch_number,
+                               "operation."
+                               + (f" Gateway message: {detail}"
+                                  if detail else ""),
+                               batch_number=batch_number,
                                request_count=request_count,
                                http_status=status, gateway_code=code)
         data = parsed.get("data")
@@ -831,6 +835,29 @@ def _write_enrichment(job_id: str, data: dict) -> None:
 
 
 # --- correlation ------------------------------------------------------------------
+
+_ENVELOPE_DIAGNOSTIC_MAX = 300
+
+
+def _envelope_diagnostic(parsed) -> str:
+    """Short, sanitized operational explanation from a non-success
+    envelope - the documented `reason`/`note` fields ONLY, never the raw
+    body. Passed through the shared redaction, whitespace-normalized,
+    deduplicated, and truncated to a conservative length."""
+    if not isinstance(parsed, dict):
+        return ""
+    from apps.web.transfer.gateway_auth import redact
+    safe = redact({"reason": parsed.get("reason"),
+                   "note": parsed.get("note")})
+    parts: list[str] = []
+    for key in ("reason", "note"):
+        value = safe.get(key)
+        if isinstance(value, str):
+            text = " ".join(value.split())
+            if text and text not in parts:
+                parts.append(text)
+    return " | ".join(parts)[:_ENVELOPE_DIAGNOSTIC_MAX]
+
 
 def correlate_records(batch: list[ProductLookupKey],
                       records: list[dict]) -> tuple[dict, list[dict]]:

@@ -399,6 +399,77 @@ class TestRequest:
             "https://gw.test/devgapi/corpTool/itemMaster-get")
 
 
+# --- envelope diagnostics (Build 12) ----------------------------------------------
+
+class TestEnvelopeDiagnostics:
+    """A non-success gateway envelope preserves a short, sanitized
+    explanation from its documented reason/note fields - never the raw
+    body - while typed code/status/gateway_code stay intact."""
+
+    def test_reason_only_note_only_and_both(self):
+        assert pl._envelope_diagnostic(
+            {"reason": "Invalid PLU format."}) == "Invalid PLU format."
+        assert pl._envelope_diagnostic(
+            {"note": "Org not entitled."}) == "Org not entitled."
+        assert pl._envelope_diagnostic(
+            {"reason": "Bad request.", "note": "See admin."}) \
+            == "Bad request. | See admin."
+
+    def test_duplicate_reason_and_note_included_once(self):
+        assert pl._envelope_diagnostic(
+            {"reason": "Same text.", "note": "Same text."}) == "Same text."
+
+    def test_missing_null_and_non_string_values_safe(self):
+        assert pl._envelope_diagnostic({}) == ""
+        assert pl._envelope_diagnostic({"reason": None, "note": None}) == ""
+        assert pl._envelope_diagnostic({"reason": 12345,
+                                        "note": ["x"]}) == ""
+        assert pl._envelope_diagnostic(None) == ""
+        assert pl._envelope_diagnostic("not a dict") == ""
+
+    def test_whitespace_normalized_and_truncated(self):
+        assert pl._envelope_diagnostic(
+            {"reason": "  spaced\n\tout   text  "}) == "spaced out text"
+        long_text = "word " * 200
+        result = pl._envelope_diagnostic({"reason": long_text})
+        assert len(result) <= 300
+
+    def test_redaction_and_no_raw_body_leakage(self):
+        parsed = {"reason": "Operation failed.",
+                  "note": "Contact admin.",
+                  "data": [{"plu": "SECRET-ROW", "password": "p"}],
+                  "accessToken": "eyJtoken"}
+        result = pl._envelope_diagnostic(parsed)
+        assert result == "Operation failed. | Contact admin."
+        assert "SECRET-ROW" not in result and "eyJtoken" not in result
+
+    def test_rejection_message_carries_snippet_and_typed_fields(
+            self, tmp_path):
+        job_id = approved_job(tmp_path)
+        rejection = envelope([], code=400012)
+        rejection["reason"] = "Location code is required."
+        rejection["note"] = "ref#123"
+        enrichment, _, _ = run_lookup(job_id, [(200, rejection)])
+        assert enrichment["status"] == "failed"
+        issue = next(i for i in enrichment["issues"]
+                     if i["code"] == pl.PRODUCT_LOOKUP_API_ERROR)
+        assert "Gateway message: Location code is required. | ref#123" \
+            in issue["message"]
+        assert "http=200" in issue["message"]
+        assert "gateway_code=400012" in issue["message"]
+        blob = json.dumps(enrichment)
+        assert "tok-A" not in blob and "Bearer" not in blob
+
+    def test_success_parsing_unchanged(self, tmp_path):
+        job_id = approved_job(tmp_path)
+        enrichment, _, _ = run_lookup(job_id, [(200, envelope(
+            [wire_record(EAN_A), wire_record(
+                EAN_B, item="ZETF381237E085", color="E085", size="XS",
+                desc="SRT - JAZZ SHORTS", price=1900.00)]))])
+        assert enrichment["status"] == "complete"
+        assert enrichment["summary"]["matched_lines"] == 2
+
+
 # --- response handling ------------------------------------------------------------
 
 class TestResponse:

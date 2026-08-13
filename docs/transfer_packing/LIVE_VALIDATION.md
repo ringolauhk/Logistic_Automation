@@ -133,3 +133,43 @@ PILOT_ENABLE_LIVE_PRODUCT_LOOKUP=true python -m apps.web.transfer.pilot \
 
 to confirm: envelope shape, plu/ean echo, orgId echo, AC01-15 and
 compositon1-4 population, and originalPrice/currentPrice semantics.
+
+## Build 12 — controlled itemMaster-get probes (executed)
+
+Organization **100009** (IMAGINEX Hong Kong), approved identifiers only,
+one request per probe under the standing double gate. No Stage 2 batch,
+no UI batch run, and the historical 481-lookup job was never touched.
+
+**Confirmed**
+
+- `/corpTool/itemMaster-get` is reachable and authorized for org 100009:
+  a composite PLU (item+color+size form) returned HTTP 200, gateway code
+  100000, exactly one correlated record.
+- Omitting `locationCode` works - the schema's nullable field can be left
+  out entirely, as the client does.
+- The record carries the expected shape: `orgId`/`plu` echoes, string
+  `ean` with leading zeros, all fifteen `analysisCode01..15` present
+  (blanks as empty strings), the misspelled `compositon1..4`, `currency`,
+  and `originalPrice`/`currentPrice` as JSON numbers. No `locationCode`,
+  no `xf_group*`, no `qty` echo - exactly as the tracked spec documents.
+- An approved **EAN** identifier returned HTTP 200 with gateway code
+  **400012** and reason/note stating that no price information could be
+  retrieved for the given PLUs. Authentication and transport succeeded.
+- **400012 is a business-envelope rejection meaning "no match / no price
+  data" for the identifier(s) sent** - not an entitlement, endpoint,
+  environment or `locationCode` problem. The client therefore records it
+  with its HTTP status, gateway code and a bounded, sanitized
+  reason/note snippet (Build 12 diagnostics) instead of an opaque error.
+
+**Unresolved - business/API confirmation still required**
+
+1. Whether `itemMaster-get` accepts EAN values in `plu` at all, or only
+   composite PLUs. The single EAN tested produced 400012 while the
+   composite PLU succeeded; one product is not a general answer.
+2. Partial-batch semantics: for a batch where some identifiers match and
+   others do not, does the gateway return the found rows with 100000, or
+   400012 for the whole batch? This determines whether 400012 should map
+   to a per-batch "not found" instead of a run failure.
+
+Until both are answered, the client keeps treating 400012 as a batch
+error (safe, no silent data loss) and no broad live batch is run.

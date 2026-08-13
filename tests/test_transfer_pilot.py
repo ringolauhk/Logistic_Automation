@@ -216,6 +216,48 @@ class TestProductProbe:
         blob = json.dumps(observation)
         assert "tok-A" not in blob and "Bearer" not in blob
 
+    def test_failure_preserves_http_status_gateway_code_and_message(
+            self, monkeypatch):
+        """Build 12 diagnostic capture: a typed ProductError's HTTP
+        status, gateway business code, and redaction-safe message are
+        preserved in the observation."""
+        # HTTP-level rejection: status preserved, no gateway code
+        observation, _, _ = self._run(monkeypatch, [(403, None)])
+        assert observation["error_code"] == "PRODUCT_GATEWAY_REJECTED"
+        assert observation["http_status"] == 403
+        assert observation["gateway_code"] is None
+        assert "http=403" in observation["error_message"]
+        # business-envelope rejection: HTTP 200 + failing envelope code
+        observation, _, _ = self._run(
+            monkeypatch, [(200, envelope([], code=100401))])
+        assert observation["error_code"] == "PRODUCT_GATEWAY_REJECTED"
+        assert observation["http_status"] == 200
+        assert observation["gateway_code"] == 100401
+        assert "gateway_code=100401" in observation["error_message"]
+
+    def test_failure_capture_handles_missing_fields_and_stays_redacted(
+            self, monkeypatch):
+        # non-typed exception (no code/status attributes): safe None
+        observation, _, _ = self._run(monkeypatch, [ValueError("boom")])
+        assert observation["error_code"] == "ValueError"
+        assert observation.get("error_message") is None   # no .code attr
+        assert observation["http_status"] is None
+        assert observation["gateway_code"] is None
+        # never any credential material in ANY failure observation
+        for responses in ([(403, None)], [(200, envelope([], code=100401))]):
+            observation, _, _ = self._run(monkeypatch, responses)
+            blob = json.dumps(observation)
+            for banned in ("tok-A", "tok-B", "Bearer", "Authorization",
+                           "password", "cookie", "accessToken"):
+                assert banned not in blob, banned
+
+    def test_success_output_has_no_error_message_field(self, monkeypatch):
+        record = wire_record("4894532999996", ean="4894532999996")
+        observation, _, _ = self._run(monkeypatch,
+                                      [(200, envelope([record]))])
+        assert observation["success"] is True
+        assert "error_message" not in observation    # success unchanged
+
 
 # --- schema observation -----------------------------------------------------------
 

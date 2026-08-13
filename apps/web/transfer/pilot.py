@@ -437,6 +437,14 @@ def product_probe(*, org_id: str, plus: list[str],
     except Exception as exc:
         observation["error_code"] = getattr(exc, "code",
                                             type(exc).__name__)
+        # Diagnostic capture (Build 12): the typed ProductError already
+        # carries the HTTP status, gateway business code, and a
+        # redaction-safe message (never tokens, credentials, headers, or
+        # raw bodies) - preserve them so a live rejection is diagnosable.
+        observation["http_status"] = getattr(exc, "http_status", None)
+        observation["gateway_code"] = getattr(exc, "gateway_code", None)
+        observation["error_message"] = (str(exc)
+                                        if hasattr(exc, "code") else None)
     finally:
         observation["duration_seconds"] = round(
             time.monotonic() - started, 2)
