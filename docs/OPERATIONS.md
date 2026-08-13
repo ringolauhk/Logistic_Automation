@@ -163,6 +163,27 @@ Failure labels distinguish the two situations exactly: `provider_failure`
 means no usable provider response was received; `missing_required_fields`
 means providers answered but the document never supplied the fields.
 
+### Currency must be evidenced by the source
+
+A currency is kept only when the document itself shows it:
+
+- **Accepted** — an explicit ISO code (`HKD`, `USD`, `EUR`, `GBP`, …) or a
+  qualified symbol (`HK$`, `US$`, `S$`, `NT$`, …), or a symbol that belongs
+  to exactly one currency (`€`, `£`, `₹`, …). Matching is case-insensitive
+  and never fires inside a longer word (`USDA` is not `USD`).
+- **Rejected** — a bare `$` or `¥`. These are shared by many currencies, so
+  they evidence none of them. Addresses, seller/buyer country, locale and
+  model world-knowledge are **not** evidence: a Hong Kong address plus `$`
+  does not make it HKD.
+
+When a model returns a currency the source does not evidence, the value is
+dropped (kept as provenance), the row is routed to review with
+`currency lacks explicit source evidence`, and every other extracted field —
+including a seller name recovered by the vision fallback — is preserved.
+The check is deterministic and offline: it never triggers another provider
+or vision attempt. Documents whose pages expose no text at all (pure scans)
+are exempt, since there is nothing to verify against.
+
 ## 11. Rerunning with --overwrite
 
 By default a run **refuses** (before any provider call) if the workbook, its

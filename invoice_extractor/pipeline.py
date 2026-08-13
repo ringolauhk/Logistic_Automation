@@ -63,6 +63,7 @@ from invoice_extractor.schema import (
     REQUIRED_FIELDS,
     ExtractionError,
     Invoice,
+    currency_evidence_supports,
     empty_invoice,
     validate_invoice,
 )
@@ -118,6 +119,9 @@ class InvoiceResult:
     vision_fallback_pages: list[int] = field(default_factory=list)
     vision_fallback_missing: list[str] = field(default_factory=list)
     vision_fallback_recovered: bool = False
+    # M9.3: a model-returned currency the SOURCE did not evidence (kept for
+    # provenance; the invoice field itself is cleared and flagged).
+    rejected_currency: str | None = None
 
 
 # A whole-ladder rejection is "validation only" when EVERY recorded attempt
@@ -803,6 +807,39 @@ def process_file(
     # still enforced on the aggregated invoice. Never discards invoice/
     # line_items - only flags needs_review with a specific, safe reason
     # naming the missing field(s) (existing contract, unchanged).
+    # M9.3: a currency is accepted only when the SOURCE evidences it. A
+    # model may return a dollar-family code for a document that prints a
+    # bare "$" simply because the addresses sit in that country - that is
+    # inference, not evidence, and it must not let the document leave
+    # review. Purely
+    # deterministic and offline: no extra provider or vision attempt is
+    # ever triggered by this rejection.
+    #
+    # Scope: documents whose meaningful pages are ALL text pages, so the
+    # extracted text is the whole document and absence of evidence really
+    # is evidence of absence (this includes a text-native document that
+    # used the M9.2 vision fallback). A pure scan exposes no text to check,
+    # and a MIXED document may legitimately print its currency on an image
+    # page we cannot read - rejecting either would be guesswork of the
+    # opposite kind, so both are left untouched.
+    evidence_text = "\n".join(p.text for p in pages if getattr(p, "text", None))
+    if (result.invoice.currency and not image_pages
+            and evidence_text.strip()):
+        if not currency_evidence_supports(evidence_text, result.invoice.currency):
+            result.rejected_currency = result.invoice.currency
+            result.invoice.currency = None
+            reasons.append(
+                # NOTE: never use "; " inside a clause - it is the review
+                # reason's clause separator (a split clause would degrade
+                # to an 'unknown' category).
+                f"currency lacks explicit source evidence (model returned "
+                f"{result.rejected_currency}, the document shows only an "
+                "ambiguous symbol)")
+            logger.info(
+                "%s: rejected model currency %s - no explicit evidence in the "
+                "source (ambiguous symbol only); routed to review",
+                path.name, result.rejected_currency)
+
     validation_reason = validate_invoice(
         result.invoice, cfg.total_abs_tolerance, cfg.total_rel_tolerance
     )

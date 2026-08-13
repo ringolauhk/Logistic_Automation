@@ -45,6 +45,8 @@ _REVIEW_PATTERNS = [
     ("conflict in invoice_number", "invoice_number_conflict"),
     ("conflict in", "header_conflict"),
     ("missing required fields", "missing_required_fields"),
+    # M9.3: an unevidenced currency is a missing required field
+    ("lacks explicit source evidence", "missing_required_fields"),
     ("totals inconclusive", "totals_inconclusive"),
     ("partial extraction", "partial_extraction"),
     ("missing an amount", "suspicious_line"),

@@ -90,7 +90,7 @@ def line_items_only(items):
 
 
 def full_headers(**overrides):
-    data = dict(invoice_number="INV-1", invoice_date="2026-01-01", currency="USD",
+    data = dict(invoice_number="INV-1", invoice_date="2026-01-01", currency="EUR",
                 seller_name="Acme", total_amount=100)
     data.update(overrides)
     return header_only(**data)

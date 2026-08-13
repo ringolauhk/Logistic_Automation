@@ -417,8 +417,13 @@ class TestNoHardcoding:
                 assert banned not in src, f"{rel}: {banned}"
 
     def test_currency_is_never_inferred_in_the_pipeline(self):
+        """The pipeline may CLEAR an unevidenced currency but must never
+        assign one: no country/locale/currency mapping lives here."""
+        import re
         from pathlib import Path
         root = Path(__file__).resolve().parent.parent
         src = (root / "invoice_extractor/pipeline.py").read_text(
             encoding="utf-8")
-        assert "currency =" not in src        # never assigned/derived here
+        assignments = re.findall(r"\.currency\s*=\s*(\S+)", src)
+        assert assignments, "expected the evidence guard to clear currency"
+        assert all(value == "None" for value in assignments), assignments

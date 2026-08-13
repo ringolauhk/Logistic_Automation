@@ -124,7 +124,13 @@ def build_pdf(path, page_specs) -> str:
     for spec in page_specs:
         page = doc.new_page()
         if spec[0] == "text":
-            page.insert_text((50, 72), spec[1], fontsize=10)
+            # Wrap inside the page: a single insert_text() line runs off the
+            # right edge and the tail is silently CLIPPED, so a fixture body
+            # ending in "... 100.00 EUR" never actually reached the page and
+            # could not be used as source evidence (M9.3).
+            page.insert_textbox(
+                fitz.Rect(50, 60, page.rect.width - 50, page.rect.height - 60),
+                spec[1], fontsize=10)
         elif spec[0] == "image":
             page.insert_image(fitz.Rect(40, 40, 460, 460), stream=_scan_png())
         elif spec[0] != "blank":
