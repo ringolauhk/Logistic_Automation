@@ -128,6 +128,41 @@ Reasons are compact and safe (missing required fields, header/total conflicts,
 totals inconclusive, partial extraction, budget reached, unreadable PDF, ...).
 Open the `NeedsReview` sheet, fix or confirm by hand, and move on.
 
+### Automatic text → vision fallback (bounded)
+
+A **text-native** page can still hide a required field inside an image — the
+confirmed case is a seller name that exists only in a letterhead logo, so
+every text model answers correctly and is still rejected for missing
+`seller_name`.
+
+When (and only when) **every** attempt of the text ladder was rejected for
+that one reason, the run re-reads those pages **once** through the normal
+vision path:
+
+- **Trigger** — all recorded text attempts have rejection category
+  `missing_required_fields` (a structured signal, not text matching), the
+  document has no image pages of its own, and the failed pages fit in one
+  vision chunk.
+- **Hard bounds** — at most **one** fallback per document, **one** chunk of
+  at most `MAX_VISION_PAGES` pages; the run-wide and per-file cost/attempt
+  budgets are checked first and are never bypassed; the fallback can never
+  trigger itself again.
+- **Never triggers for** provider/transport errors, auth failures, timeouts,
+  rate limiting, malformed envelopes or JSON, budget exhaustion, operator
+  cancellation, documents already routed to vision, or missing/invalid
+  `OPENROUTER_VISION_MODELS` (which skips the fallback with no call).
+- **Provenance** — the result records that the fallback ran, which pages, the
+  fields that triggered it, and whether it recovered them; the extra request
+  appears once in the usage CSV (`route=vision`) and in the request counts.
+- **Nothing is invented.** If the source is genuinely ambiguous (e.g. prices
+  written only as `$` with no currency code anywhere), the field stays empty
+  and the row remains in review. Documents such as zero-value Sales Orders
+  may therefore still need a human decision — that is the correct outcome.
+
+Failure labels distinguish the two situations exactly: `provider_failure`
+means no usable provider response was received; `missing_required_fields`
+means providers answered but the document never supplied the fields.
+
 ## 11. Rerunning with --overwrite
 
 By default a run **refuses** (before any provider call) if the workbook, its

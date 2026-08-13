@@ -40,6 +40,7 @@ These appear as compact review reasons; raw provider bodies are never shown.
 | `model_unavailable` (HTTP 404) | Model id not available to your key | Fix the id; confirm on OpenRouter |
 | `timeout` | Request exceeded the timeout | Raise `REQUEST_TIMEOUT_SECONDS`; lower `RENDER_DPI`/chunk size |
 | `... failed on all configured models` | Every model in the ladder failed for that chunk | Inspect the named page range; add/adjust models or limits |
+| `missing required fields: ...` | Providers **answered**; the document never supplied those fields. **Not** a provider failure | For a text-native file the run already retried the pages once through vision automatically; if a field (e.g. currency written only as `$`) is genuinely absent, complete it by hand in NeedsReview |
 
 Under `LLM_GATEWAY=openrouter` the message says **"all configured models"**
 (only the ladder was tried) — not "all providers".

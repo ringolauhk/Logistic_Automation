@@ -63,7 +63,12 @@ _REVIEW_PATTERNS = [
     ("http 4", "provider_failure"),
     ("http 5", "provider_failure"),
     ("rate_limited", "provider_failure"),
-    ("truncated", "provider_failure"),
+    # "response truncated", never a bare "truncated": logging_setup shortens
+    # long summaries with a "...[truncated]" marker, and that marker must
+    # NEVER be read as a provider truncation (M9.2 - it mislabeled
+    # validation-only failures as provider_failure). Both genuine sources
+    # say "... response truncated before valid JSON completed".
+    ("response truncated", "provider_failure"),
 ]
 
 
