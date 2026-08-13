@@ -59,7 +59,14 @@ from invoice_extractor.pdf_utils import (
     PageInfo,
     format_page_ranges,
 )
-from invoice_extractor.schema import ExtractionError, Invoice, empty_invoice, validate_invoice
+from invoice_extractor.schema import (
+    REQUIRED_FIELDS,
+    ExtractionError,
+    Invoice,
+    currency_evidence_supports,
+    empty_invoice,
+    validate_invoice,
+)
 from invoice_extractor.usage import FileBudget, RunBudget, UsageRecord
 
 
@@ -102,6 +109,44 @@ class InvoiceResult:
     # to the workbook; consumed by cli.py to write the .usage.csv sidecar.
     # Always empty for the direct gateway.
     usage_records: list[UsageRecord] = field(default_factory=list)
+    # M9.2 bounded text -> vision fallback provenance. Set only when a
+    # TEXT-native document's entire text ladder was rejected solely because
+    # required fields were missing and exactly ONE automatic vision attempt
+    # was made to recover them (e.g. a seller name that exists only inside a
+    # letterhead logo, invisible to the text layer). Never set for documents
+    # already routed to vision, nor for provider/transport/budget failures.
+    vision_fallback_used: bool = False
+    vision_fallback_pages: list[int] = field(default_factory=list)
+    vision_fallback_missing: list[str] = field(default_factory=list)
+    vision_fallback_recovered: bool = False
+    # M9.3: a model-returned currency the SOURCE did not evidence (kept for
+    # provenance; the invoice field itself is cleared and flagged).
+    rejected_currency: str | None = None
+
+
+# A whole-ladder rejection is "validation only" when EVERY recorded attempt
+# was rejected for this one reason: the provider answered, the JSON parsed,
+# but the extracted invoice lacked required fields. Any transport, auth,
+# rate-limit, malformed-envelope/JSON or budget rejection disqualifies it.
+VALIDATION_ONLY_REJECTION = "missing_required_fields"
+
+
+def _validation_only_exhaustion(exc: Exception) -> bool:
+    """True when a model ladder failed ONLY because required fields were
+    missing - decided from the attempts' structured rejection categories
+    (never by string matching on provider text)."""
+    records = getattr(exc, "usage_records", None) or []
+    categories = [r.rejection_category for r in records if not r.accepted]
+    if not categories or any(c is None for c in categories):
+        return False
+    return all(c == VALIDATION_ONLY_REJECTION for c in categories)
+
+
+def _missing_required_from(exc: Exception) -> list[str]:
+    """Required-field names named by a validation-only failure. Matches ONLY
+    against schema.REQUIRED_FIELDS, so no provider text can leak through."""
+    text = str(exc)
+    return [f for f in REQUIRED_FIELDS if f in text]
 
 
 def _chunked(items: list, size: int) -> list[list]:
@@ -491,6 +536,98 @@ def process_file(
                 route_failures.append((label, exc))
                 result.failed_pages.extend(result.text_pages)
 
+    # --- M9.2: bounded automatic text -> vision fallback --------------------
+    # A text-native page can still hide a required field in an IMAGE (the
+    # confirmed case: a seller name that exists only as a letterhead logo,
+    # so every text model answers correctly and is still rejected for
+    # missing seller_name). When - and only when - the entire text ladder
+    # was rejected for that single reason, re-read those pages ONCE through
+    # the existing vision chunk path. Hard limits: at most one fallback per
+    # file, one chunk (<= max_vision_pages), never recursive, and never for
+    # provider/transport/auth/rate-limit/malformed/budget failures, which
+    # keep their existing behavior untouched.
+    if (cfg.llm_gateway == "openrouter" and text_pages and not image_pages
+            and route_failures and not result.vision_fallback_used
+            and all(_validation_only_exhaustion(exc)
+                    for _, exc in route_failures)):
+        failed_nums = set(result.failed_pages)
+        pages = [p for p in text_pages if p.number in failed_nums]
+        missing = sorted({f for _, exc in route_failures
+                          for f in _missing_required_from(exc)})
+        budget_reason = _budget_stop_reason()
+        if not pages:
+            pass                                    # nothing recoverable
+        elif len(pages) > cfg.max_vision_pages:
+            # ONE chunk is the hard bound: a bigger document is left to
+            # normal review rather than silently escalating page by page.
+            logger.warning(
+                "%s: text ladder rejected only for missing required fields "
+                "(%s) but %d page(s) exceed the single-chunk vision "
+                "fallback bound (MAX_VISION_PAGES=%d); no fallback "
+                "attempted", path.name, ", ".join(missing) or "unnamed",
+                len(pages), cfg.max_vision_pages)
+        elif budget_reason is not None:
+            logger.warning("%s: %s; skipping the automatic vision fallback "
+                           "with no provider calls", path.name, budget_reason)
+        else:
+            try:
+                validate_openrouter_config(cfg, require_vision=True,
+                                           require_text=False)
+            except ConfigurationError as exc:
+                logger.warning(
+                    "%s: text ladder rejected only for missing required "
+                    "fields (%s) but OpenRouter vision configuration is "
+                    "invalid (%s); no fallback attempted",
+                    path.name, ", ".join(missing) or "unnamed",
+                    exc_summary(exc))
+            else:
+                fallback_nums = [p.number for p in pages]
+                page_range = format_page_ranges(fallback_nums)
+                result.vision_fallback_used = True   # set BEFORE the attempt
+                result.vision_fallback_pages = fallback_nums
+                result.vision_fallback_missing = missing
+                logger.info(
+                    "%s: text ladder returned answers but lacked required "
+                    "field(s) %s; ONE automatic vision fallback on page(s) "
+                    "%s", path.name, ", ".join(missing) or "unnamed",
+                    page_range)
+                emit(on_event, ProgressEvent(
+                    event=CHUNK_STARTED, source_file=path.name,
+                    route="vision", page_range=page_range,
+                    chunk_index=1, chunk_total=1))
+                result.vision_chunk_count += 1
+                try:
+                    # is_chunked=True: this attempt is a SECOND view of
+                    # pages the text route already read, so chunk-level
+                    # hard-field enforcement is relaxed exactly as it is
+                    # for any multi-request document - otherwise a vision
+                    # answer that recovers seller_name but still lacks an
+                    # unresolvable currency would be discarded whole. The
+                    # full requirement is still enforced once, on the
+                    # aggregated invoice, by Stage 6 below.
+                    route = _run_openrouter_vision_chunk(
+                        cfg, logger, path.name, path, pages, 1, 1,
+                        run_id, run_budget, file_budget, True,
+                        on_event=on_event,
+                    )
+                    routes.append(route)
+                    result.usage_records.extend(route.usage_records)
+                    result.vision_fallback_recovered = True
+                    # the text failures are superseded: these pages now have
+                    # a structured result, so they are no longer "failed"
+                    route_failures.clear()
+                    result.failed_pages = [n for n in result.failed_pages
+                                           if n not in set(fallback_nums)]
+                    logger.info("%s: vision fallback produced a structured "
+                                "result for page(s) %s", path.name, page_range)
+                except Exception as exc:
+                    result.usage_records.extend(
+                        getattr(exc, "usage_records", None) or [])
+                    logger.warning(
+                        "%s: vision fallback on page(s) %s did not recover "
+                        "the missing field(s) (%s)", path.name, page_range,
+                        exc_summary(exc))
+
     if image_pages and cfg.llm_gateway == "openrouter":
         chunks = or_vision_chunks
         result.vision_chunk_count = len(chunks)
@@ -591,6 +728,27 @@ def process_file(
                      else "all providers")
         if result.document_classification == DOC_ERROR:
             result.review_reason = "no meaningful pages (document is blank)"
+        elif (route_failures and _budget_stop_reason() is None
+              and all(_validation_only_exhaustion(exc)
+                      for _, exc in route_failures)):
+            # NOT a provider failure: every model answered and parsed - the
+            # document simply never supplied these fields. One clause, no
+            # "failed on ..." phrasing, so the shared category vocabulary
+            # reports missing_required_fields alone (M9.2). A ladder that
+            # ALSO stopped on a cost/attempt budget keeps the existing
+            # message instead: the budget is the more actionable cause and
+            # must never be hidden behind a validation label.
+            missing = sorted({f for _, exc in route_failures
+                              for f in _missing_required_from(exc)})
+            fallback_note = (", and one automatic vision fallback could not "
+                             "supply them either"
+                             if result.vision_fallback_used else "")
+            result.review_reason = (
+                "missing required fields: "
+                + (", ".join(missing) or "unnamed")
+                + " (every configured model responded but none supplied "
+                + "them" + fallback_note + ")"
+            )
         else:
             result.review_reason = "; ".join(
                 f"{label} failed on {failed_on}: {exc_summary(exc)}"
@@ -649,6 +807,39 @@ def process_file(
     # still enforced on the aggregated invoice. Never discards invoice/
     # line_items - only flags needs_review with a specific, safe reason
     # naming the missing field(s) (existing contract, unchanged).
+    # M9.3: a currency is accepted only when the SOURCE evidences it. A
+    # model may return a dollar-family code for a document that prints a
+    # bare "$" simply because the addresses sit in that country - that is
+    # inference, not evidence, and it must not let the document leave
+    # review. Purely
+    # deterministic and offline: no extra provider or vision attempt is
+    # ever triggered by this rejection.
+    #
+    # Scope: documents whose meaningful pages are ALL text pages, so the
+    # extracted text is the whole document and absence of evidence really
+    # is evidence of absence (this includes a text-native document that
+    # used the M9.2 vision fallback). A pure scan exposes no text to check,
+    # and a MIXED document may legitimately print its currency on an image
+    # page we cannot read - rejecting either would be guesswork of the
+    # opposite kind, so both are left untouched.
+    evidence_text = "\n".join(p.text for p in pages if getattr(p, "text", None))
+    if (result.invoice.currency and not image_pages
+            and evidence_text.strip()):
+        if not currency_evidence_supports(evidence_text, result.invoice.currency):
+            result.rejected_currency = result.invoice.currency
+            result.invoice.currency = None
+            reasons.append(
+                # NOTE: never use "; " inside a clause - it is the review
+                # reason's clause separator (a split clause would degrade
+                # to an 'unknown' category).
+                f"currency lacks explicit source evidence (model returned "
+                f"{result.rejected_currency}, the document shows only an "
+                "ambiguous symbol)")
+            logger.info(
+                "%s: rejected model currency %s - no explicit evidence in the "
+                "source (ambiguous symbol only); routed to review",
+                path.name, result.rejected_currency)
+
     validation_reason = validate_invoice(
         result.invoice, cfg.total_abs_tolerance, cfg.total_rel_tolerance
     )

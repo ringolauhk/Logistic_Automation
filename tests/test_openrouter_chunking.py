@@ -214,7 +214,7 @@ class TestAllChunksSucceedTierOne:
                 {"description": "Item B", "quantity": 1, "unit_price": 20, "amount": 20},
             ])),
             envelope(header_only(
-                invoice_number="INV-1", invoice_date="2026-01-01", currency="USD",
+                invoice_number="INV-1", invoice_date="2026-01-01", currency="EUR",
                 seller_name="Acme", total_amount=30,
             )),
         ]
@@ -238,7 +238,7 @@ class TestOneChunkEscalates:
         pdf = multi_page_pdf(pdf_factory, 4)  # chunks: 1-2, 3-4
         rec = Recorder([
             envelope(header_only(
-                invoice_number="INV-1", invoice_date="2026-01-01", currency="USD",
+                invoice_number="INV-1", invoice_date="2026-01-01", currency="EUR",
                 seller_name="Acme", total_amount=10,
             ), model="tier-1-served"),  # chunk 1: tier-1 ok
             # chunk 2 tier-1: transport failure (NOT a missing-header
@@ -275,7 +275,7 @@ class TestMiddleChunkFails:
             ])),  # chunk 1 ok
             rate_limit_error(), rate_limit_error(),  # chunk 2: both tiers fail
             envelope(header_only(
-                invoice_number="INV-1", invoice_date="2026-01-01", currency="USD",
+                invoice_number="INV-1", invoice_date="2026-01-01", currency="EUR",
                 seller_name="Acme", total_amount=1,
             )),  # chunk 3 ok
         ])
@@ -329,7 +329,7 @@ class TestFinalHardRequiredGate:
             envelope(line_items_only([
                 {"description": "Freight", "quantity": 1, "unit_price": 100, "amount": 100},
             ])),  # chunk 2: line-item-only, NO headers at all
-            envelope(header_only(currency="USD", total_amount=100)),  # chunk 3: remaining headers
+            envelope(header_only(currency="EUR", total_amount=100)),  # chunk 3: remaining headers
         ])
         monkeypatch.setattr(openrouter_client, "_chat_completion", rec)
 
@@ -337,7 +337,7 @@ class TestFinalHardRequiredGate:
 
         assert result.invoice.seller_name == "Acme"
         assert result.invoice.invoice_date == "2026-01-01"
-        assert result.invoice.currency == "USD"
+        assert result.invoice.currency == "EUR"
         assert float(result.invoice.total_amount) == 100.0
         assert result.needs_review is False  # final gate passes - all 4 required fields present
         assert result.error is False
@@ -383,9 +383,9 @@ class TestHeaderConflicts:
         pdf = multi_page_pdf(pdf_factory, 4)
         rec = Recorder([
             envelope(header_only(seller_name="Acme Ltd", total_amount=100,
-                                 invoice_date="2026-01-01", currency="USD")),
+                                 invoice_date="2026-01-01", currency="EUR")),
             envelope(header_only(seller_name="Other Corp", total_amount=100,
-                                 invoice_date="2026-01-01", currency="USD")),
+                                 invoice_date="2026-01-01", currency="EUR")),
         ])
         monkeypatch.setattr(openrouter_client, "_chat_completion", rec)
 
@@ -401,9 +401,9 @@ class TestHeaderConflicts:
         pdf = multi_page_pdf(pdf_factory, 4)
         rec = Recorder([
             envelope(header_only(invoice_number="INV-1", seller_name="Acme",
-                                 total_amount=100, invoice_date="2026-01-01", currency="USD")),
+                                 total_amount=100, invoice_date="2026-01-01", currency="EUR")),
             envelope(header_only(invoice_number="INV-2", seller_name="Acme",
-                                 total_amount=100, invoice_date="2026-01-01", currency="USD")),
+                                 total_amount=100, invoice_date="2026-01-01", currency="EUR")),
         ])
         monkeypatch.setattr(openrouter_client, "_chat_completion", rec)
 
@@ -447,7 +447,7 @@ class TestFinalValidationChecks:
                 {"description": "A", "quantity": 1, "unit_price": 10, "amount": 10},
             ])),
             envelope(header_only(seller_name="Acme", invoice_date="2026-01-01",
-                                 currency="USD", total_amount=999)),  # doesn't reconcile
+                                 currency="EUR", total_amount=999)),  # doesn't reconcile
         ])
         monkeypatch.setattr(openrouter_client, "_chat_completion", rec)
 
@@ -467,7 +467,7 @@ class TestFinalValidationChecks:
                 {"description": "Real item", "quantity": 1, "unit_price": 10, "amount": 10},
             ])),
             envelope(header_only(seller_name="Acme", invoice_date="2026-01-01",
-                                 currency="USD", total_amount=10)),
+                                 currency="EUR", total_amount=10)),
         ])
         monkeypatch.setattr(openrouter_client, "_chat_completion", rec)
 
@@ -572,7 +572,7 @@ class TestProvenance:
                 {"description": "A", "quantity": 1, "unit_price": 1, "amount": 1},
             ]), model="same-served"),
             envelope(header_only(seller_name="Acme", invoice_date="2026-01-01",
-                                 currency="USD", total_amount=1), model="same-served"),
+                                 currency="EUR", total_amount=1), model="same-served"),
         ])
         monkeypatch.setattr(openrouter_client, "_chat_completion", rec)
 
@@ -589,7 +589,7 @@ class TestProvenance:
                 {"description": "A", "quantity": 1, "unit_price": 1, "amount": 1},
             ]), model="model-a-served"),
             envelope(header_only(seller_name="Acme", invoice_date="2026-01-01",
-                                 currency="USD", total_amount=1), model="model-b-served"),
+                                 currency="EUR", total_amount=1), model="model-b-served"),
         ])
         monkeypatch.setattr(openrouter_client, "_chat_completion", rec)
 

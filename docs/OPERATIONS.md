@@ -128,6 +128,62 @@ Reasons are compact and safe (missing required fields, header/total conflicts,
 totals inconclusive, partial extraction, budget reached, unreadable PDF, ...).
 Open the `NeedsReview` sheet, fix or confirm by hand, and move on.
 
+### Automatic text → vision fallback (bounded)
+
+A **text-native** page can still hide a required field inside an image — the
+confirmed case is a seller name that exists only in a letterhead logo, so
+every text model answers correctly and is still rejected for missing
+`seller_name`.
+
+When (and only when) **every** attempt of the text ladder was rejected for
+that one reason, the run re-reads those pages **once** through the normal
+vision path:
+
+- **Trigger** — all recorded text attempts have rejection category
+  `missing_required_fields` (a structured signal, not text matching), the
+  document has no image pages of its own, and the failed pages fit in one
+  vision chunk.
+- **Hard bounds** — at most **one** fallback per document, **one** chunk of
+  at most `MAX_VISION_PAGES` pages; the run-wide and per-file cost/attempt
+  budgets are checked first and are never bypassed; the fallback can never
+  trigger itself again.
+- **Never triggers for** provider/transport errors, auth failures, timeouts,
+  rate limiting, malformed envelopes or JSON, budget exhaustion, operator
+  cancellation, documents already routed to vision, or missing/invalid
+  `OPENROUTER_VISION_MODELS` (which skips the fallback with no call).
+- **Provenance** — the result records that the fallback ran, which pages, the
+  fields that triggered it, and whether it recovered them; the extra request
+  appears once in the usage CSV (`route=vision`) and in the request counts.
+- **Nothing is invented.** If the source is genuinely ambiguous (e.g. prices
+  written only as `$` with no currency code anywhere), the field stays empty
+  and the row remains in review. Documents such as zero-value Sales Orders
+  may therefore still need a human decision — that is the correct outcome.
+
+Failure labels distinguish the two situations exactly: `provider_failure`
+means no usable provider response was received; `missing_required_fields`
+means providers answered but the document never supplied the fields.
+
+### Currency must be evidenced by the source
+
+A currency is kept only when the document itself shows it:
+
+- **Accepted** — an explicit ISO code (`HKD`, `USD`, `EUR`, `GBP`, …) or a
+  qualified symbol (`HK$`, `US$`, `S$`, `NT$`, …), or a symbol that belongs
+  to exactly one currency (`€`, `£`, `₹`, …). Matching is case-insensitive
+  and never fires inside a longer word (`USDA` is not `USD`).
+- **Rejected** — a bare `$` or `¥`. These are shared by many currencies, so
+  they evidence none of them. Addresses, seller/buyer country, locale and
+  model world-knowledge are **not** evidence: a Hong Kong address plus `$`
+  does not make it HKD.
+
+When a model returns a currency the source does not evidence, the value is
+dropped (kept as provenance), the row is routed to review with
+`currency lacks explicit source evidence`, and every other extracted field —
+including a seller name recovered by the vision fallback — is preserved.
+The check is deterministic and offline: it never triggers another provider
+or vision attempt. Documents whose pages expose no text at all (pure scans)
+are exempt, since there is nothing to verify against.
+
 ## 11. Rerunning with --overwrite
 
 By default a run **refuses** (before any provider call) if the workbook, its

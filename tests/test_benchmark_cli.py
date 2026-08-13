@@ -186,7 +186,7 @@ class TestSyntheticEndToEnd:
 
         def full(desc, amt, total, **extra):
             return json.dumps({"invoice_number": "INV-1", "invoice_date": "2026-07-01",
-                               "currency": "USD", "seller_name": "Acme",
+                               "currency": "EUR", "seller_name": "Acme",
                                "total_amount": total, "line_items": [item(desc, amt)], **extra})
         responses = [
             _envelope(json.dumps({"line_items": [item("Mixed text line", 10)]})),   # mixed text
@@ -216,7 +216,7 @@ class TestSyntheticEndToEnd:
             manifest_entry("failed", "failed.pdf", "malformed", "failed"),
         ]
         gts = {
-            "text": gt("text", invoice={"invoice_number": "INV-1", "currency": "USD",
+            "text": gt("text", invoice={"invoice_number": "INV-1", "currency": "EUR",
                                         "total_amount": "100.00"},
                        line_items=[{"description": "Text line", "amount": "100.00"}]),
             "scan": gt("scan", invoice={"invoice_number": "INV-1", "total_amount": "50.00"},
