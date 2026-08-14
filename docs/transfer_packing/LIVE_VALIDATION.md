@@ -161,15 +161,30 @@ no UI batch run, and the historical 481-lookup job was never touched.
   with its HTTP status, gateway code and a bounded, sanitized
   reason/note snippet (Build 12 diagnostics) instead of an opaque error.
 
-**Unresolved - business/API confirmation still required**
+**Identifier handling - CONFIRMED by the API team**
 
-1. Whether `itemMaster-get` accepts EAN values in `plu` at all, or only
-   composite PLUs. The single EAN tested produced 400012 while the
-   composite PLU succeeded; one product is not a general answer.
-2. Partial-batch semantics: for a batch where some identifiers match and
-   others do not, does the gateway return the found rows with 100000, or
-   400012 for the whole batch? This determines whether 400012 should map
-   to a per-batch "not found" instead of a run failure.
+`itemMaster-get` validates the supplied identifier **sequentially: EAN
+first, then PLU**. Both identifier forms therefore travel through the
+same `plu` request parameter and both are supported.
 
-Until both are answered, the client keeps treating 400012 as a batch
-error (safe, no silent data loss) and no broad live batch is run.
+Consequences for this client, all of which mean *no code change*:
+
+- The existing EAN-first planning with an Item+Color+Size fallback stays
+  exactly as it is. Composite-PLU-first request planning is **not**
+  required, and identifier construction and lookup priority are
+  unchanged.
+- The `400012` seen for the tested EAN means **no price information
+  matched that identifier under the selected organization**. It does not
+  indicate that EAN lookup is unsupported, nor an entitlement, endpoint,
+  environment or `locationCode` problem.
+- No further live probe is required for the identifier question.
+
+**Still unconfirmed - partial-batch behavior**
+
+For a batch where some identifiers match and others do not, it is not
+known whether the gateway returns the matching rows with code 100000 or
+rejects the whole batch with 400012. Until that is confirmed, the client
+keeps its conservative handling: `400012` is treated as a batch error
+(safe - no silent data loss), and no broad live batch is run. This
+behavior must not be described as confirmed for partially matching
+batches.
