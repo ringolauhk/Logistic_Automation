@@ -1,0 +1,1226 @@
+{
+  "x-generator": "NSwag v14.6.3.0 (NJsonSchema v11.5.2.0 (Newtonsoft.Json v13.0.0.0))",
+  "openapi": "3.0.0",
+  "info": {
+    "title": "imxapig",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "https://websrv.imaginex.hk/devgapi"
+    }
+  ],
+  "paths": {
+    "/corpTool/invByItem-get": {
+      "post": {
+        "tags": [
+          "Corptool"
+        ],
+        "operationId": "comimaginexapigCorpToolEpGetInventory",
+        "requestBody": {
+          "x-name": "InvByItemReqDto",
+          "description": "",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ComimaginexapigCorpToolInvByItemReqDto"
+              }
+            }
+          },
+          "required": true,
+          "x-position": 1
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComimaginexapigCorpToolInvStyleResDto_DocHttp200"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        },
+        "security": [
+          {
+            "JWTBearerAuth": []
+          }
+        ]
+      }
+    },
+    "/corpTool/invByPluLoc-get": {
+      "post": {
+        "tags": [
+          "Corptool"
+        ],
+        "operationId": "comimaginexapigCorpToolEpGetInventoryAtLoc",
+        "requestBody": {
+          "x-name": "InvItemPluAtLocReqDto",
+          "description": "",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ComimaginexapigCorpToolInvItemPluAtLocReqDto"
+              }
+            }
+          },
+          "required": true,
+          "x-position": 1
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComimaginexapigCorpToolInvPluAtLocResDto_DocHttp200"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        },
+        "security": [
+          {
+            "JWTBearerAuth": []
+          }
+        ]
+      }
+    },
+    "/corpTool/itemMaster-get": {
+      "post": {
+        "tags": [
+          "Corptool"
+        ],
+        "operationId": "comimaginexapigCorpToolEpGetItemMaster",
+        "requestBody": {
+          "x-name": "ItemMasterListReqDto",
+          "description": "",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ComimaginexapigCorpToolItemMasterListReqDto"
+              }
+            }
+          },
+          "required": true,
+          "x-position": 1
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ItemMasterResDto_DocHttp200"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        },
+        "security": [
+          {
+            "JWTBearerAuth": []
+          }
+        ]
+      }
+    },
+    "/corpTool/pluLabel-get": {
+      "post": {
+        "tags": [
+          "Corptool"
+        ],
+        "operationId": "comimaginexapigCorpToolEpGetItemLabel",
+        "requestBody": {
+          "x-name": "LabelListReqDto",
+          "description": "",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ComimaginexapigCorpToolLabelListReqDto"
+              }
+            }
+          },
+          "required": true,
+          "x-position": 1
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComimaginexapigCorpToolLabelResDto_DocHttp200"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        },
+        "security": [
+          {
+            "JWTBearerAuth": []
+          }
+        ]
+      }
+    },
+    "/auth/login": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "operationId": "comimaginexapigAuthSvcEpUserLogin",
+        "requestBody": {
+          "x-name": "LoginReqDto",
+          "description": "",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ComimaginexapigAuthSvcLoginReqDto"
+              }
+            }
+          },
+          "required": true,
+          "x-position": 1
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComimaginexapigAuthSvcUserTokenResDto_DocHttp200"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/refresh": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "operationId": "comimaginexapigAuthSvcEpUserRefresh",
+        "requestBody": {
+          "x-name": "RefreshReqDto",
+          "description": "",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ComimaginexapigAuthSvcRefreshReqDto"
+              }
+            }
+          },
+          "required": true,
+          "x-position": 1
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComimaginexapigAuthSvcUserTokenResDto_DocHttp200"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ComimaginexapigCorpToolInvStyleResDto_DocHttp200": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ComimaginexapigBaseBaseResDto"
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "data": {
+                "nullable": true,
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/ComimaginexapigCorpToolInvStyleResDto"
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "ComimaginexapigCorpToolInvStyleResDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "orgID": {
+            "type": "string"
+          },
+          "style": {
+            "type": "string"
+          },
+          "longDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "shortDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "season": {
+            "type": "string",
+            "nullable": true
+          },
+          "seasonDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "mainCat": {
+            "type": "string",
+            "nullable": true
+          },
+          "mainCatDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "subCat": {
+            "type": "string",
+            "nullable": true
+          },
+          "subCatDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "collection": {
+            "type": "string",
+            "nullable": true
+          },
+          "collectionDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "productType": {
+            "type": "string",
+            "nullable": true
+          },
+          "productTypeDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "model": {
+            "type": "string",
+            "nullable": true
+          },
+          "modelDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "material": {
+            "type": "string",
+            "nullable": true
+          },
+          "materialDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "gender": {
+            "type": "string",
+            "nullable": true
+          },
+          "genderDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "brand": {
+            "type": "string",
+            "nullable": true
+          },
+          "brandDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "styleInventoryDetails": {
+            "type": "array",
+            "nullable": true,
+            "items": {
+              "$ref": "#/components/schemas/ComimaginexapigCorpToolInvStyleDetailResDto"
+            }
+          }
+        }
+      },
+      "ComimaginexapigCorpToolInvStyleDetailResDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "locCode": {
+            "type": "string"
+          },
+          "locLongDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "locShortDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "style": {
+            "type": "string"
+          },
+          "colorCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "colorDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "colorOrder": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "size": {
+            "type": "string",
+            "nullable": true
+          },
+          "sizeOrder": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "plu": {
+            "type": "string",
+            "nullable": true
+          },
+          "ean": {
+            "type": "string",
+            "nullable": true
+          },
+          "matchedSearchingPlu": {
+            "type": "boolean",
+            "nullable": true
+          },
+          "qtySoH": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "qtyInTransit": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "qtyOutTransit": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "qtyReserved": {
+            "type": "integer",
+            "format": "int32"
+          }
+        }
+      },
+      "ComimaginexapigBaseBaseResDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "status": {
+            "type": "string",
+            "nullable": true
+          },
+          "code": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "reason": {
+            "type": "string",
+            "nullable": true
+          },
+          "note": {
+            "type": "string",
+            "nullable": true
+          },
+          "data": {
+            "nullable": true
+          }
+        }
+      },
+      "ComimaginexapigCorpToolInvByItemReqDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "plu": {
+            "type": "string",
+            "nullable": true
+          },
+          "style": {
+            "type": "string",
+            "nullable": true
+          },
+          "ownLoc": {
+            "type": "boolean",
+            "nullable": true
+          }
+        }
+      },
+      "ComimaginexapigCorpToolInvPluAtLocResDto_DocHttp200": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ComimaginexapigBaseBaseResDto"
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "data": {
+                "nullable": true,
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/ComimaginexapigCorpToolInvPluAtLocResDto"
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "ComimaginexapigCorpToolInvPluAtLocResDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "orgID": {
+            "type": "string"
+          },
+          "locCode": {
+            "type": "string"
+          },
+          "locLongDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "locShortDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "style": {
+            "type": "string"
+          },
+          "colorCode": {
+            "type": "string"
+          },
+          "colorDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "size": {
+            "type": "string"
+          },
+          "plu": {
+            "type": "string",
+            "nullable": true
+          },
+          "ean": {
+            "type": "string",
+            "nullable": true
+          },
+          "longDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "shortDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "season": {
+            "type": "string",
+            "nullable": true
+          },
+          "seasonDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "mainCat": {
+            "type": "string",
+            "nullable": true
+          },
+          "mainCatDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "subCat": {
+            "type": "string",
+            "nullable": true
+          },
+          "subCatDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "collection": {
+            "type": "string",
+            "nullable": true
+          },
+          "collectionDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "productType": {
+            "type": "string",
+            "nullable": true
+          },
+          "productTypeDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "model": {
+            "type": "string",
+            "nullable": true
+          },
+          "modelDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "material": {
+            "type": "string",
+            "nullable": true
+          },
+          "materialDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "gender": {
+            "type": "string",
+            "nullable": true
+          },
+          "genderDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "brand": {
+            "type": "string",
+            "nullable": true
+          },
+          "brandDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "priceOriginal": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "priceCurrent": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "imageSources": {
+            "type": "array",
+            "nullable": true,
+            "items": {
+              "$ref": "#/components/schemas/ComimaginexapigCorpToolItemImageResDto"
+            }
+          }
+        }
+      },
+      "ComimaginexapigCorpToolItemImageResDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "colorCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "imageSource": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "ComimaginexapigCorpToolInvItemPluAtLocReqDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "storeCode": {
+            "type": "string"
+          },
+          "plu": {
+            "type": "string"
+          }
+        }
+      },
+      "ItemMasterResDto_DocHttp200": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ComimaginexapigBaseBaseResDto"
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "data": {
+                "type": "array",
+                "nullable": true,
+                "items": {
+                  "$ref": "#/components/schemas/ItemMasterResDto"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "ItemMasterResDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "orgId": {
+            "type": "string"
+          },
+          "itemCode": {
+            "type": "string"
+          },
+          "itemDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "longItemDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "colorCode": {
+            "type": "string"
+          },
+          "colorDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "colorOrder": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "sizeCode": {
+            "type": "string"
+          },
+          "plu": {
+            "type": "string"
+          },
+          "ean": {
+            "type": "string"
+          },
+          "brand": {
+            "type": "string",
+            "nullable": true
+          },
+          "brandName": {
+            "type": "string",
+            "nullable": true
+          },
+          "season": {
+            "type": "string",
+            "nullable": true
+          },
+          "seasonDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "cat": {
+            "type": "string",
+            "nullable": true
+          },
+          "catDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "subcat": {
+            "type": "string",
+            "nullable": true
+          },
+          "subcatDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "collection": {
+            "type": "string",
+            "nullable": true
+          },
+          "collectionDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "gender": {
+            "type": "string",
+            "nullable": true
+          },
+          "prodLine": {
+            "type": "string",
+            "nullable": true
+          },
+          "prodLineDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "model": {
+            "type": "string",
+            "nullable": true
+          },
+          "material": {
+            "type": "string",
+            "nullable": true
+          },
+          "supplierItemCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "countryOfOrigin": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode01": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode02": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode03": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode04": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode05": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode06": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode07": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode08": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode09": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode10": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode11": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode12": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode13": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode14": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode15": {
+            "type": "string",
+            "nullable": true
+          },
+          "compositon1": {
+            "type": "string",
+            "nullable": true
+          },
+          "compositon2": {
+            "type": "string",
+            "nullable": true
+          },
+          "compositon3": {
+            "type": "string",
+            "nullable": true
+          },
+          "compositon4": {
+            "type": "string",
+            "nullable": true
+          },
+          "currency": {
+            "type": "string",
+            "nullable": true
+          },
+          "originalPrice": {
+            "type": "number",
+            "format": "decimal",
+            "nullable": true
+          },
+          "currentPrice": {
+            "type": "number",
+            "format": "decimal",
+            "nullable": true
+          }
+        }
+      },
+      "ComimaginexapigCorpToolItemMasterListReqDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "requestList": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ComimaginexapigCorpToolItemMasterReqDto"
+            }
+          }
+        }
+      },
+      "ComimaginexapigCorpToolItemMasterReqDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "orgId": {
+            "type": "string"
+          },
+          "locationCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "plu": {
+            "type": "string"
+          }
+        }
+      },
+      "ComimaginexapigCorpToolLabelResDto_DocHttp200": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ComimaginexapigBaseBaseResDto"
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "data": {
+                "type": "array",
+                "nullable": true,
+                "items": {
+                  "$ref": "#/components/schemas/ComimaginexapigCorpToolLabelResDto"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "ComimaginexapigCorpToolLabelResDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "orgId": {
+            "type": "string"
+          },
+          "locationCode": {
+            "type": "string"
+          },
+          "brand": {
+            "type": "string",
+            "nullable": true
+          },
+          "brandName": {
+            "type": "string",
+            "nullable": true
+          },
+          "currency": {
+            "type": "string",
+            "nullable": true
+          },
+          "itemCode": {
+            "type": "string"
+          },
+          "colorCode": {
+            "type": "string"
+          },
+          "sizeCode": {
+            "type": "string"
+          },
+          "plu": {
+            "type": "string"
+          },
+          "ean": {
+            "type": "string"
+          },
+          "itemDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "longItemDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "colorDesc": {
+            "type": "string",
+            "nullable": true
+          },
+          "subcat": {
+            "type": "string",
+            "nullable": true
+          },
+          "gender": {
+            "type": "string",
+            "nullable": true
+          },
+          "prodLine": {
+            "type": "string",
+            "nullable": true
+          },
+          "supplierItemCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "xf_group5": {
+            "type": "string",
+            "nullable": true
+          },
+          "xf_group12": {
+            "type": "string",
+            "nullable": true
+          },
+          "xf_group16": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode01": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode02": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode03": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode04": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode05": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode06": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode07": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode08": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode09": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode10": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode11": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode12": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode13": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode14": {
+            "type": "string",
+            "nullable": true
+          },
+          "analysisCode15": {
+            "type": "string",
+            "nullable": true
+          },
+          "compositon1": {
+            "type": "string",
+            "nullable": true
+          },
+          "compositon2": {
+            "type": "string",
+            "nullable": true
+          },
+          "compositon3": {
+            "type": "string",
+            "nullable": true
+          },
+          "compositon4": {
+            "type": "string",
+            "nullable": true
+          },
+          "originalRetailPrice": {
+            "type": "number",
+            "format": "decimal"
+          },
+          "discountPrice": {
+            "type": "number",
+            "format": "decimal"
+          },
+          "qty": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          }
+        }
+      },
+      "ComimaginexapigCorpToolLabelListReqDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "requestList": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ComimaginexapigCorpToolLabelReqDto"
+            }
+          }
+        }
+      },
+      "ComimaginexapigCorpToolLabelReqDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "locationCode": {
+            "type": "string"
+          },
+          "plu": {
+            "type": "string"
+          },
+          "item": {
+            "type": "string",
+            "nullable": true
+          },
+          "color": {
+            "type": "string",
+            "nullable": true
+          },
+          "size": {
+            "type": "string",
+            "nullable": true
+          },
+          "qty": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "priceDate": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "ComimaginexapigAuthSvcUserTokenResDto_DocHttp200": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ComimaginexapigBaseBaseResDto"
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "data": {
+                "nullable": true,
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/ComimaginexapigAuthSvcUserTokenResDto"
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "ComimaginexapigAuthSvcUserTokenResDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "accessToken": {
+            "type": "string",
+            "nullable": true
+          },
+          "expire_in": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "refreshToken": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "ComimaginexapigAuthSvcLoginReqDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "client": {
+            "type": "string"
+          },
+          "userId": {
+            "type": "string"
+          },
+          "password": {
+            "type": "string"
+          },
+          "locale": {
+            "type": "string",
+            "nullable": true
+          },
+          "targetData": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "ComimaginexapigAuthSvcRefreshReqDto": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "rt": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "JWTBearerAuth": {
+        "type": "http",
+        "description": "Enter a JWT token to authorize the requests...",
+        "scheme": "Bearer",
+        "bearerFormat": "JWT"
+      }
+    }
+  }
+}

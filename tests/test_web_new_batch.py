@@ -211,6 +211,47 @@ class TestCompactStyle:
         assert 'data-testid="stMainBlockContainer"' in COMPACT_CSS
         assert "st-emotion" not in COMPACT_CSS
 
+    def test_layout_clears_fixed_toolbar_and_headings_not_clipped(self):
+        """Pilot-reported layout audit: the block container must clear the
+        ~60px fixed Streamlit toolbar, and the negative heading margin
+        Streamlit ships (to cancel its default 1rem gap) must be
+        neutralized so headings are never painted over by tables/grids."""
+        import re
+        m = re.search(r'stMainBlockContainer"\]\s*\{[^}]*padding-top:\s*'
+                      r'([\d.]+)rem', COMPACT_CSS)
+        assert m, "block-container padding-top missing"
+        assert float(m.group(1)) >= 4.0, "top padding must clear the toolbar"
+        assert ('[data-testid="stHeading"] '
+                '[data-testid="stMarkdownContainer"]') in COMPACT_CSS
+        heading_rule = COMPACT_CSS.split('[data-testid="stHeading"]', 1)[1]
+        heading_rule = heading_rule.split("}", 1)[0]
+        assert "margin-bottom: 0 !important" in heading_rule
+
+    def test_heading_line_height_safe(self):
+        import re
+        for tag in ("h1", "h2", "h3"):
+            m = re.search(tag + r"\s*\{[^}]*line-height:\s*([\d.]+)",
+                          COMPACT_CSS)
+            assert m, f"{tag} line-height missing"
+            assert float(m.group(1)) >= 1.25, f"{tag} line-height compressed"
+
+    def test_no_fragile_layout_hacks(self):
+        import re
+        # rules only - comments may legitimately DESCRIBE negative margins
+        low = re.sub(r"/\*.*?\*/", "", COMPACT_CSS.lower(), flags=re.S)
+        assert "position: absolute" not in low
+        assert "position:absolute" not in low
+        assert "overflow: hidden" not in low
+        assert "overflow:hidden" not in low
+        # no negative margins or offsets anywhere in our stylesheet
+        import re
+        assert not re.search(r"(margin|top|left|right|bottom)[^:;{]*:\s*-",
+                             low), "negative margin/offset found"
+        # no fixed pixel heights for dynamic content
+        assert not re.search(r"height:\s*\d+px", low)
+        # the old blanket element-container rule must stay gone
+        assert 'stElementContainer"] { margin-bottom: 0' not in COMPACT_CSS
+
     def test_app_uses_wide_layout_and_compact_css(self):
         import pathlib
         root = pathlib.Path(__file__).resolve().parent.parent

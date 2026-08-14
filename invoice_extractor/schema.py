@@ -237,6 +237,59 @@ def check_required(inv: Invoice) -> None:
         raise ExtractionError(f"missing required fields: {', '.join(missing)}")
 
 
+# --- currency evidence (M9.3) -------------------------------------------------
+# A currency is only as trustworthy as the notation actually printed on the
+# document. `$` and `¥` are SHARED by many currencies, so on their own they
+# support none of them: a Hong Kong address, a seller's country, a locale or
+# a model's world knowledge is not evidence. Anything that is unambiguous in
+# the source - an ISO code, or a qualified symbol such as HK$/US$ - is.
+
+# Symbols that identify exactly one currency.
+_UNIQUE_CURRENCY_SYMBOLS = {
+    "EUR": ("€",), "GBP": ("£",), "INR": ("₹",), "KRW": ("₩",),
+    "THB": ("฿",), "PHP": ("₱",), "VND": ("₫",), "ILS": ("₪",),
+}
+# Qualified notations that disambiguate an otherwise shared symbol.
+_QUALIFIED_CURRENCY_NOTATION = {
+    "HKD": ("HK$",), "USD": ("US$", "U.S.$", "$US"), "SGD": ("S$",),
+    "AUD": ("A$", "AU$"), "CAD": ("C$", "CA$"), "NZD": ("NZ$",),
+    "TWD": ("NT$",), "MOP": ("MOP$",), "BRL": ("R$",),
+    "CNY": ("CN¥", "RMB"), "JPY": ("JP¥",), "MYR": ("RM",), "IDR": ("Rp",),
+}
+# Never sufficient on their own, whatever the model concluded.
+AMBIGUOUS_CURRENCY_SYMBOLS = ("$", "¥")
+
+
+def _token_present(text: str, token: str) -> bool:
+    """Case-insensitive match that never fires inside a longer word (so
+    'USD' is not found in 'USDA' and 'RM' is not found in 'FORM')."""
+    return re.search(rf"(?<![A-Za-z0-9]){re.escape(token)}(?![A-Za-z0-9])",
+                     text, re.IGNORECASE) is not None
+
+
+def currency_evidence_supports(text: str, currency: str | None) -> bool:
+    """True when `text` explicitly evidences `currency`.
+
+    Deterministic and offline - no provider call, no inference. Returns
+    False for a bare shared symbol even when the surrounding document
+    'obviously' implies a country: that inference is exactly what this
+    check exists to reject.
+    """
+    code = (currency or "").strip().upper()
+    if not code or not text:
+        return False
+    if _token_present(text, code):                      # explicit ISO code
+        return True
+    for notation in _QUALIFIED_CURRENCY_NOTATION.get(code, ()):
+        if notation.isalnum():
+            if _token_present(text, notation):
+                return True
+        elif notation.upper() in text.upper():          # e.g. HK$, US$
+            return True
+    return any(symbol in text
+               for symbol in _UNIQUE_CURRENCY_SYMBOLS.get(code, ()))
+
+
 def missing_identifier(inv: Invoice) -> bool:
     """True when the invoice has no invoice_number AND no po_number AND no
     reference - nothing a reviewer or downstream system could use to

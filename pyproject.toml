@@ -35,6 +35,11 @@ dev = ["pytest>=8.0"]
 # Pilot web UI (M9) - only the `web` Docker stage / UI operators need this;
 # the CLI stays installable without it. Exact lock: requirements-web.txt.
 web = ["streamlit==1.59.2"]
+# Local OCR for scanned Transfer Delivery Notes (Build 2) - optional and
+# fully offline (onnxruntime models run locally; no cloud provider). Without
+# it, text-native transfer PDFs still extract; scanned pages are reported as
+# needing the OCR dependency. Exact lock: requirements-ocr.txt.
+transfer-ocr = ["rapidocr-onnxruntime==1.2.3"]
 
 [project.scripts]
 invoice-extractor = "invoice_extractor.cli:cli"

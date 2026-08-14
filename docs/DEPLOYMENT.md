@@ -219,14 +219,48 @@ docker compose up invoice-extractor-web        # http://localhost:8501
 - Separate image built from the `web` stage (`--target web`); the CLI stage is
   the Dockerfile's final/default stage, so plain `docker build .` still
   produces the CLI image.
-- The container binds the host port as `127.0.0.1:8501` only — never exposed
-  beyond the machine by default. For remote pilot users prefer
-  `tailscale serve 8501` (authenticated, private) over LAN binding.
+- The web service publishes host port `8501:8501` (all interfaces) so pilot
+  users on the trusted LAN reach it at `http://<host>:8501`. For off-LAN
+  pilots prefer `tailscale serve 8501` (authenticated, private); for
+  single-machine use rebind to `127.0.0.1:8501:8501`. Never expose it to the
+  public internet.
 - Job storage is `./web-data` on the host (`/data/jobs` in the container),
   git-ignored and excluded from build contexts; jobs are deleted after
   `WEB_JOB_RETENTION_HOURS` (default 24).
 - Runs as the same non-root user with `user: "${HOST_UID:-1000}:${HOST_GID:-1000}"`.
 - No login, no telemetry (`gatherUsageStats = false`), single active job.
+- Optional feature flag `TRANSFER_WORKFLOW_ENABLED=true` (in `.env`) adds the
+  Transfer Note Packing List workflow selector (see
+  `docs/transfer_packing/FUNCTIONAL_SPEC.md`). Default off.
+- The Transfer workflow's product lookup (Build 11:
+  `/corpTool/itemMaster-get`) uses BACKEND-ONLY `API_GATEWAY_*` and
+  `PRODUCT_LOOKUP_*` variables (see `.env.example`): keep credentials in
+  the server's `.env` only — never in Docker image layers, never in the
+  browser. The API account is SHARED and not tied to an organization —
+  the user selects the organization in the Transfer UI and its
+  Organization ID is sent as `orgId`; no organization is ever inferred
+  from the login account. Gateway tokens are held in process memory
+  per container and are never persisted; restarting a container simply
+  re-authenticates on the next lookup. Packing preparation (Build 6) and
+  workbook generation (Build 7) are fully local and configured by the
+  optional `PACKING_*` variables (see `.env.example`); generated workbooks
+  live under each transfer job's `output/` folder and are subject to
+  `PACKING_OUTPUT_RETENTION_HOURS`.
+- **Docker OCR (Build 8)**: the web image installs the pinned
+  `requirements-ocr.txt` stack plus `libgl1`/`libglib2.0-0`, so scanned
+  (image-only) Transfer Delivery Notes OCR inside the container with no
+  runtime model downloads (models ship in the wheel). This adds roughly
+  1 GB uncompressed to the web image (~1.5 GB total); the CLI image is
+  unchanged. Rebuild with `docker compose build invoice-extractor-web`.
+- **Pilot operations (Build 8)**: `python -m apps.web.transfer.pilot
+  doctor` gives a redacted readiness report (exit 0/1/2);
+  `... pilot cleanup --dry-run|--execute` reclaims expired transfer
+  outputs/tmp/archived metadata (in-progress and invoice jobs are never
+  touched). Live API probes are disabled by default and doubly gated —
+  see `docs/transfer_packing/LIVE_VALIDATION.md`; pilot procedure and
+  rollback: `docs/transfer_packing/PILOT_CHECKLIST.md` and
+  `PILOT_ROLLBACK.md`. Keep `.env` at mode 600; `PILOT_ENABLE_LIVE_*`
+  stay `false` outside an approved validation window.
 
 Full usage, limits, cancellation, retention, and remote-access guidance:
 `docs/WEB_UI.md`.

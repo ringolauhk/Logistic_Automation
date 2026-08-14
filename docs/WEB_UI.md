@@ -5,8 +5,8 @@ run, watch safe progress, download the results. It is a limited pilot tool,
 not a production platform.
 
 > **No login.** Anyone who can reach the port can upload invoices and trigger
-> **paid provider calls**. Keep it on localhost or Tailscale. Public internet
-> exposure is **unsupported**.
+> **paid provider calls**. Keep it on a trusted LAN, localhost, or Tailscale.
+> Public internet exposure is **unsupported**.
 
 > **Privacy.** During extraction, uploaded invoice content (text and rendered
 > page images) is sent to the configured external model provider. Uploads and
@@ -81,18 +81,67 @@ The active job is never deleted.
 
 ## Remote pilot access
 
-Keep the host binding on `127.0.0.1:8501` (the compose default) and prefer an
-**authenticated private proxy**:
+The compose default publishes host port `8501:8501` on all interfaces so
+pilot users on the **trusted LAN** can reach the app directly
+(`http://<host>:8501`) - anyone on that network can upload and spend, so keep
+the network trusted. For remote (off-LAN) pilots prefer an **authenticated
+private proxy**:
 
 ```bash
 # Tailscale Serve: private, authenticated, no port changes needed
 tailscale serve 8501
 ```
 
-Explicit LAN alternative (trusted networks only — understand that anyone on
-the LAN can then upload and spend): change the compose mapping to
-`"8501:8501"`. Do **not** expose the port to the public internet; that is
-unsupported (no login, no rate limiting, no HTTPS termination).
+Localhost-only alternative (single-machine use): change the compose mapping
+to `"127.0.0.1:8501:8501"`. Whatever the binding, do **not** expose the port
+to the public internet; that is unsupported (no login, no rate limiting, no
+HTTPS termination). Native `streamlit run` (without Docker) still binds
+localhost only.
+
+## Transfer Note Packing List (feature-flagged)
+
+A second, independent workflow — upload Transfer Delivery Note PDFs in
+carton order, create a Transfer Packing job, and (Build 2) run local
+deterministic extraction: embedded text first, optional local OCR for
+scanned pages (`pip install -r requirements-ocr.txt` — no cloud calls),
+carton/item parsing with exact printed-total validation, and (Build 3) a
+review screen: correct or exclude headers/cartons/lines with full audit of
+original vs corrected values, deterministic issue resolution, and approval
+to `READY_FOR_PRODUCT_LOOKUP`, then (Build 5) run **Product lookup**:
+deduplicated, batched `pluLabel-get` calls through the server-side API
+Gateway client (EAN first, Item+Color+Size fallback), with a reviewable
+enrichment table (Analysis Codes, Compositions, source-vs-API comparison,
+issues) that survives refresh, then (Build 6) **Prepare Packing Groups**:
+destination grouping by To Loc., carton renumbering from 001 per
+destination (originals kept), same-carton consolidation, and one delivery
+invoice number per destination - all local and deterministic - and
+finally (Build 7) **Generate Workbooks**: one validated packing-list
+`.xlsx` per destination (Packing List, Detail, Carton Mapping, Needs
+Review, Source Documents sheets) with per-workbook downloads and a ZIP
+for multiple destinations; stale inputs disable downloads until
+regeneration. Tokens and credentials never reach the browser. Printing
+and email delivery are not included. Build 10 turns the page into a
+**guided top-to-bottom flow** (progress indicator, compact stage
+summaries with details in collapsed expanders, the next action always
+directly below the last successful stage) whose primary result is the
+**Final enriched product lines** table - source + API values, prices,
+and all Analysis Code/Composition attributes per line, with a column
+selector and a local **Excel export**
+(`Transfer_<job_id>_Enriched_Product_Lines.xlsx`; no API call, no state
+change). Build 11 adds a required **Organization selector** at the top of
+the workflow (11 approved organizations; product lookup calls
+`itemMaster-get` with the selected Organization ID as `orgId`; changing
+the organization invalidates enrichment and downstream stages until a
+fresh lookup). Build 8 adds a **Pilot readiness**
+expander (on-demand redacted diagnostics: OCR, API configuration status
+by variable name, job states, retention — never secrets) and Docker OCR
+support so scanned notes work in the container; live API probes are
+CLI-only, disabled by default, and doubly gated (see
+`docs/transfer_packing/LIVE_VALIDATION.md`).
+Hidden unless `TRANSFER_WORKFLOW_ENABLED=true`; the invoice workflow stays
+the default and is unchanged. Transfer jobs are stored separately under
+`web-data/transfer-jobs/` and are not auto-deleted in Build 1. Full details:
+`docs/transfer_packing/FUNCTIONAL_SPEC.md`.
 
 ## Troubleshooting
 

@@ -1,0 +1,377 @@
+"""Streamlit page for the Transfer Note Packing List workflow (Build 1:
+upload shell only - no extraction, product lookup, or Excel generation).
+
+All session-state keys are prefixed "transfer_" so nothing collides with
+the invoice workflow's keys (job_id, plans, uploader_gen, new_batch_msg).
+"""
+
+import streamlit as st
+
+from apps.web.job_manager import JobError
+from apps.web.transfer import extraction, jobs, review_page
+from apps.web.transfer.models import (
+    EXTRACTABLE_STATUSES,
+    FILE_VALIDATED,
+    JOB_EXTRACTING,
+    TransferPackingJob,
+)
+
+_UPLOADER_GEN_KEY = "transfer_uploader_gen"
+
+
+def _uploader_key() -> str:
+    return f"transfer-uploader-{st.session_state.get(_UPLOADER_GEN_KEY, 0)}"
+
+
+def _reset_selection() -> None:
+    st.session_state[_UPLOADER_GEN_KEY] = (
+        st.session_state.get(_UPLOADER_GEN_KEY, 0) + 1)
+
+
+def _size_mb(size_bytes: int) -> str:
+    return f"{size_bytes / 1e6:.1f} MB"
+
+
+def _selection_table(validated, *, from_job: bool = False) -> list[dict]:
+    rows = []
+    for f in validated:
+        rows.append({
+            "Order": f.sequence,
+            "File": f.original_name,
+            "Size": _size_mb(f.size_bytes),
+            "Pages": f.page_count if f.page_count is not None else "-",
+            "Status": f.status,
+        })
+    return rows
+
+
+_STAGE_GLYPHS = {"complete": "✔", "active": "▶", "failed": "✖",
+                 "blocked": "⛔", "pending": "○"}
+
+
+def _workflow_stages(status: str) -> list[tuple[str, str, str]]:
+    """(stage, state, label) derived ONLY from the persisted job status -
+    the existing single source of truth. No second state system."""
+    def rank(prefixes):
+        return any(status.startswith(p) for p in prefixes)
+
+    extraction = ("active" if status == "EXTRACTING"
+                  else "pending" if status == "READY_FOR_EXTRACTION"
+                  else "complete")
+    review = ("blocked" if status == "REVIEW_REJECTED"
+              else "active" if status in ("EXTRACTED",
+                                          "EXTRACTED_WITH_ISSUES",
+                                          "REVIEW_IN_PROGRESS")
+              else "complete" if not rank(("READY_FOR_EXTRACTION",
+                                           "EXTRACTING"))
+              else "pending")
+    lookup = ("failed" if status == "PRODUCT_LOOKUP_FAILED"
+              else "active" if status == "PRODUCT_LOOKUP_IN_PROGRESS"
+              else "complete" if rank(("PRODUCT_LOOKUP_COMPLETE",
+                                       "PRODUCT_LOOKUP_WITH_ISSUES",
+                                       "PACKING_", "WORKBOOK_"))
+              else "pending")
+    packing = ("failed" if status == "PACKING_PREPARATION_FAILED"
+               else "active" if status == "PACKING_PREPARATION_IN_PROGRESS"
+               else "complete" if rank(("PACKING_PREPARATION_COMPLETE",
+                                        "PACKING_PREPARATION_WITH_ISSUES",
+                                        "WORKBOOK_"))
+               else "pending")
+    workbook = ("failed" if status == "WORKBOOK_GENERATION_FAILED"
+                else "active" if status == "WORKBOOK_GENERATION_IN_PROGRESS"
+                else "complete" if rank(("WORKBOOK_GENERATION_COMPLETE",
+                                         "WORKBOOK_GENERATION_WITH_ISSUES"))
+                else "pending")
+    labels = {"complete": "Complete", "active": "In progress",
+              "failed": "Failed", "blocked": "Blocked",
+              "pending": "Not started"}
+    return [("Extraction", extraction, labels[extraction]),
+            ("Review", review,
+             "Approved" if review == "complete" else labels[review]),
+            ("Product Lookup", lookup, labels[lookup]),
+            ("Packing", packing, labels[packing]),
+            ("Workbook", workbook,
+             "Generated" if workbook == "complete"
+             else "Not generated" if workbook == "pending"
+             else labels[workbook])]
+
+
+def _render_workflow_progress(job: TransferPackingJob) -> None:
+    parts = [f"{_STAGE_GLYPHS[state]} **{stage}** {label}"
+             for stage, state, label in _workflow_stages(job.status)]
+    st.markdown("&nbsp;·&nbsp;".join(parts))
+
+
+def _render_organization_selector() -> None:
+    """Build 11: the API login account is shared and NOT tied to one
+    organization, so the user must deliberately choose the organization
+    whose item master is queried. The selection (name + Organization ID)
+    lives in session state; product lookup stays blocked without it and
+    the ID is sent as `orgId` on every itemMaster-get request. Never
+    derived from the login account, token, or .env."""
+    from apps.web.transfer import organizations as orgs
+    chosen = st.selectbox(
+        "Organization", orgs.organization_names(), index=None,
+        placeholder="Select an organization",
+        key="transfer_org_name",
+        help="Determines which organization's item master is queried. "
+             "The API credentials in the server environment are a shared "
+             "account and do not imply an organization.")
+    org = orgs.by_name(chosen) if chosen else None
+    st.session_state["transfer_org_id"] = org.org_id if org else None
+    if org is not None:
+        st.caption(f"Organization ID: {org.org_id} (sent as orgId with "
+                   "every product lookup)")
+    else:
+        st.caption("Product lookup stays disabled until an organization "
+                   "is selected.")
+
+
+def _render_job_summary(job: TransferPackingJob) -> None:
+    st.subheader("Transfer Packing job")
+    _render_workflow_progress(job)
+    _render_organization_selector()
+    row = st.columns(5)
+    row[0].metric("Job ID", job.job_id.rsplit("-", 1)[-1])
+    row[1].metric("Files", len(job.files))
+    row[2].metric("Total pages", job.total_pages)
+    row[3].metric("Total size", _size_mb(job.total_bytes))
+    row[4].metric("Status", job.status)
+    st.caption(f"Job ID: {job.job_id} - created {job.created_at}")
+    with st.expander("Uploaded files (in processing order)"):
+        st.table(_selection_table(job.files, from_job=True))
+
+    _render_extraction_section(job)
+
+    if st.button("Start a new Transfer Packing selection"):
+        st.session_state["transfer_job_id"] = None
+        _reset_selection()
+        st.rerun()
+
+
+def _render_extraction_section(job: TransferPackingJob) -> None:
+    """Build 2 extraction + Build 3 review/correction/approval. There are
+    no product-API or packing-list controls - those are later builds."""
+    result = extraction.load_result(job.job_id)
+
+    if job.status in EXTRACTABLE_STATUSES:
+        label = ("Retry Transfer Note extraction"
+                 if result is not None or job.status == JOB_EXTRACTING
+                 else "Extract Transfer Notes")
+        if job.status == JOB_EXTRACTING:
+            st.warning("A previous extraction did not finish; retrying is "
+                       "safe (results are written only once, atomically).")
+        if st.button(label, type="primary"):
+            progress = st.progress(0.0, text="Starting extraction...")
+
+            def on_progress(seq, total, name):
+                progress.progress(min(seq / max(total, 1), 1.0),
+                                  text=f"File {seq} of {total}: {name}")
+
+            try:
+                with st.spinner("Extracting Transfer Notes locally "
+                                "(no cloud calls)..."):
+                    extraction.run_extraction(job.job_id,
+                                              on_progress=on_progress)
+            except JobError as exc:
+                st.error(str(exc))
+            st.rerun()
+
+    if result is None:
+        st.caption("Extraction output: structured cartons and item lines "
+                   "grouped for review, then product lookup, packing "
+                   "groups, and per-destination packing-list workbooks.")
+        return
+
+    summary = result.summary()
+    st.subheader("Extraction summary")
+    r1 = st.columns(6)
+    r1[0].metric("Files", f"{summary['processed_files']}/"
+                          f"{summary['uploaded_files']}")
+    r1[1].metric("Pages", summary["processed_pages"])
+    r1[2].metric("Text pages", summary["pages_embedded_text"])
+    r1[3].metric("OCR pages", summary["pages_ocr"])
+    r1[4].metric("Unreadable", summary["pages_unreadable"])
+    r1[5].metric("Recognized notes", summary["recognized_documents"])
+    r2 = st.columns(6)
+    r2[0].metric("Destinations", len(summary["destination_codes"]))
+    r2[1].metric("Cartons", summary["cartons"])
+    r2[2].metric("Item lines", summary["lines"])
+    r2[3].metric("Total units", summary["total_units"])
+    r2[4].metric("Warnings", summary["warnings"])
+    r2[5].metric("Blocking errors", summary["errors"])
+    if summary["destination_codes"]:
+        st.caption("Destinations (To Loc.): "
+                   + ", ".join(summary["destination_codes"]))
+
+    cartons = [c for d in result.documents for c in d.cartons]
+    if cartons:
+        # Progressive disclosure: successful extraction details stay in
+        # collapsed expanders; the compact summary above is the default.
+        with st.expander("View carton details"):
+            st.table([{
+                "Order": i + 1,
+                "Carton": c.original_carton_number or "?",
+                "Destination": c.destination_code or "?",
+                "D/N": c.delivery_note_number or "?",
+                "File": c.source_file,
+                "Page(s)": ",".join(str(p) for p in c.source_pages),
+                "Lines": len(c.lines),
+                "Units": c.calculated_carton_total,
+                "Printed": (c.printed_carton_total
+                            if c.printed_carton_total is not None else "-"),
+                "Check": c.validation_status,
+            } for i, c in enumerate(cartons)])
+
+        with st.expander("View extracted item lines"):
+            for c in cartons:
+                st.markdown(f"**Carton {c.original_carton_number or '?'}** - "
+                            f"{c.destination_code or '?'} - "
+                            f"{len(c.lines)} line(s)")
+                st.table([{
+                    "Seq": ln.source_sequence_number,
+                    "Item": ln.normalized_item_code or ln.raw_item_code,
+                    "EAN": ln.normalized_ean or ln.raw_ean,
+                    "Description": (ln.normalized_description or "")[:60],
+                    "Price": ln.normalized_retail_price or ln.raw_retail_price,
+                    "Color": ln.normalized_color_code,
+                    "Size": ln.normalized_size_code,
+                    "Qty": (ln.normalized_quantity
+                            if ln.normalized_quantity is not None
+                            else ln.raw_quantity),
+                } for ln in c.lines])
+
+    issues = result.all_issues()
+    if issues:
+        # blocking extraction errors auto-expand; warnings stay collapsed
+        has_blocking = any(i.severity == "error" for i in issues)
+        with st.expander(f"Extraction issues - source record "
+                         f"({len(issues)})", expanded=has_blocking):
+            st.table([{
+                "Severity": i.severity,
+                "Code": i.code,
+                "File": i.source_file,
+                "Page": i.source_page if i.source_page is not None else "-",
+                "Carton": i.carton or "-",
+                "Line": i.line_ref if i.line_ref is not None else "-",
+                "Message": i.message,
+            } for i in issues[:200]])
+            if len(issues) > 200:
+                st.caption(f"Showing first 200 of {len(issues)} issues.")
+
+    # --- Build 3: review, correction, and approval --------------------------------
+    if job.status in review_page.review_mod.REVIEWABLE_JOB_STATUSES:
+        review_page.render_review_section(job, result)
+    st.caption("Full workflow: extract, review and approve, run product "
+               "lookup (API is called only on Run), prepare packing "
+               "groups, then generate the packing-list workbooks.")
+
+
+def _render_pilot_readiness() -> None:
+    """Build 8: on-demand, fully redacted pilot readiness (doctor) report.
+    Never triggers a network call; shows names and statuses only."""
+    from apps.web.transfer import pilot
+    with st.expander("Pilot readiness (Build 8)"):
+        if st.button("Run readiness checks", key="transfer_pilot_doctor"):
+            report, code = pilot.doctor()
+            st.session_state["transfer_pilot_report"] = (report, code)
+        stored = st.session_state.get("transfer_pilot_report")
+        if not stored:
+            st.caption("Run the checks to see application, OCR, API, "
+                       "mapping, and retention status. No live API call is "
+                       "made and no secrets are shown.")
+            return
+        report, code = stored
+        badge = {0: "READY", 1: "WARNINGS", 2: "BLOCKED"}[code]
+        st.markdown(f"**Overall: {badge}** - commit `{report['app_commit']}`"
+                    f", Python {report['python']}, generated "
+                    f"{report['generated_at']}")
+        rows = [
+            ("Transfer workflow enabled", report["transfer_workflow_enabled"]),
+            ("Running in container", report["in_container"]),
+            ("Job root writable", report["job_root_writable"]),
+            ("OCR", f"{report['ocr']['status']} "
+                    f"({report['ocr']['detail']})"),
+            ("API configuration", report["api_status"]),
+            ("Live auth probe enabled", report["live_auth_enabled"]),
+            ("Live product probe enabled",
+             report["live_product_lookup_enabled"]),
+            ("Stranded jobs", report["stranded_jobs"]),
+            ("Free disk (GB)", report["free_disk_gb"]),
+            ("Cleanup candidates",
+             f"{report['cleanup_candidates']['files']} files / "
+             f"{report['cleanup_candidates']['bytes']} bytes"),
+        ]
+        st.table([{"Check": k, "Status": str(v)} for k, v in rows])
+        if report["job_state_counts"]:
+            st.caption("Jobs by state: " + ", ".join(
+                f"{k}: {v}" for k, v in
+                sorted(report["job_state_counts"].items())))
+        for message in report["api_problems"]:
+            st.warning(message)          # variable names only, never values
+        for message in report["warnings"]:
+            st.warning(message)
+        for message in report["blockers"]:
+            st.error(message)
+
+
+def render() -> None:
+    """Render the whole Transfer Note workflow page, then stop."""
+    st.title("Transfer Note Packing List")
+    st.markdown("Upload one or more Transfer Delivery Note PDF files in the "
+                "order that cartons should be processed.")
+    _render_pilot_readiness()
+    limits = jobs.transfer_limits()
+
+    # Refresh recovery: a created job is redisplayed from its metadata -
+    # never re-created. Session key is transfer-specific.
+    job_id = st.session_state.get("transfer_job_id")
+    if job_id is None and "transfer_job_id" not in st.session_state:
+        job_id = jobs.newest_transfer_job_id()
+        if job_id:
+            st.session_state["transfer_job_id"] = job_id
+    job = jobs.load_transfer_job(job_id) if job_id else None
+    if job is not None:
+        _render_job_summary(job)
+        return
+
+    up_col, info_col = st.columns([3, 2])
+    with up_col:
+        uploaded = st.file_uploader(
+            "Transfer Delivery Note PDFs", type=["pdf"],
+            accept_multiple_files=True, key=_uploader_key())
+    with info_col:
+        st.caption(f"Limits: {limits['max_files']} files, "
+                   f"{limits['max_file_mb']} MB each, "
+                   f"{limits['max_pages']} pages combined. PDF only.")
+        st.caption("Upload order matters: cartons are processed in the "
+                   "order shown below (1, 2, 3, ...).")
+
+    validated, issues = [], []
+    if uploaded:
+        validated, issues = jobs.validate_transfer_uploads(
+            [(f.name, f.getvalue()) for f in uploaded])
+        st.table(_selection_table(validated))
+        for issue in issues:
+            st.error(f"[{issue.code}] {issue.message}")
+        if st.button("Clear selection"):
+            _reset_selection()
+            st.rerun()
+
+    can_create = bool(uploaded) and not issues and validated and all(
+        f.status == FILE_VALIDATED for f in validated)
+    if st.button("Create Transfer Packing Job", type="primary",
+                 disabled=not can_create):
+        try:
+            new_id = jobs.create_transfer_job(
+                [(f.name, f.getvalue()) for f in uploaded], validated)
+            st.session_state["transfer_job_id"] = new_id
+            _reset_selection()
+            st.rerun()
+        except JobError as exc:
+            st.error(str(exc))
+
+    st.caption("Creating a job stores and validates the uploads; "
+               "extraction, review, product lookup, packing groups, and "
+               "the per-destination workbooks then run from the job page. "
+               "No API is called until you press Run Product Lookup.")

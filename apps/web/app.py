@@ -1,7 +1,7 @@
 """Invoice Extractor Pilot - single-user Streamlit UI (M9).
 
 Run locally:   streamlit run apps/web/app.py     (binds localhost by default)
-Run in Docker: docker compose up invoice-extractor-web   (127.0.0.1:8501)
+Run in Docker: docker compose up invoice-extractor-web   (host port 8501, LAN)
 
 Single user, no login: anyone who can reach the port can upload invoices and
 trigger paid provider calls - keep it on localhost/Tailscale (docs/WEB_UI.md).
@@ -34,6 +34,19 @@ from apps.web.style import COMPACT_CSS
 st.set_page_config(page_title="Invoice Extractor Pilot", page_icon="🧾",
                    layout="wide")
 st.markdown(COMPACT_CSS, unsafe_allow_html=True)
+# UI-only fix (pilot-reported): the workflow radio option text rendered
+# invisible in some browsers. Narrowly scoped to radio widgets; no other
+# control or logic is affected.
+st.markdown("""<style>
+div[data-testid="stRadio"] label,
+div[data-testid="stRadio"] p,
+div[data-testid="stRadio"] span {
+    color: #262730 !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+    font-size: 0.9rem !important;
+}
+</style>""", unsafe_allow_html=True)
 
 
 # --- one-time-per-server startup cleanup --------------------------------------
@@ -43,6 +56,26 @@ def _startup_cleanup() -> dict:
 
 
 _startup_cleanup()
+
+
+# --- workflow selector (feature-flagged; invoice remains the default) ----------
+# With TRANSFER_WORKFLOW_ENABLED unset/false this block renders nothing and
+# the invoice page below behaves exactly as before. The transfer page uses
+# only transfer_-prefixed session keys, so the workflows never share state,
+# and switching the selector never deletes either workflow's jobs.
+from apps.web.transfer import jobs as transfer_jobs  # noqa: E402
+
+WORKFLOW_INVOICE = "Invoice Extraction"
+WORKFLOW_TRANSFER = "Transfer Note Packing List"
+
+if transfer_jobs.workflow_enabled():
+    workflow = st.radio("Workflow", [WORKFLOW_INVOICE, WORKFLOW_TRANSFER],
+                        horizontal=True, key="workflow",
+                        label_visibility="collapsed")
+    if workflow == WORKFLOW_TRANSFER:
+        from apps.web.transfer import page as transfer_page
+        transfer_page.render()
+        st.stop()
 
 
 def _load_cfg():

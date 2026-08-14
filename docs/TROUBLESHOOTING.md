@@ -40,6 +40,7 @@ These appear as compact review reasons; raw provider bodies are never shown.
 | `model_unavailable` (HTTP 404) | Model id not available to your key | Fix the id; confirm on OpenRouter |
 | `timeout` | Request exceeded the timeout | Raise `REQUEST_TIMEOUT_SECONDS`; lower `RENDER_DPI`/chunk size |
 | `... failed on all configured models` | Every model in the ladder failed for that chunk | Inspect the named page range; add/adjust models or limits |
+| `missing required fields: ...` | Providers **answered**; the document never supplied those fields. **Not** a provider failure | For a text-native file the run already retried the pages once through vision automatically; if a field (e.g. currency written only as `$`) is genuinely absent, complete it by hand in NeedsReview |
 
 Under `LLM_GATEWAY=openrouter` the message says **"all configured models"**
 (only the ladder was tried) — not "all providers".
@@ -87,6 +88,6 @@ Under `LLM_GATEWAY=openrouter` the message says **"all configured models"**
 | Start button shows a configuration error | Missing provider key/model in the server's `.env` | Fix `.env` where the web service runs, restart it |
 | Cancel shows "Could not verify the worker process" | Fail-closed identity check: the recorded PID no longer matches a live worker | The job ends on its own; reload — no signal was sent to an unrelated process |
 | Job or downloads disappeared | Retention cleanup (`WEB_JOB_RETENTION_HOURS`, default 24 h) | Download results promptly after a run |
-| Page unreachable from another machine | Host binding is localhost-only by design | Use `tailscale serve 8501`, or (trusted LAN only) change the compose port mapping |
+| Page unreachable from another machine | Firewall, or the mapping was rebound to localhost | The compose default `"8501:8501"` serves the LAN at `http://<host>:8501`; check the host firewall, or use `tailscale serve 8501` for off-LAN access |
 
 More detail: `docs/WEB_UI.md`.

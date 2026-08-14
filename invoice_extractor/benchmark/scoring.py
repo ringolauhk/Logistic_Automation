@@ -45,6 +45,8 @@ _REVIEW_PATTERNS = [
     ("conflict in invoice_number", "invoice_number_conflict"),
     ("conflict in", "header_conflict"),
     ("missing required fields", "missing_required_fields"),
+    # M9.3: an unevidenced currency is a missing required field
+    ("lacks explicit source evidence", "missing_required_fields"),
     ("totals inconclusive", "totals_inconclusive"),
     ("partial extraction", "partial_extraction"),
     ("missing an amount", "suspicious_line"),
@@ -63,7 +65,12 @@ _REVIEW_PATTERNS = [
     ("http 4", "provider_failure"),
     ("http 5", "provider_failure"),
     ("rate_limited", "provider_failure"),
-    ("truncated", "provider_failure"),
+    # "response truncated", never a bare "truncated": logging_setup shortens
+    # long summaries with a "...[truncated]" marker, and that marker must
+    # NEVER be read as a provider truncation (M9.2 - it mislabeled
+    # validation-only failures as provider_failure). Both genuine sources
+    # say "... response truncated before valid JSON completed".
+    ("response truncated", "provider_failure"),
 ]
 
 
