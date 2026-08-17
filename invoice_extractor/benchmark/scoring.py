@@ -45,6 +45,9 @@ _REVIEW_PATTERNS = [
     ("conflict in invoice_number", "invoice_number_conflict"),
     ("conflict in", "header_conflict"),
     ("missing required fields", "missing_required_fields"),
+    # M10: structurally valid response whose line items are semantically
+    # impossible (systematic column shift) - the provider DID respond.
+    ("semantic mismatch", "line_item_semantic_mismatch"),
     # M9.3: an unevidenced currency is a missing required field
     ("lacks explicit source evidence", "missing_required_fields"),
     ("totals inconclusive", "totals_inconclusive"),

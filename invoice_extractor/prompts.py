@@ -22,7 +22,8 @@ JSON_SCHEMA_BLOCK = """{
   "line_items": [
     {
       "line_no": "string or null - ONLY the printed row/sequence number of this line in the invoice's own item table (e.g. '1', '2', '003', '10A'), if and only if the invoice actually prints one. This is NEVER a SKU, PLU, product code, article number, style code, or barcode - those go in item_code instead. Null if the invoice does not print a row number.",
-      "item_code": "string or null - the product/SKU/article/style/item identifier printed for this line (e.g. '31C207', '73SA041601'), if shown. This is NEVER a row/sequence number - that goes in line_no instead. Null if none is printed.",
+      "item_code": "string or null - the product/SKU/article/style/item identifier printed for this line (e.g. '31C207', '73SA041601'), if shown. This is NEVER a row/sequence number (line_no) and NEVER an EAN/UPC barcode (barcode). When the table prints BOTH a product code and a barcode, keep BOTH in their own fields. Null if none is printed.",
+      "barcode": "string or null - the numeric EAN/UPC/GTIN barcode printed for this line (typically 8-14 digits), if shown. This is NEVER the product/SKU code - that goes in item_code. Null if none is printed.",
       "description": "string or null",
       "quantity": "number or null",
       "unit_price": "number or null",
@@ -41,7 +42,8 @@ RULES = """Rules:
 - If the same table header repeats on continuation pages, count the items underneath it only once.
 - If a value appears in a non-English language, extract it as-is (do not translate names or addresses).
 - Not every document has a true invoice number: some commercial/customs invoices only show a PO number or other reference. Extract invoice_number ONLY if the document itself labels a value as the invoice number; otherwise set it to null and populate po_number/reference instead. Never copy a PO number or reference into invoice_number just because invoice_number would otherwise be empty.
-- line_no and item_code are DIFFERENT fields and must never be swapped: line_no is ONLY a printed row/sequence number (e.g. '1', '2'); item_code is ONLY a product/SKU/article/style identifier (e.g. '31C207'). A product code is NEVER a line_no. Never merge either one into description unless it is genuinely written as part of the description text itself."""
+- line_no, item_code and barcode are DIFFERENT fields and must never be swapped: line_no is ONLY a printed row/sequence number (e.g. '1', '2'); item_code is ONLY a product/SKU/article/style identifier (e.g. '31C207'); barcode is ONLY a numeric EAN/UPC/GTIN. A product code is NEVER a line_no. Never merge any of them into description unless it is genuinely written as part of the description text itself.
+- Extracted text can present table columns OUT of their visual order (values of one row scattered across lines). Map every value by its COLUMN HEADER MEANING - PRODUCT CODE vs BARCODE, QUANTITY vs UNIT PRICE vs TOTAL PRICE - never by its position in the text stream. quantity is the count of units, unit_price the price of ONE unit, amount the printed line total (usually quantity x unit_price - amount is NEVER the quantity). Before returning, verify each line: if quantity x unit_price is wildly different from the printed line total, you have mis-mapped that row's columns - re-read it. If a value's column is genuinely uncertain, use null instead of guessing or shifting columns."""
 
 
 def text_extraction_prompt(invoice_text: str, *, chunk_context: str | None = None) -> str:

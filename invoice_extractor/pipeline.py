@@ -125,21 +125,36 @@ class InvoiceResult:
 
 
 # A whole-ladder rejection is "validation only" when EVERY recorded attempt
-# was rejected for this one reason: the provider answered, the JSON parsed,
-# but the extracted invoice lacked required fields. Any transport, auth,
-# rate-limit, malformed-envelope/JSON or budget rejection disqualifies it.
+# was rejected because the provider answered and the JSON parsed but the
+# extracted invoice failed OUR validation: required fields missing, or line
+# items semantically impossible (M10 systematic column shift). Any
+# transport, auth, rate-limit, malformed-envelope/JSON or budget rejection
+# disqualifies it.
 VALIDATION_ONLY_REJECTION = "missing_required_fields"
+SEMANTIC_REJECTION = "line_item_semantic_mismatch"
+VALIDATION_ONLY_REJECTIONS = frozenset(
+    {VALIDATION_ONLY_REJECTION, SEMANTIC_REJECTION})
 
 
 def _validation_only_exhaustion(exc: Exception) -> bool:
-    """True when a model ladder failed ONLY because required fields were
-    missing - decided from the attempts' structured rejection categories
-    (never by string matching on provider text)."""
+    """True when a model ladder failed ONLY on validation (missing required
+    fields and/or semantically invalid line items) - decided from the
+    attempts' structured rejection categories (never by string matching on
+    provider text)."""
     records = getattr(exc, "usage_records", None) or []
     categories = [r.rejection_category for r in records if not r.accepted]
     if not categories or any(c is None for c in categories):
         return False
-    return all(c == VALIDATION_ONLY_REJECTION for c in categories)
+    return all(c in VALIDATION_ONLY_REJECTIONS for c in categories)
+
+
+def _had_semantic_rejection(failures) -> bool:
+    """True when any recorded attempt across the failures was rejected for
+    semantically invalid line items."""
+    return any(r.rejection_category == SEMANTIC_REJECTION
+               for _, exc in failures
+               for r in (getattr(exc, "usage_records", None) or [])
+               if not r.accepted)
 
 
 def _missing_required_from(exc: Exception) -> list[str]:
@@ -586,11 +601,15 @@ def process_file(
                 result.vision_fallback_used = True   # set BEFORE the attempt
                 result.vision_fallback_pages = fallback_nums
                 result.vision_fallback_missing = missing
+                # "cause" covers both validation-only shapes: fields the
+                # ladder never supplied, and/or M10 semantic rejection.
+                cause = ", ".join(missing) or (
+                    "semantically invalid line items"
+                    if _had_semantic_rejection(route_failures) else "unnamed")
                 logger.info(
-                    "%s: text ladder returned answers but lacked required "
-                    "field(s) %s; ONE automatic vision fallback on page(s) "
-                    "%s", path.name, ", ".join(missing) or "unnamed",
-                    page_range)
+                    "%s: text ladder returned answers rejected for %s; ONE "
+                    "automatic vision fallback on page(s) %s",
+                    path.name, cause, page_range)
                 emit(on_event, ProgressEvent(
                     event=CHUNK_STARTED, source_file=path.name,
                     route="vision", page_range=page_range,
@@ -743,12 +762,23 @@ def process_file(
             fallback_note = (", and one automatic vision fallback could not "
                              "supply them either"
                              if result.vision_fallback_used else "")
-            result.review_reason = (
-                "missing required fields: "
-                + (", ".join(missing) or "unnamed")
-                + " (every configured model responded but none supplied "
-                + "them" + fallback_note + ")"
-            )
+            if _had_semantic_rejection(route_failures) and not missing:
+                # M10: every answer parsed but mapped the table columns
+                # wrongly. Wording carries the stable semantic-category
+                # marker, never "failed on ..." (not provider_failure).
+                result.review_reason = (
+                    "line-item semantic mismatch: every configured model "
+                    "responded but each mapped the item table columns "
+                    "inconsistently with the document totals"
+                    + fallback_note
+                )
+            else:
+                result.review_reason = (
+                    "missing required fields: "
+                    + (", ".join(missing) or "unnamed")
+                    + " (every configured model responded but none supplied "
+                    + "them" + fallback_note + ")"
+                )
         else:
             result.review_reason = "; ".join(
                 f"{label} failed on {failed_on}: {exc_summary(exc)}"

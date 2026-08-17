@@ -30,7 +30,12 @@ HEADER_FIELDS = [
 
 NUMERIC_HEADER_FIELDS = ["subtotal", "tax_amount", "total_amount"]
 
-LINE_ITEM_FIELDS = ["line_no", "item_code", "description", "quantity", "unit_price", "amount"]
+# barcode (M10): optional - many invoices print no barcode at all, and it is
+# never required. Added because tables that show BOTH a product code and an
+# EAN/UPC barcode were losing one of them (a live model put the barcode in
+# item_code and dropped the product code entirely).
+LINE_ITEM_FIELDS = ["line_no", "item_code", "barcode", "description",
+                    "quantity", "unit_price", "amount"]
 NUMERIC_LINE_ITEM_FIELDS = ["quantity", "unit_price", "amount"]
 
 # Fields that must be non-null or the LLM call is treated as a hard failure
@@ -71,6 +76,10 @@ class LineItem(BaseModel):
     # this dedicated field and rewording line_no's description).
     line_no: str | None = None
     item_code: str | None = None
+    # barcode: the numeric EAN/UPC/GTIN printed for the line, when the table
+    # shows one - NEVER a substitute for item_code (a table listing both must
+    # keep both). Optional: absent barcodes are simply None.
+    barcode: str | None = None
     description: str | None = None
     quantity: Decimal | None = None
     unit_price: Decimal | None = None
@@ -235,6 +244,118 @@ def check_required(inv: Invoice) -> None:
     missing = missing_required_fields(inv)
     if missing:
         raise ExtractionError(f"missing required fields: {', '.join(missing)}")
+
+
+# --- line-item semantic validation (M10) --------------------------------------
+# A model response can be structurally perfect - every field present, every
+# number a valid Decimal - and still be semantically impossible because the
+# model mapped table COLUMNS wrongly (the confirmed live case: a text layer
+# that scrambles column order made a model put each row's TOTAL PRICE into
+# quantity, then return amount = that total x unit price, inflating the line
+# sum ~78x past the printed invoice total). These checks reject such an
+# attempt so the existing model ladder escalates, instead of accepting
+# corrupted rows and merely flagging review.
+#
+# Design constraints (deliberate):
+#  - Decision thresholds are RELATIONSHIPS to the document's own totals,
+#    never absolute magnitudes - legitimate wholesale invoices have huge
+#    quantities, so "quantity too big" alone is never evidence.
+#  - Rejection requires a SYSTEMATIC pattern (>= 2 independent rows).  A
+#    single inconsistent row can be a legitimate discount, allowance, or
+#    bundle the schema cannot represent per-line, and is left to the
+#    existing aggregate totals-reconciliation review (validate_invoice).
+#  - Rows with non-positive quantity or unit price (credits, free-of-charge
+#    lines, returns) carry no shift evidence and are skipped.
+#  - Tolerances mirror the totals-reconciliation defaults, so rounding
+#    differences that pass there pass here too.
+
+LINE_SEMANTIC_ABS_TOLERANCE = Decimal("0.02")
+LINE_SEMANTIC_REL_TOLERANCE = Decimal("0.005")
+# The line sum must exceed the stated invoice total by MORE than this factor
+# before it counts as "grossly incompatible": discounts/deposits legitimately
+# make a line sum bigger than the total, but not several-fold bigger.
+LINE_SEMANTIC_GROSS_FACTOR = Decimal("3")
+
+
+class LineItemSemanticError(ExtractionError):
+    """A structurally valid extraction whose line items are semantically
+    impossible (systematic column misassignment). Distinct from a missing-
+    field failure so the attempt is recorded under its own rejection
+    category - the provider DID respond, so this is never provider_failure.
+    """
+
+
+def _semantic_tolerance(value: Decimal) -> Decimal:
+    return max(LINE_SEMANTIC_ABS_TOLERANCE,
+               LINE_SEMANTIC_REL_TOLERANCE * abs(value))
+
+
+def line_item_semantic_finding(inv: Invoice) -> str | None:
+    """Return a concise reason when the line items show a SYSTEMATIC
+    column-mapping failure, else None. Deterministic, Decimal-safe, offline.
+
+    Two independent shift signatures are recognized:
+
+    1. quantity carries the printed line total, amount recomputed: each
+       affected row's quantity x unit_price then EXCEEDS the whole stated
+       invoice total, and the line sum overshoots it several-fold. Needs
+       >= 2 such rows AND the gross-sum overshoot together.
+    2. quantity carries the printed line total, amount copied unchanged:
+       quantity literally equals the row's amount while quantity x
+       unit_price disagrees with that amount beyond tolerance. Needs >= 2
+       such rows (no stated total required).
+    """
+    stated = next((v for v in (inv.total_amount, inv.subtotal)
+                   if v is not None and v > 0), None)
+    exceeds_total: list[int] = []
+    quantity_is_amount: list[int] = []
+    line_sum = Decimal("0")
+    for row_no, item in enumerate(inv.line_items, start=1):
+        qty, unit, amount = item.quantity, item.unit_price, item.amount
+        computed = qty * unit if (qty is not None and unit is not None) else None
+        if amount is not None:
+            line_sum += amount
+        elif computed is not None:
+            line_sum += computed
+        if qty is None or unit is None or qty <= 0 or unit <= 0:
+            continue  # credits / FOC / partial rows: no shift evidence
+        if stated is not None and computed > stated + _semantic_tolerance(stated):
+            exceeds_total.append(row_no)
+        if (amount is not None and qty == amount
+                and abs(computed - amount) > _semantic_tolerance(amount)):
+            quantity_is_amount.append(row_no)
+
+    def _rows(nums: list[int]) -> str:
+        return ", ".join(str(n) for n in nums[:12])
+
+    if len(quantity_is_amount) >= 2:
+        return (
+            "line-item semantic mismatch: quantity equals the line amount on "
+            f"rows {_rows(quantity_is_amount)} while quantity x unit price "
+            "disagrees with it - the quantity column appears to hold the "
+            "printed line totals"
+        )
+    if (stated is not None and len(exceeds_total) >= 2
+            and line_sum > stated * LINE_SEMANTIC_GROSS_FACTOR):
+        return (
+            "line-item semantic mismatch: quantity x unit price exceeds the "
+            f"stated invoice total ({stated}) on rows {_rows(exceeds_total)} "
+            f"and the line sum ({line_sum}) is incompatible with it - the "
+            "quantity column appears to hold the printed line totals"
+        )
+    return None
+
+
+def check_line_item_semantics(inv: Invoice) -> None:
+    """Raise LineItemSemanticError on a systematic column-mapping failure.
+
+    Called on each model attempt's output right after check_required: a
+    failure rejects THAT attempt and lets the existing ladder escalate to
+    the next configured model. Source values are never rewritten to make
+    the arithmetic pass."""
+    finding = line_item_semantic_finding(inv)
+    if finding:
+        raise LineItemSemanticError(finding)
 
 
 # --- currency evidence (M9.3) -------------------------------------------------
