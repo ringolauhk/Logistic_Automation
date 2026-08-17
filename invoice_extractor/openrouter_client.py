@@ -61,6 +61,8 @@ from invoice_extractor.retry import call_with_retry
 from invoice_extractor.schema import (
     ExtractionError,
     Invoice,
+    LineItemSemanticError,
+    check_line_item_semantics,
     check_required,
     normalize_invoice,
     unknown_keys,
@@ -397,6 +399,15 @@ def _finalize(
         except ExtractionError as exc:
             save_debug_artifact(cfg, label, model=model, reason=str(exc), raw_text=raw_text)
             raise
+    # M10: reject structurally valid but semantically impossible line items
+    # (systematic column shift) so the ladder escalates instead of accepting
+    # corrupted rows. Runs for chunked calls too - both signatures degrade
+    # safely when this chunk lacks the totals (see schema docstring).
+    try:
+        check_line_item_semantics(inv)
+    except LineItemSemanticError as exc:
+        save_debug_artifact(cfg, label, model=model, reason=str(exc), raw_text=raw_text)
+        raise
     return inv
 
 
@@ -630,6 +641,12 @@ def _attempt_model(
     try:
         inv = _finalize(cfg, data, result.text, label, model,
                         require_hard_fields=require_hard_fields)
+    except LineItemSemanticError as exc:
+        # The provider answered and parsed - this is a validation rejection,
+        # NEVER provider_failure. Recorded under its own category so review
+        # classification and the bounded vision fallback stay accurate.
+        outcome_record(result, accepted=False, category="line_item_semantic_mismatch")
+        return _AttemptOutcome(None, None, usage_records, f"{model}: {exc_summary(exc)}")
     except ExtractionError as exc:
         outcome_record(result, accepted=False, category="missing_required_fields")
         return _AttemptOutcome(None, None, usage_records, f"{model}: {exc_summary(exc)}")

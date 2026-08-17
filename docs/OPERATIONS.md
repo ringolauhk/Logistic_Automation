@@ -163,6 +163,36 @@ Failure labels distinguish the two situations exactly: `provider_failure`
 means no usable provider response was received; `missing_required_fields`
 means providers answered but the document never supplied the fields.
 
+### Line items must be semantically possible
+
+A model answer can be structurally perfect and still wrong: PDF text layers
+sometimes scramble the item table's column order, and a model that maps by
+stream position can return each row's TOTAL PRICE as the quantity (with
+amount recomputed as that total x unit price). Every attempt is therefore
+checked before acceptance:
+
+- **Rejected as `line_item_semantic_mismatch`** when a SYSTEMATIC shift
+  pattern appears - two or more rows whose quantity x unit price exceeds
+  the stated invoice total while the line sum overshoots it several-fold,
+  or two or more rows whose quantity literally equals the printed line
+  amount while the arithmetic disagrees. Thresholds are relationships to
+  the document's own totals - never absolute magnitudes, so legitimate
+  wholesale quantities always pass.
+- **Never rejected** for a single inconsistent row (could be a discount or
+  bundle - left to the aggregate totals reconciliation), for credit /
+  free-of-charge / negative lines, or for rounding within the shared
+  tolerance.
+- A rejected attempt escalates through the existing model ladder; if every
+  text model fails validation the bounded one-attempt vision fallback may
+  run under its usual conditions. `MAX_MODEL_ATTEMPTS_PER_FILE` is always
+  honored, and the rejection is never `provider_failure` - the provider
+  responded.
+- Source values are never rewritten to make the arithmetic pass.
+
+Line items additionally carry an optional `barcode` field: tables that
+print both a PRODUCT CODE and an EAN/UPC barcode keep both (`item_code`
+and `barcode` respectively). Invoices without barcodes are unaffected.
+
 ### Currency must be evidenced by the source
 
 A currency is kept only when the document itself shows it:
