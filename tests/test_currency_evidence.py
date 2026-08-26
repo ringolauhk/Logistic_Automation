@@ -108,7 +108,7 @@ class TestPipelineEnforcement:
         assert result.needs_review is True
         assert "currency lacks explicit source evidence" in result.review_reason
         cats = safe_review_categories(result)
-        assert cats == ("missing_required_fields",)
+        assert "missing_document_metadata" in cats
         assert "provider_failure" not in cats
 
     def test_us_address_with_bare_dollar_also_rejected(self, logger,
@@ -144,29 +144,33 @@ class TestPipelineEnforcement:
         assert result.rejected_currency is None
         assert result.needs_review is False
 
-    def test_logo_recovery_plus_ambiguous_currency_ends_in_review(
+    def test_logo_document_with_ambiguous_currency_ends_in_review(
             self, logger, pdf_factory, monkeypatch):
-        """End-to-end shape of the live Sales Order: the vision fallback
-        recovers the seller from the logo, the model's inferred currency is
-        rejected, and the document lands in review - with exactly one
-        vision attempt and no further calls."""
+        """End-to-end shape of the live Sales Order under the M11 product-
+        first policy: the text answer carries usable product rows, so it is
+        ACCEPTED as-is - no vision call is bought to chase a seller name -
+        the inferred currency is still rejected, and the row lands in review
+        with both gaps reported."""
         pdf = _pdf(pdf_factory, HK_BARE_DOLLAR_BODY, "logo-doc.pdf")
         rec = Recorder([
-            envelope(invoice_json(seller_name=None, currency=None)),
-            envelope(invoice_json(seller_name="AUTEUR", currency="HKD")),
+            envelope(invoice_json(seller_name=None, currency="HKD")),
         ])
         monkeypatch.setattr(openrouter_client, "_chat_completion", rec)
 
         result = process_file(pdf, fallback_cfg(), logger)
 
         assert len(text_calls(rec)) == 1
-        assert len(vision_calls(rec)) == 1           # exactly one fallback
-        assert result.vision_fallback_used is True
-        assert result.invoice.seller_name == "AUTEUR"
-        assert result.invoice.currency is None
+        assert vision_calls(rec) == []               # no paid metadata chase
+        assert result.vision_fallback_used is False
+        assert result.invoice.seller_name is None    # blank, not invented
+        assert result.invoice.currency is None       # inference rejected
         assert result.rejected_currency == "HKD"
+        assert result.invoice.line_items              # product rows kept
+        assert result.error is False                  # extracted, not failed
         assert result.needs_review is True
-        assert safe_review_categories(result) == ("missing_required_fields",)
+        cats = safe_review_categories(result)
+        assert "missing_document_metadata" in cats
+        assert "provider_failure" not in cats
 
     def test_rejection_never_triggers_another_attempt(self, logger,
                                                       pdf_factory,

@@ -248,7 +248,7 @@ class TestSchemaValidationFailures:
 
         assert result.error is True
         assert result.needs_review is True
-        assert "missing required fields" in result.review_reason
+        assert "no usable product rows" in result.review_reason
 
     def test_i_single_missing_hard_required_field_is_named(
         self, logger, text_pdf, monkeypatch
@@ -264,7 +264,7 @@ class TestSchemaValidationFailures:
         result = process_file(text_pdf, cfg, logger)
 
         assert result.error is True
-        assert "missing required fields: currency" in result.review_reason
+        assert "no usable product rows" in result.review_reason
 
 
 # --- J/K: truncation and empty content ----------------------------------------

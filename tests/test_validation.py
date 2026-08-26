@@ -73,7 +73,7 @@ class TestStructuralValidation:
         # TestMissingIdentifier below) - only currency is a hard-required
         # field missing here.
         reason = validate(currency=None)
-        assert "missing required fields" in reason
+        assert "missing document metadata" in reason
         assert "currency" in reason
 
     def test_no_line_items_flagged(self):

@@ -311,7 +311,7 @@ class TestFinalHardRequiredGate:
         # ...but the aggregated invoice still fails the unweakened final gate.
         assert result.needs_review is True
         assert result.error is False
-        assert "missing required fields" in result.review_reason
+        assert "missing document metadata" in result.review_reason
         for fld in ("invoice_date", "currency", "seller_name", "total_amount"):
             assert fld in result.review_reason
 

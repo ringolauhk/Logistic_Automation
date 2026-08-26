@@ -62,6 +62,7 @@ from invoice_extractor.schema import (
     ExtractionError,
     Invoice,
     LineItemSemanticError,
+    check_extractable,
     check_line_item_semantics,
     check_required,
     normalize_invoice,
@@ -394,8 +395,13 @@ def _finalize(
                      label, len(extras), ", ".join(extras[:8]))
     inv = normalize_invoice(data)
     if require_hard_fields:
+        # M11 product-first: the hard gate is "did we get usable product
+        # rows?", not "did we get invoice headers?". Missing seller/date/
+        # currency/total are reported as warnings downstream instead of
+        # burning another paid model attempt on metadata the document may
+        # simply not contain.
         try:
-            check_required(inv)
+            check_extractable(inv)
         except ExtractionError as exc:
             save_debug_artifact(cfg, label, model=model, reason=str(exc), raw_text=raw_text)
             raise

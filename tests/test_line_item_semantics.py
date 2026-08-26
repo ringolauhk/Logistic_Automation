@@ -371,6 +371,8 @@ class TestCompatibility:
             "invoice_id", "line_number", "source_file",
             "line_no", "item_code", "barcode", "description",
             "quantity", "unit_price", "amount",
+            # M11 appends warning columns; earlier ones keep their order.
+            "missing_fields", "validation_warnings",
         ]
 
     def test_barcode_optional_and_survives_normalization(self):
