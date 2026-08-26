@@ -35,9 +35,10 @@ JSON_SCHEMA_BLOCK = """{
 RULES = """Rules:
 - Return ONLY a single JSON object matching the schema exactly. No markdown fences, no commentary, no extra keys.
 - Use null for anything not present. Never invent values (including currency - only report a currency you can actually see or unambiguously infer from a symbol).
+- This document may be an invoice, commercial invoice, packing list, delivery note, free-goods support list or similar product document. The LINE ITEMS are always the priority: extract every product row even when the document has no seller name, no invoice number, no invoice date, no currency and no totals. Leave every absent header field null - do NOT guess one, and do NOT copy a delivery/shipment date into invoice_date unless the document itself labels that date as the invoice or document date.
 - Numbers must be plain JSON numbers: no currency symbols, no thousands separators. Preserve zero as 0, not null.
 - Convert dates to YYYY-MM-DD. Interpret ambiguous formats using the invoice's country/locale cues.
-- The seller is the party issuing the invoice; the buyer is the party being billed.
+- The seller is the party issuing the invoice; the buyer is the party being billed. If the document never names an issuing/supplying party, leave seller_name null - NEVER fall back to the sold-to / bill-to / ship-to party, which is the buyer. A party labelled "SOLD-TO", "BILL TO", "SHIP TO" or "CONSIGNEE" is the buyer, never the seller.
 - Include every line item, in the order they appear in the document. Do NOT repeat table header rows as line items, and exclude subtotal/discount/shipping/tax/total rows from line_items.
 - If the same table header repeats on continuation pages, count the items underneath it only once.
 - If a value appears in a non-English language, extract it as-is (do not translate names or addresses).

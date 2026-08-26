@@ -8,6 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pandas as pd
+from openpyxl.styles import PatternFill
 
 from invoice_extractor.pdf_utils import format_page_ranges
 from invoice_extractor.pipeline import InvoiceResult
@@ -29,11 +30,17 @@ PROVENANCE_COLUMNS = [
     "vision_chunk_count",
 ]
 
+# M11: document_type/missing_fields/validation_warnings are APPENDED after the
+# existing columns so every pre-M11 column keeps its position and meaning.
 INVOICE_COLUMNS = (
-    ["invoice_id"] + HEADER_FIELDS + PROVENANCE_COLUMNS + ["needs_review", "review_reason"]
+    ["invoice_id"] + HEADER_FIELDS + PROVENANCE_COLUMNS
+    + ["needs_review", "review_reason", "document_type", "missing_fields",
+       "validation_warnings"]
 )
 
-LINE_ITEM_COLUMNS = ["invoice_id", "line_number", "source_file"] + LINE_ITEM_FIELDS
+LINE_ITEM_COLUMNS = (["invoice_id", "line_number", "source_file"]
+                     + LINE_ITEM_FIELDS
+                     + ["missing_fields", "validation_warnings"])
 
 # A focused, reviewer-facing sheet - deliberately NOT a slice of INVOICE_COLUMNS.
 # line_numbers/line_descriptions are None unless suspicious_line_item_rows()
@@ -54,6 +61,53 @@ def _cell(value):
     return value
 
 
+# Restrained warning fill: pale yellow, readable in print and on screen.
+_MISSING_FILL = PatternFill("solid", start_color="FFFDF3C7",
+                            end_color="FFFDF3C7")
+
+
+def _highlight_missing(ws, df, results, *, level: str) -> None:
+    """Shade blank cells whose value the source document never printed.
+
+    Only cells named by the per-document/per-row missing-field lists are
+    shaded - a cell that is blank for any other reason is left alone, so the
+    fill always means exactly one thing to a reviewer."""
+    columns = {name: idx for idx, name in enumerate(df.columns, start=1)}
+    if level == "document":
+        for row_idx, res in enumerate(results, start=2):   # row 1 = header
+            for field in getattr(res, "document_missing", []) or []:
+                col = columns.get(field)
+                if col:
+                    ws.cell(row=row_idx, column=col).fill = _MISSING_FILL
+        return
+    excel_row = 1                                          # row 1 = header
+    for res in results:
+        line_missing = getattr(res, "line_missing", {}) or {}
+        for line_no in range(1, len(res.invoice.line_items) + 1):
+            excel_row += 1
+            for field in line_missing.get(line_no, []):
+                col = columns.get(field)
+                if col:
+                    ws.cell(row=excel_row, column=col).fill = _MISSING_FILL
+
+
+def _document_warnings(res) -> str | None:
+    """Reviewer-facing warning summary for one document (M11). Warnings are
+    NOT failures: the product rows are present and exported."""
+    parts = []
+    missing = getattr(res, "document_missing", []) or []
+    if missing:
+        parts.append("document metadata not printed: " + ", ".join(missing))
+    line_missing = getattr(res, "line_missing", {}) or {}
+    if line_missing:
+        rows = ", ".join(str(r) for r in sorted(line_missing)[:12])
+        parts.append(f"line-item fields missing on row(s) {rows}")
+    if getattr(res, "free_of_charge", False):
+        parts.append("declared free-of-charge: printed values may be "
+                     "declared/reference amounts, payable amount unclear")
+    return " | ".join(parts) or None
+
+
 def export_workbook(results: list[InvoiceResult], output_path: str | Path) -> Path:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -61,6 +115,7 @@ def export_workbook(results: list[InvoiceResult], output_path: str | Path) -> Pa
     invoice_rows = []
     line_item_rows = []
     needs_review_rows = []
+
     for i, res in enumerate(results, start=1):
         invoice_id = f"INV-{i:04d}"
         row = {"invoice_id": invoice_id}
@@ -79,12 +134,22 @@ def export_workbook(results: list[InvoiceResult], output_path: str | Path) -> Pa
             vision_chunk_count=res.vision_chunk_count,
             needs_review=res.needs_review,
             review_reason=res.review_reason,
+            document_type=getattr(res, "document_type", None),
+            missing_fields=", ".join(getattr(res, "document_missing", []))
+            or None,
+            validation_warnings=_document_warnings(res),
         )
         invoice_rows.append(row)
 
+        line_missing = getattr(res, "line_missing", {}) or {}
         for j, item in enumerate(res.invoice.line_items, start=1):
             li = {"invoice_id": invoice_id, "line_number": j, "source_file": res.source_file}
             li.update({f: _cell(getattr(item, f)) for f in LINE_ITEM_FIELDS})
+            missing = line_missing.get(j) or []
+            li["missing_fields"] = ", ".join(missing) or None
+            li["validation_warnings"] = (
+                "not printed on the document: " + ", ".join(missing)
+                if missing else None)
             line_item_rows.append(li)
 
         if res.needs_review:
@@ -110,6 +175,15 @@ def export_workbook(results: list[InvoiceResult], output_path: str | Path) -> Pa
         invoices_df.to_excel(writer, sheet_name="Invoices", index=False)
         line_items_df.to_excel(writer, sheet_name="LineItems", index=False)
         needs_review_df.to_excel(writer, sheet_name="NeedsReview", index=False)
+
+        # M11: highlight cells the DOCUMENT did not supply. Cells are left
+        # genuinely blank (never "n/a" text) and typed values elsewhere are
+        # untouched, so numeric columns stay numeric and sortable - only the
+        # fill changes.
+        _highlight_missing(writer.sheets["Invoices"], invoices_df,
+                           results, level="document")
+        _highlight_missing(writer.sheets["LineItems"], line_items_df,
+                           results, level="line")
 
         # Reasonable column widths for quick triage; tolerate null/NaN values.
         for sheet_name, df in (

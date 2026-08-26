@@ -44,6 +44,12 @@ _REVIEW_PATTERNS = [
     ("possible multiple invoices", "invoice_number_conflict"),
     ("conflict in invoice_number", "invoice_number_conflict"),
     ("conflict in", "header_conflict"),
+    # M11: absent document metadata is a warning, not a failure - it gets
+    # its own precise category and must never read as provider_failure.
+    ("missing document metadata", "missing_document_metadata"),
+    ("missing line-item fields", "missing_line_item_fields"),
+    ("free-of-charge document", "free_of_charge_value_ambiguity"),
+    ("no usable product rows", "no_usable_product_rows"),
     ("missing required fields", "missing_required_fields"),
     # M10: structurally valid response whose line items are semantically
     # impossible (systematic column shift) - the provider DID respond.

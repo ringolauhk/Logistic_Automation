@@ -64,7 +64,13 @@ from invoice_extractor.schema import (
     ExtractionError,
     Invoice,
     currency_evidence_supports,
+    declares_free_of_charge,
+    detect_document_type,
+    document_missing_fields,
     empty_invoice,
+    review_worthy_missing_fields,
+    line_item_missing_fields,
+    usable_line_items,
     validate_invoice,
 )
 from invoice_extractor.usage import FileBudget, RunBudget, UsageRecord
@@ -122,6 +128,15 @@ class InvoiceResult:
     # M9.3: a model-returned currency the SOURCE did not evidence (kept for
     # provenance; the invoice field itself is cleared and flagged).
     rejected_currency: str | None = None
+    # M11 product-first extraction. document_type is set only from explicit
+    # wording in the source (None when the document does not say). The
+    # missing-field lists drive the workbook's warning columns/highlighting;
+    # an entry here means "the document did not supply this", never "the
+    # extraction failed".
+    document_type: str | None = None
+    document_missing: list[str] = field(default_factory=list)
+    line_missing: dict = field(default_factory=dict)   # 1-based row -> fields
+    free_of_charge: bool = False
 
 
 # A whole-ladder rejection is "validation only" when EVERY recorded attempt
@@ -130,6 +145,10 @@ class InvoiceResult:
 # items semantically impossible (M10 systematic column shift). Any
 # transport, auth, rate-limit, malformed-envelope/JSON or budget rejection
 # disqualifies it.
+# M11: this category now means "the answer carried no usable product rows"
+# (check_extractable). Missing document metadata no longer rejects an
+# attempt, so it can never reach here and never triggers escalation or the
+# vision fallback - the wire name is kept for taxonomy/UI compatibility.
 VALIDATION_ONLY_REJECTION = "missing_required_fields"
 SEMANTIC_REJECTION = "line_item_semantic_mismatch"
 VALIDATION_ONLY_REJECTIONS = frozenset(
@@ -603,9 +622,10 @@ def process_file(
                 result.vision_fallback_missing = missing
                 # "cause" covers both validation-only shapes: fields the
                 # ladder never supplied, and/or M10 semantic rejection.
-                cause = ", ".join(missing) or (
-                    "semantically invalid line items"
-                    if _had_semantic_rejection(route_failures) else "unnamed")
+                cause = (", ".join(missing)
+                         or ("semantically invalid line items"
+                             if _had_semantic_rejection(route_failures)
+                             else "no usable product rows"))
                 logger.info(
                     "%s: text ladder returned answers rejected for %s; ONE "
                     "automatic vision fallback on page(s) %s",
@@ -772,12 +792,19 @@ def process_file(
                     "inconsistently with the document totals"
                     + fallback_note
                 )
-            else:
+            elif missing:
                 result.review_reason = (
                     "missing required fields: "
-                    + (", ".join(missing) or "unnamed")
+                    + ", ".join(missing)
                     + " (every configured model responded but none supplied "
                     + "them" + fallback_note + ")"
+                )
+            else:
+                # M11: nothing usable to extract - the one hard failure.
+                result.review_reason = (
+                    "no usable product rows: every configured model "
+                    "responded but none returned a product line carrying an "
+                    "item code, barcode or description" + fallback_note
                 )
         else:
             result.review_reason = "; ".join(
@@ -875,6 +902,58 @@ def process_file(
     )
     if validation_reason:
         reasons.append(validation_reason)
+
+    # M11 product-first review reporting. The document already passed the one
+    # hard gate (usable product rows) to get here, so everything below is a
+    # WARNING: it routes the row to review and is surfaced per-field in the
+    # workbook, but never turns an extraction into a failure and never costs
+    # another provider call.
+    result.document_type = detect_document_type(evidence_text)
+    result.free_of_charge = declares_free_of_charge(evidence_text)
+
+    # M11 hard gate, enforced ONCE on the aggregated document. Per-attempt
+    # checking cannot own this: a chunked call legitimately covers header-
+    # only pages and carries no rows at all (require_hard_fields=False), and
+    # the same relaxation applies to the M9.2 vision fallback. So the final
+    # authority on "did we actually extract any product?" lives here, the
+    # same way Stage 6 owns every other whole-document rule.
+    # Distinguish two very different situations:
+    #  - rows came back but NONE identify a product  -> corrupt extraction,
+    #    hard failure (nothing trustworthy to export).
+    #  - no rows at all                              -> keep the long-standing
+    #    "no line items extracted" review clause from validate_invoice: the
+    #    header data is still worth exporting, and header-only aggregates are
+    #    a legitimate shape (chunked documents, conflict detection).
+    if result.invoice.line_items and not usable_line_items(result.invoice):
+        result.needs_review = True
+        result.error = True
+        result.review_reason = (
+            "no usable product rows: the extraction produced no product line "
+            "carrying an item code, barcode or description")
+        result.elapsed_seconds = time.perf_counter() - started
+        logger.error("%s: extraction produced no usable product rows; "
+                     "emitting review row", path.name)
+        return result
+    result.document_missing = document_missing_fields(result.invoice)
+    result.line_missing = {
+        row: missing
+        for row, item in enumerate(result.invoice.line_items, start=1)
+        if (missing := line_item_missing_fields(item))
+    }
+    # NOTE: core missing metadata is reported once, by validate_invoice
+    # below - M11 deliberately does not repeat it here. Per-row gaps are
+    # reporting-only: they populate the workbook's missing_fields column and
+    # highlighting rather than adding review clauses, so a complete invoice
+    # with one blank cell is never dragged into review.
+    if result.free_of_charge and result.invoice.total_amount is not None:
+        # Printed prices on a free-of-charge document are a DECLARED value,
+        # not evidence of a payable amount. Both are preserved as printed -
+        # neither zeroed nor promoted to payable - and the ambiguity is
+        # handed to the reviewer.
+        reasons.append(
+            "free-of-charge document with printed values (the printed total "
+            "may be a declared/reference value, payable amount unclear)")
+
     if reasons:
         result.needs_review = True
         result.review_reason = "; ".join(reasons)

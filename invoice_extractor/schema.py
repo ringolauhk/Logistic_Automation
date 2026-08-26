@@ -38,18 +38,78 @@ LINE_ITEM_FIELDS = ["line_no", "item_code", "barcode", "description",
                     "quantity", "unit_price", "amount"]
 NUMERIC_LINE_ITEM_FIELDS = ["quantity", "unit_price", "amount"]
 
-# Fields that must be non-null or the LLM call is treated as a hard failure
-# (triggers provider fallback / the invoice-level failed/needs_review outcome
-# - see check_required below). invoice_number is deliberately NOT here: many
-# real commercial/customs invoices have no true invoice number at all, only a
-# PO number or other reference (see missing_identifier below for the softer,
-# review-only check that covers that case instead).
+# Document metadata we EXPECT on a well-formed invoice. Since M11 these are
+# SOFT: absence is reported as a review warning, never an extraction failure.
+# The scanner handles product documents generally - packing lists, delivery
+# notes, free-goods support lists, commercial invoices - and many carry no
+# seller name, invoice number or invoice date at all while still carrying the
+# product rows that are the actual payload. The one HARD requirement is
+# usable product rows (see check_extractable). invoice_number stays out of
+# this list for the older reason: plenty of commercial/customs invoices only
+# ever show a PO or reference number.
 REQUIRED_FIELDS = [
     "invoice_date",
     "currency",
     "seller_name",
     "total_amount",
 ]
+
+# Absence of these SIGNALS a review: they are the fields that used to be hard
+# requirements, so a document lacking one genuinely needs a human glance.
+# Deliberately NOT the full soft list below: subtotal/tax/payment terms/buyer
+# are routinely absent from perfectly good invoices, and routing every such
+# document to review would drown the real warnings.
+REVIEW_TRIGGER_FIELDS = list(REQUIRED_FIELDS)
+
+# Every document-level field whose absence is reported in the workbook's
+# missing_fields column and highlighted. Reporting only - see above.
+SOFT_DOCUMENT_FIELDS = [
+    "invoice_number",
+    "invoice_date",
+    "seller_name",
+    "buyer_name",
+    "currency",
+    "subtotal",
+    "tax_amount",
+    "total_amount",
+    "payment_terms",
+]
+
+# Line-item fields that may be missing on a still-usable row.
+SOFT_LINE_ITEM_FIELDS = ["quantity", "unit_price", "amount", "barcode",
+                         "item_code", "description"]
+
+# A row is usable when it identifies a product at all - by code, by barcode,
+# or by description. Everything else about the row may be missing.
+LINE_ITEM_IDENTITY_FIELDS = ["item_code", "barcode", "description"]
+
+# Document kinds recognizable from explicit wording. Never required, and
+# never used to force invoice semantics onto a non-invoice.
+DOC_TYPE_INVOICE = "invoice"
+DOC_TYPE_COMMERCIAL_INVOICE = "commercial_invoice"
+DOC_TYPE_PACKING_LIST = "packing_list"
+DOC_TYPE_DELIVERY_NOTE = "delivery_note"
+DOC_TYPE_FREE_GOODS = "free_goods_support_list"
+DOC_TYPE_UNKNOWN = "unknown_product_document"
+
+# Explicit title/wording evidence -> document type. Ordered: the first match
+# wins, most specific first. Matching is case-insensitive on the document's
+# own text; no inference from layout or vendor.
+_DOC_TYPE_EVIDENCE = [
+    (DOC_TYPE_FREE_GOODS, ("free goods support", "free-goods support",
+                           "free goods item list")),
+    (DOC_TYPE_COMMERCIAL_INVOICE, ("commercial invoice",)),
+    (DOC_TYPE_PACKING_LIST, ("packing list", "packing note")),
+    (DOC_TYPE_DELIVERY_NOTE, ("delivery note", "delivery order",
+                              "goods delivery note")),
+    (DOC_TYPE_INVOICE, ("tax invoice", "invoice")),
+]
+
+# Wording that explicitly declares the goods carry no payable value.
+_FREE_OF_CHARGE_EVIDENCE = (
+    "free-of-charge", "free of charge", "no commercial value",
+    "not for sale", "no charge", "nil value",
+)
 
 
 class ExtractionError(Exception):
@@ -238,12 +298,102 @@ def missing_required_fields(inv: Invoice) -> list[str]:
 def check_required(inv: Invoice) -> None:
     """Raise ExtractionError when required fields are missing.
 
-    Called on each provider's output: a failure here is what triggers the
-    fallback provider.
+    Retained for callers that genuinely want strict INVOICE semantics (the
+    direct-gateway M2 path). The OpenRouter ladder uses check_extractable
+    instead since M11 - see its docstring.
     """
     missing = missing_required_fields(inv)
     if missing:
         raise ExtractionError(f"missing required fields: {', '.join(missing)}")
+
+
+# --- product-first extraction (M11) -------------------------------------------
+# The scanner is not limited to payable invoices: users upload packing lists,
+# delivery notes, free-goods support lists and other product documents whose
+# payload is the LINE ITEMS. Document metadata (seller, invoice date/number,
+# currency, totals) is frequently absent by nature, and failing the whole
+# document over it threw away perfectly good product rows. So:
+#
+#   HARD  - at least one USABLE product row must be extracted.
+#   SOFT  - every document-level field, and most per-row fields: missing
+#           values are reported as warnings and exported blank.
+#
+# Semantic safety is unchanged and still hard (see check_line_item_semantics):
+# a MISSING value is a warning, a CONTRADICTORY value is still a rejection.
+
+
+def line_item_is_usable(item: LineItem) -> bool:
+    """True when the row identifies a product at all - by code, barcode or a
+    non-empty description. Quantity/price/amount may all be missing."""
+    return any(
+        (getattr(item, field) or "").strip()
+        for field in LINE_ITEM_IDENTITY_FIELDS
+    )
+
+
+def usable_line_items(inv: Invoice) -> list[LineItem]:
+    return [it for it in inv.line_items if line_item_is_usable(it)]
+
+
+def line_item_missing_fields(item: LineItem) -> list[str]:
+    """Soft fields absent on this row, in schema order (for per-row
+    warnings). Identity fields count too - a row identified only by
+    description should still tell the reviewer the code is missing."""
+    return [f for f in SOFT_LINE_ITEM_FIELDS
+            if getattr(item, f) is None
+            or (isinstance(getattr(item, f), str)
+                and not getattr(item, f).strip())]
+
+
+def document_missing_fields(inv: Invoice) -> list[str]:
+    """Document-level metadata absent from this extraction (reporting)."""
+    return [f for f in SOFT_DOCUMENT_FIELDS if getattr(inv, f) is None]
+
+
+def review_worthy_missing_fields(inv: Invoice) -> list[str]:
+    """The subset of missing metadata that should route a document to
+    review - the formerly-required fields only."""
+    return [f for f in REVIEW_TRIGGER_FIELDS if getattr(inv, f) is None]
+
+
+def check_extractable(inv: Invoice) -> None:
+    """Raise ExtractionError only when there is nothing usable to extract.
+
+    This is the model-attempt acceptance gate for the OpenRouter ladder
+    (M11). An answer carrying usable product rows is ACCEPTED even when it
+    supplies no seller, date, currency or total - escalating to another paid
+    model could not conjure metadata the document does not contain. An
+    answer with no usable row at all is rejected so the ladder escalates."""
+    if not usable_line_items(inv):
+        if inv.line_items:
+            raise ExtractionError(
+                f"no usable product rows (all {len(inv.line_items)} extracted "
+                "row(s) lack an item code, barcode and description)")
+        raise ExtractionError("no product rows extracted")
+
+
+def detect_document_type(text: str | None) -> str | None:
+    """Document kind from EXPLICIT wording in the source text, else None.
+
+    Never inferred from layout, vendor or field presence: an absent or
+    unrecognized title simply yields None, and the document is processed
+    exactly the same way."""
+    if not text:
+        return None
+    low = text.casefold()
+    for doc_type, phrases in _DOC_TYPE_EVIDENCE:
+        if any(phrase in low for phrase in phrases):
+            return doc_type
+    return None
+
+
+def declares_free_of_charge(text: str | None) -> bool:
+    """True when the document explicitly states the goods are free of
+    charge / of no commercial value."""
+    if not text:
+        return False
+    low = text.casefold()
+    return any(phrase in low for phrase in _FREE_OF_CHARGE_EVIDENCE)
 
 
 # --- line-item semantic validation (M10) --------------------------------------
@@ -472,7 +622,10 @@ def validate_invoice(
 
     missing = missing_required_fields(inv)
     if missing:
-        reasons.append(f"missing required fields: {', '.join(missing)}")
+        # M11: wording says "document metadata", not "required" - these are
+        # no longer hard requirements, and a product document that simply
+        # does not print them is extracted, not failed.
+        reasons.append("missing document metadata: " + ", ".join(missing))
 
     if missing_identifier(inv):
         reasons.append(

@@ -163,6 +163,39 @@ Failure labels distinguish the two situations exactly: `provider_failure`
 means no usable provider response was received; `missing_required_fields`
 means providers answered but the document never supplied the fields.
 
+### Product-first extraction (any product document)
+
+The scanner accepts product documents generally - invoices, commercial
+invoices, packing lists, delivery notes, free-goods support lists - and the
+LINE ITEMS are the payload. Validation is two-level:
+
+- **Hard (fails the document):** no usable product row. A row is usable when
+  it identifies a product at all - item code, barcode, or a non-empty
+  description. Rows that came back but identify nothing are a corrupt
+  extraction and fail; a document with no rows at all keeps its existing
+  "no line items extracted" review clause so header data is still exported.
+- **Soft (warns, never fails):** every document-level field (seller, invoice
+  date/number, buyer, currency, subtotal, tax, total, payment terms) and most
+  per-row fields (quantity, unit price, amount, barcode, code, description).
+  Missing values stay blank - never invented - are listed in the workbook's
+  `missing_fields` column and highlighted pale yellow.
+
+Only the four formerly-required fields (invoice date, currency, seller name,
+total) route a document to review when absent; the rest are reported without
+dragging every ordinary invoice into the review queue. A missing header never
+costs another provider call: the ladder does not escalate, and the bounded
+vision fallback now triggers only when the product rows themselves are
+missing or unusable.
+
+`document_type` is set only from explicit wording in the source (e.g. a
+"Free Goods Support Item List" title); an unrecognized document is processed
+identically with a null type. A document declaring itself free of charge
+keeps its printed prices and total exactly as printed - neither zeroed nor
+promoted to a payable amount - and is flagged so a reviewer can decide.
+
+Semantic safety is unchanged: a MISSING value warns, a CONTRADICTORY value
+(systematic column shift) still rejects the model attempt.
+
 ### Line items must be semantically possible
 
 A model answer can be structurally perfect and still wrong: PDF text layers

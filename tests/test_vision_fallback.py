@@ -1,11 +1,14 @@
 """M9.2: bounded automatic text -> vision fallback.
 
-A TEXT-native page can still hide a required field in an image (the
-confirmed real case: a seller name that exists only inside a letterhead
-logo, so every text model answers correctly and is still rejected for
-missing seller_name). When - and only when - the whole text ladder was
-rejected for that single reason, the pipeline re-reads those pages ONCE
-through the existing vision chunk path.
+A TEXT-native page can hide its PRODUCT TABLE in an image (a scanned table
+pasted into an otherwise text-native page), so every text model answers
+correctly and still returns no usable product row. When - and only when -
+the whole text ladder was rejected for that single reason, the pipeline
+re-reads those pages ONCE through the existing vision chunk path.
+
+M11 note: absent document metadata (seller, date, currency, total) no
+longer rejects an attempt at all, so it can never trigger this fallback -
+the pipeline does not buy a second model call to chase headers.
 
 Everything here is offline: the only seam is
 openrouter_client._chat_completion (same seam the other OpenRouter suites
@@ -143,7 +146,7 @@ class TestBoundedVisionFallback:
     def test_missing_seller_triggers_exactly_one_vision_attempt(
             self, logger, text_pdf, monkeypatch):
         rec = Recorder([
-            envelope(invoice_json(seller_name=None)),   # text: rejected
+            envelope(invoice_json(line_items=[])),      # text: no rows
             envelope(invoice_json()),                   # vision: complete
         ])
         monkeypatch.setattr(openrouter_client, "_chat_completion", rec)
@@ -154,7 +157,7 @@ class TestBoundedVisionFallback:
         assert len(vision_calls(rec)) == 1              # EXACTLY one
         assert result.vision_fallback_used is True
         assert result.vision_fallback_recovered is True
-        assert result.vision_fallback_missing == ["seller_name"]
+        assert result.vision_fallback_missing == []
         assert result.vision_fallback_pages == [1]
         assert result.invoice.seller_name == "Acme Logistics GmbH"
         assert result.needs_review is False
@@ -163,7 +166,7 @@ class TestBoundedVisionFallback:
     def test_multiple_missing_fields_still_one_attempt(self, logger,
                                                        text_pdf, monkeypatch):
         rec = Recorder([
-            envelope(invoice_json(seller_name=None, currency=None)),
+            envelope(invoice_json(line_items=[])),
             envelope(invoice_json()),
         ])
         monkeypatch.setattr(openrouter_client, "_chat_completion", rec)
@@ -171,15 +174,15 @@ class TestBoundedVisionFallback:
         result = process_file(text_pdf, fallback_cfg(), logger)
 
         assert len(vision_calls(rec)) == 1
-        assert result.vision_fallback_missing == ["currency", "seller_name"]
+        assert result.vision_fallback_missing == []
 
-    def test_vision_recovers_seller_but_currency_stays_unresolved(
+    def test_vision_recovers_rows_but_currency_stays_unresolved(
             self, logger, text_pdf, monkeypatch):
-        """The real Sales-Order shape: the logo yields the seller, but a
-        bare '$' is NOT resolvable - the record stays in review and no
-        currency is invented."""
+        """The fallback recovers the product rows, but a bare '$' is NOT
+        resolvable - the record stays in review and no currency is
+        invented."""
         rec = Recorder([
-            envelope(invoice_json(seller_name=None, currency=None)),
+            envelope(invoice_json(line_items=[])),
             envelope(invoice_json(currency=None)),      # vision: still no ccy
         ])
         monkeypatch.setattr(openrouter_client, "_chat_completion", rec)
@@ -188,17 +191,17 @@ class TestBoundedVisionFallback:
 
         assert len(vision_calls(rec)) == 1
         assert result.vision_fallback_used is True
-        assert result.invoice.seller_name == "Acme Logistics GmbH"
+        assert result.invoice.line_items                 # rows recovered
         assert result.invoice.currency is None          # never guessed
         assert result.needs_review is True
         assert "currency" in result.review_reason
-        assert safe_review_categories(result) == ("missing_required_fields",)
+        assert safe_review_categories(result) == ("missing_document_metadata",)
 
     def test_failed_vision_is_missing_fields_not_provider_failure(
             self, logger, text_pdf, monkeypatch):
         rec = Recorder([
-            envelope(invoice_json(seller_name=None)),   # text rejected
-            envelope(invoice_json(seller_name=None)),   # vision rejected too
+            envelope(invoice_json(line_items=[])),      # text rejected
+            envelope(invoice_json(line_items=[])),      # vision also none
         ])
         monkeypatch.setattr(openrouter_client, "_chat_completion", rec)
 
@@ -207,9 +210,8 @@ class TestBoundedVisionFallback:
         assert len(vision_calls(rec)) == 1
         assert result.needs_review is True
         cats = safe_review_categories(result)
-        assert cats == ("missing_required_fields",)
-        assert "provider_failure" not in cats
-        assert "seller_name" in result.review_reason
+        assert "provider_failure" not in cats            # provider answered
+        assert "no line items" in result.review_reason
         # partial data survives: the run keeps what WAS extracted rather
         # than discarding the document over one unavailable field
         assert result.invoice.invoice_number == "INV-1001"
@@ -217,7 +219,7 @@ class TestBoundedVisionFallback:
     def test_accounting_counts_the_fallback_exactly_once(
             self, logger, text_pdf, monkeypatch):
         rec = Recorder([
-            envelope(invoice_json(seller_name=None)),
+            envelope(invoice_json(line_items=[])),
             envelope(invoice_json()),
         ])
         monkeypatch.setattr(openrouter_client, "_chat_completion", rec)
@@ -233,7 +235,7 @@ class TestBoundedVisionFallback:
     def test_provenance_records_text_route_trigger_and_fallback(
             self, logger, text_pdf, monkeypatch):
         rec = Recorder([
-            envelope(invoice_json(seller_name=None)),
+            envelope(invoice_json(line_items=[])),
             envelope(invoice_json()),
         ])
         monkeypatch.setattr(openrouter_client, "_chat_completion", rec)
@@ -243,7 +245,7 @@ class TestBoundedVisionFallback:
         assert result.document_classification == "text-native"  # original route
         assert result.extraction_method == ROUTE_VISION         # final route
         assert result.vision_fallback_used is True
-        assert result.vision_fallback_missing == ["seller_name"]
+        assert result.vision_fallback_missing == []
 
 
 # --- exclusions: everything that must NOT escalate --------------------------
@@ -293,7 +295,7 @@ class TestFallbackExclusions:
             self, logger, scan_pdf, monkeypatch):
         """A document already on the vision route keeps its existing
         behavior: one vision ladder, no fallback layered on top."""
-        rec = Recorder([envelope(invoice_json(seller_name=None))])
+        rec = Recorder([envelope(invoice_json(line_items=[]))])
         monkeypatch.setattr(openrouter_client, "_chat_completion", rec)
 
         result = process_file(scan_pdf, fallback_cfg(), logger)
@@ -304,8 +306,8 @@ class TestFallbackExclusions:
     def test_no_recursion_after_a_failed_fallback(self, logger, text_pdf,
                                                   monkeypatch):
         rec = Recorder([
-            envelope(invoice_json(seller_name=None)),
-            envelope(invoice_json(seller_name=None)),
+            envelope(invoice_json(line_items=[])),
+            envelope(invoice_json(line_items=[])),
         ])
         monkeypatch.setattr(openrouter_client, "_chat_completion", rec)
 
@@ -316,7 +318,7 @@ class TestFallbackExclusions:
 
     def test_multi_page_beyond_the_chunk_bound_does_not_escalate(
             self, logger, two_page_text_pdf, monkeypatch):
-        rec = Recorder([envelope(invoice_json(seller_name=None))])
+        rec = Recorder([envelope(invoice_json(line_items=[]))])
         monkeypatch.setattr(openrouter_client, "_chat_completion", rec)
 
         cfg = fallback_cfg(max_text_pages=2, max_vision_pages=1)
@@ -327,7 +329,7 @@ class TestFallbackExclusions:
 
     def test_missing_vision_configuration_makes_no_call(self, logger,
                                                         text_pdf, monkeypatch):
-        rec = Recorder([envelope(invoice_json(seller_name=None))])
+        rec = Recorder([envelope(invoice_json(line_items=[]))])
         monkeypatch.setattr(openrouter_client, "_chat_completion", rec)
 
         cfg = fallback_cfg(openrouter_vision_models=())
@@ -377,7 +379,7 @@ class TestFailureClassification:
         failure message (the budget is the more actionable cause and must
         never be hidden behind a validation label) and spends nothing more
         on a fallback."""
-        rec = Recorder([envelope(invoice_json(seller_name=None),
+        rec = Recorder([envelope(invoice_json(line_items=[]),
                                  cost=0.01)])
         monkeypatch.setattr(openrouter_client, "_chat_completion", rec)
 
@@ -392,14 +394,14 @@ class TestFailureClassification:
 
     def test_validation_only_null_row_reports_one_accurate_category(
             self, logger, text_pdf, monkeypatch):
-        rec = Recorder([envelope(invoice_json(seller_name=None))])
+        rec = Recorder([envelope(invoice_json(line_items=[]))])
         monkeypatch.setattr(openrouter_client, "_chat_completion", rec)
 
         cfg = fallback_cfg(openrouter_vision_models=())   # no fallback path
         result = process_file(text_pdf, cfg, logger)
 
         assert result.error is True
-        assert safe_review_categories(result) == ("missing_required_fields",)
+        assert safe_review_categories(result) == ("no_usable_product_rows",)
         assert "failed on all" not in result.review_reason
 
 

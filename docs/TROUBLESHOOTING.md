@@ -40,6 +40,9 @@ These appear as compact review reasons; raw provider bodies are never shown.
 | `model_unavailable` (HTTP 404) | Model id not available to your key | Fix the id; confirm on OpenRouter |
 | `timeout` | Request exceeded the timeout | Raise `REQUEST_TIMEOUT_SECONDS`; lower `RENDER_DPI`/chunk size |
 | `... failed on all configured models` | Every model in the ladder failed for that chunk | Inspect the named page range; add/adjust models or limits |
+| `missing document metadata: ...` | The document did not print these fields. The product rows were still extracted and exported; the cells are blank and highlighted. Not a failure, not a provider problem. |
+| `free-of-charge document with printed values` | The document declares the goods free of charge but prints prices. Both the line prices and the total are kept as printed - treat them as declared/reference values until confirmed. |
+| `no usable product rows` | The only hard failure: nothing came back that identifies a product (no code, barcode or description). Check the source layout; the model ladder and one vision fallback already ran. |
 | `line-item semantic mismatch: ...` | A model responded with structurally valid JSON whose line items are impossible (systematic column shift - e.g. quantities holding the printed line totals). The attempt was rejected and the ladder escalated; if every model failed, review the document layout. Not a provider failure. |
 | `missing required fields: ...` | Providers **answered**; the document never supplied those fields. **Not** a provider failure | For a text-native file the run already retried the pages once through vision automatically; if a field (e.g. currency written only as `$`) is genuinely absent, complete it by hand in NeedsReview |
 
